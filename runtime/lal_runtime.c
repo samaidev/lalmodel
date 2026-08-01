@@ -3187,38 +3187,30 @@ void model_batch_backward(Model *m, const int *tokens, int n_tokens) {
     for (int l = m->cfg.n_layer - 1; l >= 0; l--)
         trans_layer_backward(gh, &m->layers[l], &m->acts[l], &m->cfg, 0.0f);  /* lr=0, not used when accumulating */
 
-    /* === CRITICAL FIX: Accumulate gradient for ALL token embeddings ===
-     * Previously only updated tokens[n_tokens-1] (last token). But in a
-     * sequence, every token's embedding contributes to the forward pass
-     * (via attention KV cache), so all should receive gradient.
-     * The gradient gh is w.r.t. the LAST position's input, but attention
-     * backprop distributes gradients to all positions through K/V.
-     * For simplicity, we accumulate gh to all tokens in the sequence
-     * (scaled by 1/n_tokens to avoid gradient explosion). */
+    /* === Accumulate gradient for token embedding (wte) ===
+     * gh is dL/d_x at position t (the prediction position).
+     * x_t = wte[tokens[t]] + wpe[t], so grad_wte[tokens[t]] += gh.
+     * Earlier positions (0..t-1) contribute via attention KV cache,
+     * but attention_backward treats cached K/V as constants (no gradient).
+     * So we only update the last token's wte, not all tokens.
+     * Previously: accumulated to ALL tokens (diluted gradient 1/n_tokens). */
     if (m->grad_wte_accum) {
-        float scale = 1.0f / n_tokens;
-        for (int t = 0; t < n_tokens; t++) {
-            int input_token = tokens[t];
-            if (input_token >= 0 && input_token < m->cfg.vocab_size) {
-                float *gw = &m->grad_wte_accum[(size_t)input_token * n];
-                for (int i = 0; i < n; i++)
-                    gw[i] += gh[i] * scale;
-            }
+        int input_token = tokens[n_tokens - 1];
+        if (input_token >= 0 && input_token < m->cfg.vocab_size) {
+            float *gw = &m->grad_wte_accum[(size_t)input_token * n];
+            for (int i = 0; i < n; i++)
+                gw[i] += gh[i];
         }
     }
 
     /* === Accumulate gradient for position embedding (wpe) ===
-     * x = wte[token] + wpe[pos], so grad_wpe[pos] += grad_x (same as wte grad).
-     * Without this, position embeddings are NEVER trained → model has no
-     * position awareness → attention treats all positions as same → collapse. */
+     * Same logic: only position t (last position) gets gradient. */
     if (m->grad_wpe_accum) {
-        float scale = 1.0f / n_tokens;
-        for (int t = 0; t < n_tokens; t++) {
-            if (t < m->cfg.n_ctx) {
-                float *gw = &m->grad_wpe_accum[(size_t)t * n];
-                for (int i = 0; i < n; i++)
-                    gw[i] += gh[i] * scale;
-            }
+        int pos = n_tokens - 1;
+        if (pos >= 0 && pos < m->cfg.n_ctx) {
+            float *gw = &m->grad_wpe_accum[(size_t)pos * n];
+            for (int i = 0; i < n; i++)
+                gw[i] += gh[i];
         }
     }
 
