@@ -136,14 +136,19 @@ static float logic_guided_regularization(Model *m, float lr) {
             simulate_activation(m, gate_a, l, act_a, mlp_dim);
             simulate_activation(m, gate_b, l, act_b, mlp_dim);
 
-            /* 计算损失 + 统计 */
+            /* 计算损失 + 统计
+             * BUG #49 FIX: CORE loss 用 -alpha*|diff| 时,模型可以通过让所有
+             * CORE激活都很大来最小化loss(因为|diff|在两个方向都会增大)。
+             * 这导致CORE对所有概念都产生高激活但不区分概念(act=3.75, diff=0.23)。
+             * 修复: 用 tanh(adiff) 饱和函数,让diff超过一定值后不再奖励。
+             * tanh 在 0附近≈x(线性),在>2后≈1(饱和),防止无限制增大激活。 */
             int layer_nc = 0, layer_nb = 0;
             for (int j = 0; j < mlp_dim; j++) {
                 if (mask[j] == 2) continue;
                 float diff = act_a[j] - act_b[j];
                 float adiff = fabsf(diff);
                 if (mask[j] == 0) {
-                    total_loss -= alpha * adiff;
+                    total_loss -= alpha * tanhf(adiff);  /* BUG #49: 饱和而非线性 */
                     layer_nc++;
                 } else {
                     total_loss += beta * diff * diff;
@@ -161,18 +166,23 @@ static float logic_guided_regularization(Model *m, float lr) {
                 float *ga = &fc->grad_accum[(size_t)j * layer_in_dim];
 
                 if (mask[j] == 0) {  /* CORE */
+                    /* BUG #49: gradient of -alpha*tanh(|diff|):
+                     * d/dw [-alpha*tanh(|diff|)] = -alpha * sign(diff) * (1-tanh²(|diff|))
+                     * The (1-tanh²) factor saturates when |diff| is large,
+                     * preventing the model from endlessly increasing activation. */
                     float s = diff > 0 ? 1.0f : -1.0f;
-                    float grad_scale = -alpha * s * inv_nc * layer_lr_scale * lr;
+                    float tanh_adiff = tanhf(fabsf(diff));
+                    float grad_scale = -alpha * s * (1.0f - tanh_adiff * tanh_adiff) * inv_nc * layer_lr_scale * lr;
                     for (int i = 0; i < layer_in_dim; i++)
                         ga[i] += grad_scale * (gate_a[i] - gate_b[i]);
                     if (fc->bias_grad_accum)
-                        fc->bias_grad_accum[j] += -alpha * s * inv_nc * layer_lr_scale * lr;
+                        fc->bias_grad_accum[j] += grad_scale;
                 } else {  /* BINARY */
                     float grad_scale = beta * 2.0f * diff * inv_nb * layer_lr_scale * lr;
                     for (int i = 0; i < layer_in_dim; i++)
                         ga[i] += grad_scale * (gate_a[i] - gate_b[i]);
                     if (fc->bias_grad_accum)
-                        fc->bias_grad_accum[j] += beta * 2.0f * diff * inv_nb * layer_lr_scale * lr;
+                        fc->bias_grad_accum[j] += grad_scale;
                 }
             }
         }
