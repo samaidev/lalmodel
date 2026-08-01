@@ -1,0 +1,53 @@
+[*] Loaded 32768 vocab pieces from tokenizer/chinese_bpe.vocab
+=== LAL STE Whitebox-Supervised Training ===
+
+[*] Method: Straight-Through Estimator + CORE/BINARY/PRUNE Logic Guidance
+[*]   forward:  CORE = w_float * core_gain * K     (精确计算)
+[*]             BINARY = sign(w) * alpha * K       (二值符号)
+[*]             PRUNE = 0                           (静默剪枝)
+[*]   backward: STE through w_float (CORE+BINARY), PRUNE 无梯度
+[*]   update:   Adam on w_float
+[*] Logic Guidance (每步,全层):
+[*]             CORE  → maximize |act(a) - act(b)|  (差异化反义词)
+[*]             BINARY → minimize (act(a) - act(b))^2 (收敛共性)
+[*]             PRUNE → skip (保持静默)
+[*] Whitebox probe: every 10 steps observe CORE/BINARY/PRUNE circuit
+
+[*] Loaded 69990 samples from data/general_64_bpe.bin
+[*] Using Phase 1: Sprout (10L/512d) (~35M params, vocab=32768)
+[*] Generated Phase 1: Sprout (10L/512d) weights: 10 layers, 512 embd, ~35M params
+[*] Logic mask: Phase 1: Growing (20/65/15) (CORE=20% PRUNE=15%)
+[*] loaded 124 tensors
+[*] binarizing 10 layers (logic-guided)...
+    [logic] CORE=307 (20%), BINARY=999 (65%), PRUNE=230 (15%)
+[*] done
+[*] freed 40 weight tensors (126 MB) after binarization
+[*] Model loaded: 10 layers, 512 embd, k_cache=YES
+
+
+=== LAL STE Training (B=2, max_pos=64, steps=50, logic_lr=0.0020) ===
+[*] STE: forward=sign(w), backward=w_float gradient
+[*] Whitebox probe every 10 steps
+[*] Semantic regularization every step
+
+  step     0/50  loss=10.4644  avg=10.4644  lr=0.000020  B=8  4446ms
+  [WB] boundary=83/100  core_diff=0.0274  bin_diff=0.0001  ratio=365.47  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.173
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [WB] boundary=83/100  core_diff=0.0274  bin_diff=0.0001  ratio=365.47  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.173
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  step    10/50  loss=8.5349  avg=9.9422  lr=0.000220  B=8  4744ms
+  [WB] boundary=83/100  core_diff=0.0274  bin_diff=0.0001  ratio=365.87  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.173
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [WB] boundary=83/100  core_diff=0.0274  bin_diff=0.0001  ratio=365.87  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.173
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  step    20/50  loss=9.4230  avg=9.5100  lr=0.000420  B=8  4658ms
+  [WB] boundary=83/100  core_diff=0.0276  bin_diff=0.0001  ratio=367.89  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.174
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [WB] boundary=83/100  core_diff=0.0276  bin_diff=0.0001  ratio=367.89  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.174
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK

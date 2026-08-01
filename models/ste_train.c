@@ -417,6 +417,10 @@ static int ste_save(Model *m, const char *path) {
 
     /* wte */
     fwrite(m->wte, sizeof(float), (size_t)vocab * n_embd, f);
+    /* wpe */
+    if (m->wpe) {
+        fwrite(m->wpe, sizeof(float), (size_t)512 * n_embd, f);  /* n_ctx=512 */
+    }
     /* ln_f */
     fwrite(m->ln_f_w, sizeof(float), n_embd, f);
     fwrite(m->ln_f_b, sizeof(float), n_embd, f);
@@ -470,6 +474,10 @@ static int ste_load(Model *m, const char *path) {
     }
 
     fread(m->wte, sizeof(float), (size_t)vocab * n_embd, f);
+    /* wpe */
+    if (m->wpe) {
+        fread(m->wpe, sizeof(float), (size_t)512 * n_embd, f);
+    }
     fread(m->ln_f_w, sizeof(float), n_embd, f);
     fread(m->ln_f_b, sizeof(float), n_embd, f);
 

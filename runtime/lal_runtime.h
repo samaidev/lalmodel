@@ -402,6 +402,8 @@ typedef struct Model {
     /* Batch training: gradient accumulation + Adam state for embeddings/norms */
     float *grad_wte_accum;  /* [vocab * n_embd] */
     float *m_wte, *v_wte;   /* Adam state for wte */
+    float *grad_wpe_accum;  /* [n_ctx * n_embd] — position embedding grads */
+    float *m_wpe, *v_wpe;   /* Adam state for wpe */
     float *grad_ln_f_w_accum, *grad_ln_f_b_accum; /* final norm grads */
     float *m_ln_f_w, *v_ln_f_w, *m_ln_f_b, *v_ln_f_b; /* Adam state */
     float *final_ln;         /* cached final norm output */

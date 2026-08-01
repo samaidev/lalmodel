@@ -1,0 +1,279 @@
+[*] Loaded 32768 vocab pieces from tokenizer/chinese_bpe.vocab
+=== LAL STE Whitebox-Supervised Training ===
+
+[*] Method: Straight-Through Estimator + CORE/BINARY/PRUNE Logic Guidance
+[*]   forward:  CORE = w_float * core_gain * K     (精确计算)
+[*]             BINARY = sign(w) * alpha * K       (二值符号)
+[*]             PRUNE = 0                           (静默剪枝)
+[*]   backward: STE through w_float (CORE+BINARY), PRUNE 无梯度
+[*]   update:   Adam on w_float
+[*] Logic Guidance (每步,全层):
+[*]             CORE  → maximize |act(a) - act(b)|  (差异化反义词)
+[*]             BINARY → minimize (act(a) - act(b))^2 (收敛共性)
+[*]             PRUNE → skip (保持静默)
+[*] Whitebox probe: every 10 steps observe CORE/BINARY/PRUNE circuit
+
+[*] Loaded 6004 samples from data/cognitive_bpe.bin
+[*] Using Phase 1: Sprout (10L/512d) (~35M params, vocab=32768)
+[*] Generated Phase 1: Sprout (10L/512d) weights: 10 layers, 512 embd, ~35M params
+[*] Logic mask: Phase 1: Growing (20/65/15) (CORE=20% PRUNE=15%)
+[*] loaded 124 tensors
+[*] binarizing 10 layers (logic-guided)...
+    [logic] CORE=307 (20%), BINARY=999 (65%), PRUNE=230 (15%)
+[*] done
+[*] freed 40 weight tensors (126 MB) after binarization
+[*] Model loaded: 10 layers, 512 embd, k_cache=YES
+
+
+=== LAL STE Training (B=4, max_pos=64, steps=100, logic_lr=0.0020) ===
+[*] STE: forward=sign(w), backward=w_float gradient
+[*] Whitebox probe every 10 steps
+[*] Semantic regularization every step
+
+  step     0/100  loss=0.0000  avg=0.0000  lr=0.000020  B=0  27ms
+  [WB] boundary=84/100  core_diff=0.0274  bin_diff=0.0001  ratio=361.75  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.159
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [WB] boundary=84/100  core_diff=0.0274  bin_diff=0.0001  ratio=361.75  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.159
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  step    10/100  loss=0.0000  avg=0.9652  lr=0.000220  B=0  157ms
+  [WB] boundary=84/100  core_diff=0.0274  bin_diff=0.0001  ratio=361.95  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.159
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [WB] boundary=84/100  core_diff=0.0274  bin_diff=0.0001  ratio=361.95  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.159
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  step    20/100  loss=0.0000  avg=2.0059  lr=0.000420  B=0  298ms
+  [WB] boundary=84/100  core_diff=0.0275  bin_diff=0.0001  ratio=362.79  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.159
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [WB] boundary=84/100  core_diff=0.0275  bin_diff=0.0001  ratio=362.79  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.159
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  step    30/100  loss=0.0000  avg=2.0028  lr=0.000620  B=0  301ms
+  [WB] boundary=84/100  core_diff=0.0276  bin_diff=0.0001  ratio=363.64  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.159
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [WB] boundary=84/100  core_diff=0.0276  bin_diff=0.0001  ratio=363.64  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.159
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  step    40/100  loss=0.0000  avg=2.3907  lr=0.000820  B=0  372ms
+  [WB] boundary=84/100  core_diff=0.0279  bin_diff=0.0001  ratio=367.18  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.159
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [WB] boundary=84/100  core_diff=0.0279  bin_diff=0.0001  ratio=367.18  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.159
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  step    50/100  loss=9.5808  avg=2.2842  lr=0.001000  B=4  400ms
+  [WB] boundary=84/100  core_diff=0.0282  bin_diff=0.0001  ratio=370.43  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.159
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [WB] boundary=84/100  core_diff=0.0282  bin_diff=0.0001  ratio=370.43  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.159
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+[*] stateful inference started: window=256, sinks=4, ctx=512
+[*] sliding window configured: W=256, sinks=4 (effective context: 260)
+  [TRACE] "冷": L0[||x||=0.84 C409(+144.75--24.31) B1332(+52.57--39.18) P307(max0.000)] L5[||x||=66.83 C409(+190.24--21.84) B1332(+74.78--48.83) P307(max0.000)] L9[||x||=94.19 C409(+190.82--23.83) B1332(+84.70--49.30) P307(max0.000)] | H=14.76/15 top3=0x712E 0x1FB1 0x3922 
+  step    60/100  loss=0.0000  avg=2.2500  lr=0.000905  B=0  370ms
+  [WB] boundary=84/100  core_diff=0.0285  bin_diff=0.0001  ratio=373.19  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.159
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [WB] boundary=84/100  core_diff=0.0285  bin_diff=0.0001  ratio=373.19  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.159
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  step    70/100  loss=0.0000  avg=2.4551  lr=0.000655  B=0  346ms
+  [WB] boundary=84/100  core_diff=0.0287  bin_diff=0.0001  ratio=375.59  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.160
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [WB] boundary=84/100  core_diff=0.0287  bin_diff=0.0001  ratio=375.59  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.160
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  step    80/100  loss=0.0000  avg=2.1020  lr=0.000345  B=0  316ms
+  [WB] boundary=84/100  core_diff=0.0288  bin_diff=0.0001  ratio=376.88  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.160
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [WB] boundary=84/100  core_diff=0.0288  bin_diff=0.0001  ratio=376.88  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.160
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  step    90/100  loss=0.0000  avg=2.0725  lr=0.000095  B=0  300ms
+  [WB] boundary=84/100  core_diff=0.0289  bin_diff=0.0001  ratio=377.88  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.160
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [WB] boundary=84/100  core_diff=0.0289  bin_diff=0.0001  ratio=377.88  prune_act=0.0000
+  [WB] structure=20/20 (100%)  opp_sim=0.160
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  step    99/100  loss=10.2548  avg=1.8166  lr=0.000001  B=4  295ms
+
+[*] STE training done in 29.5s (295.5 ms/step)
+[*] Best recent loss: 0.0000
+
+[*] Saving trained weights to model_wpe.ste...
+[*] Saved 194487316 bytes
+=== Post-Training Whitebox Analysis (surface) ===
+
+=== LAL Whitebox Probe (step checkpoint) ===
+Model: 10L, 512 embd, 2048 mlp
+
+--- Embedding Concept Boundary ---
+
+        热  冷  大  小  上  下  亮  暗  重  轻  快  慢  湿  干
+  热  +1.00 -0.00 +0.03 +0.00 +0.04 -0.02 +0.03 -0.01 -0.01 +0.01 +0.08 -0.07 +0.01 +0.07
+  冷  -0.00 +1.00 +0.35 +0.40 -0.04 -0.04 -0.07 +0.04 -0.03 -0.03 +0.37 +0.00 +0.03 +0.36
+  大  +0.03 +0.35 +1.00 +0.30 +0.02 -0.01 +0.03 -0.06 -0.03 -0.04 +0.27 -0.00 -0.04 +0.33
+  小  +0.00 +0.40 +0.30 +1.00 -0.00 -0.03 +0.02 -0.05 +0.07 +0.02 +0.35 -0.04 -0.02 +0.30
+  上  +0.04 -0.04 +0.02 -0.00 +1.00 +0.64 +0.34 -0.04 +0.05 -0.01 +0.06 -0.03 +0.02 +0.03
+  下  -0.02 -0.04 -0.01 -0.03 +0.64 +1.00 +0.33 -0.03 +0.04 -0.03 +0.03 -0.06 +0.01 -0.00
+  亮  +0.03 -0.07 +0.03 +0.02 +0.34 +0.33 +1.00 -0.09 +0.04 -0.01 +0.06 -0.03 +0.01 -0.02
+  暗  -0.01 +0.04 -0.06 -0.05 -0.04 -0.03 -0.09 +1.00 -0.00 -0.05 +0.02 +0.32 +0.30 -0.07
+  重  -0.01 -0.03 -0.03 +0.07 +0.05 +0.04 +0.04 -0.00 +1.00 -0.05 -0.04 +0.07 -0.02 +0.00
+  轻  +0.01 -0.03 -0.04 +0.02 -0.01 -0.03 -0.01 -0.05 -0.05 +1.00 -0.01 -0.05 -0.01 -0.02
+  快  +0.08 +0.37 +0.27 +0.35 +0.06 +0.03 +0.06 +0.02 -0.04 -0.01 +1.00 -0.04 +0.35 +0.33
+  慢  -0.07 +0.00 -0.00 -0.04 -0.03 -0.06 -0.03 +0.32 +0.07 -0.05 -0.04 +1.00 +0.32 -0.00
+  湿  +0.01 +0.03 -0.04 -0.02 +0.02 +0.01 +0.01 +0.30 -0.02 -0.01 +0.35 +0.32 +1.00 +0.36
+  干  +0.07 +0.36 +0.33 +0.30 +0.03 -0.00 -0.02 -0.07 +0.00 -0.02 +0.33 -0.00 +0.36 +1.00
+
+  Opposite pairs (boundary clarity):
+    热 vs 冷: -0.0046 CLEAR
+    大 vs 小: +0.2997 CLEAR
+    上 vs 下: +0.6431 weak
+    亮 vs 暗: -0.0853 CLEAR
+    重 vs 轻: -0.0525 CLEAR
+    快 vs 慢: -0.0381 CLEAR
+    湿 vs 干: +0.3565 weak
+
+  Boundary score: 84/100 (STRONG)
+
+--- CORE Activation (simulated, layer 0) ---
+
+  热 vs 冷: CORE diff=0.0338 act=0.0208 OK | BIN diff=0.0001 | PRUNE act=0.0000
+  大 vs 小: CORE diff=0.0288 act=0.0228 OK | BIN diff=0.0001 | PRUNE act=0.0000
+  上 vs 下: CORE diff=0.0180 act=0.0217 OK | BIN diff=0.0001 | PRUNE act=0.0000
+  亮 vs 暗: CORE diff=0.0311 act=0.0211 OK | BIN diff=0.0001 | PRUNE act=0.0000
+  重 vs 轻: CORE diff=0.0338 act=0.0213 OK | BIN diff=0.0001 | PRUNE act=0.0000
+  快 vs 慢: CORE diff=0.0318 act=0.0209 OK | BIN diff=0.0001 | PRUNE act=0.0000
+  湿 vs 干: CORE diff=0.0252 act=0.0216 OK | BIN diff=0.0001 | PRUNE act=0.0000
+
+--- Weight Structure ---
+
+  L0 mlp: CORE=0.3677 BIN=0.3571 PRUNE=0.3467 OK | attn: CORE=0.5782 BIN=0.5622 PRUNE=0.5458 OK
+  L1 mlp: CORE=0.3676 BIN=0.3575 PRUNE=0.3471 OK | attn: CORE=0.5801 BIN=0.5637 PRUNE=0.5468 OK
+  ... (layers 2-8) ...
+  L9 mlp: CORE=0.3663 BIN=0.3563 PRUNE=0.3462 OK | attn: CORE=0.5797 BIN=0.5622 PRUNE=0.5454 OK
+
+  Structure: 100% OK (20/20)
+
+--- Embedding Concept Boundary ---
+
+        热  冷  大  小  上  下  亮  暗  重  轻  快  慢  湿  干
+  热  +1.00 -0.00 +0.03 +0.00 +0.04 -0.02 +0.03 -0.01 -0.01 +0.01 +0.08 -0.07 +0.01 +0.07
+  冷  -0.00 +1.00 +0.35 +0.40 -0.04 -0.04 -0.07 +0.04 -0.03 -0.03 +0.37 +0.00 +0.03 +0.36
+  大  +0.03 +0.35 +1.00 +0.30 +0.02 -0.01 +0.03 -0.06 -0.03 -0.04 +0.27 -0.00 -0.04 +0.33
+  小  +0.00 +0.40 +0.30 +1.00 -0.00 -0.03 +0.02 -0.05 +0.07 +0.02 +0.35 -0.04 -0.02 +0.30
+  上  +0.04 -0.04 +0.02 -0.00 +1.00 +0.64 +0.34 -0.04 +0.05 -0.01 +0.06 -0.03 +0.02 +0.03
+  下  -0.02 -0.04 -0.01 -0.03 +0.64 +1.00 +0.33 -0.03 +0.04 -0.03 +0.03 -0.06 +0.01 -0.00
+  亮  +0.03 -0.07 +0.03 +0.02 +0.34 +0.33 +1.00 -0.09 +0.04 -0.01 +0.06 -0.03 +0.01 -0.02
+  暗  -0.01 +0.04 -0.06 -0.05 -0.04 -0.03 -0.09 +1.00 -0.00 -0.05 +0.02 +0.32 +0.30 -0.07
+  重  -0.01 -0.03 -0.03 +0.07 +0.05 +0.04 +0.04 -0.00 +1.00 -0.05 -0.04 +0.07 -0.02 +0.00
+  轻  +0.01 -0.03 -0.04 +0.02 -0.01 -0.03 -0.01 -0.05 -0.05 +1.00 -0.01 -0.05 -0.01 -0.02
+  快  +0.08 +0.37 +0.27 +0.35 +0.06 +0.03 +0.06 +0.02 -0.04 -0.01 +1.00 -0.04 +0.35 +0.33
+  慢  -0.07 +0.00 -0.00 -0.04 -0.03 -0.06 -0.03 +0.32 +0.07 -0.05 -0.04 +1.00 +0.32 -0.00
+  湿  +0.01 +0.03 -0.04 -0.02 +0.02 +0.01 +0.01 +0.30 -0.02 -0.01 +0.35 +0.32 +1.00 +0.36
+  干  +0.07 +0.36 +0.33 +0.30 +0.03 -0.00 -0.02 -0.07 +0.00 -0.02 +0.33 -0.00 +0.36 +1.00
+
+  Opposite pairs (boundary clarity):
+    热 vs 冷: -0.0046 CLEAR
+    大 vs 小: +0.2997 CLEAR
+    上 vs 下: +0.6431 weak
+    亮 vs 暗: -0.0853 CLEAR
+    重 vs 轻: -0.0525 CLEAR
+    快 vs 慢: -0.0381 CLEAR
+    湿 vs 干: +0.3565 weak
+
+  Boundary score: 84/100 (STRONG)
+
+--- Concept Similarity (mid-layer weights) ---
+
+  Embedding similarity:
+        热  冷  大  小  上  下  亮  暗  重  轻  快  慢  湿  干
+  热  +1.00 -0.00 +0.03 +0.00 +0.04 -0.02 +0.03 -0.01 -0.01 +0.01 +0.08 -0.07 +0.01 +0.07
+  冷  -0.00 +1.00 +0.35 +0.40 -0.04 -0.04 -0.07 +0.04 -0.03 -0.03 +0.37 +0.00 +0.03 +0.36
+  大  +0.03 +0.35 +1.00 +0.30 +0.02 -0.01 +0.03 -0.06 -0.03 -0.04 +0.27 -0.00 -0.04 +0.33
+  小  +0.00 +0.40 +0.30 +1.00 -0.00 -0.03 +0.02 -0.05 +0.07 +0.02 +0.35 -0.04 -0.02 +0.30
+  上  +0.04 -0.04 +0.02 -0.00 +1.00 +0.64 +0.34 -0.04 +0.05 -0.01 +0.06 -0.03 +0.02 +0.03
+  下  -0.02 -0.04 -0.01 -0.03 +0.64 +1.00 +0.33 -0.03 +0.04 -0.03 +0.03 -0.06 +0.01 -0.00
+  亮  +0.03 -0.07 +0.03 +0.02 +0.34 +0.33 +1.00 -0.09 +0.04 -0.01 +0.06 -0.03 +0.01 -0.02
+  暗  -0.01 +0.04 -0.06 -0.05 -0.04 -0.03 -0.09 +1.00 -0.00 -0.05 +0.02 +0.32 +0.30 -0.07
+  重  -0.01 -0.03 -0.03 +0.07 +0.05 +0.04 +0.04 -0.00 +1.00 -0.05 -0.04 +0.07 -0.02 +0.00
+  轻  +0.01 -0.03 -0.04 +0.02 -0.01 -0.03 -0.01 -0.05 -0.05 +1.00 -0.01 -0.05 -0.01 -0.02
+  快  +0.08 +0.37 +0.27 +0.35 +0.06 +0.03 +0.06 +0.02 -0.04 -0.01 +1.00 -0.04 +0.35 +0.33
+  慢  -0.07 +0.00 -0.00 -0.04 -0.03 -0.06 -0.03 +0.32 +0.07 -0.05 -0.04 +1.00 +0.32 -0.00
+  湿  +0.01 +0.03 -0.04 -0.02 +0.02 +0.01 +0.01 +0.30 -0.02 -0.01 +0.35 +0.32 +1.00 +0.36
+  干  +0.07 +0.36 +0.33 +0.30 +0.03 -0.00 -0.02 -0.07 +0.00 -0.02 +0.33 -0.00 +0.36 +1.00
+
+
+========================================
+  DEEP WHITEBOX DIAGNOSIS
+  (explaining WHY generation is garbage)
+========================================
+
+--- 1. Embedding Space Differentiation ---
+
+  Embedding norms:
+    热=0.338 冷=0.331 大=0.329 小=0.322 上=0.342 下=0.334 亮=0.339 暗=0.335 火=0.331 水=0.318 
+
+  Avg cosine similarity:
+    Opposite pairs (should be LOW):  0.1738
+    Unrelated pairs (should be ~0):  0.0517
+    Gap (unrelated - opposite):       -0.1220  [FAIL] embeddings clustered — concepts not separated
+           → generation will produce near-random tokens
+
+--- 2. CORE Activation Magnitude ---
+
+  Layer 0 mlp activation (for '热'):
+    CORE  : max=0.0685 avg=0.0208  (n=409)
+    BINARY: max=0.0002 avg=0.0001  (n=1332)
+    CORE diff (热 vs 冷): 0.0338 (162.1% of avg)
+    [FAIL] CORE diff too small — cannot drive distinct logits
+
+--- 3. Weight Norm Layering (CORE > BINARY > PRUNE?) ---
+
+  L0: CORE=0.3725 BIN=0.3659 PRUNE=0.2958  [FAIL: not layered]
+  L1: CORE=0.3729 BIN=0.3663 PRUNE=0.2954  [FAIL: not layered]
+  L2: CORE=0.3719 BIN=0.3663 PRUNE=0.2950  [FAIL: not layered]
+  L3: CORE=0.3723 BIN=0.3660 PRUNE=0.2961  [FAIL: not layered]
+  L4: CORE=0.3718 BIN=0.3663 PRUNE=0.2955  [FAIL: not layered]
+  L5: CORE=0.3703 BIN=0.3662 PRUNE=0.2952  [FAIL: not layered]
+  L6: CORE=0.3705 BIN=0.3659 PRUNE=0.2956  [FAIL: not layered]
+  L7: CORE=0.3707 BIN=0.3662 PRUNE=0.2960  [FAIL: not layered]
+  L8: CORE=0.3706 BIN=0.3656 PRUNE=0.2956  [FAIL: not layered]
+  L9: CORE=0.3696 BIN=0.3655 PRUNE=0.2958  [FAIL: not layered]
+
+  → Weight norms not differentiated → logic mask is cosmetic, not functional
+
+--- 4. Logits Distribution (mode collapse check) ---
+
+  Prompt '热' → top-5 next-token logits:
+    token 31865 ',' logit=5.3783
+    token 31861 '。' logit=5.3395
+    token 31926 '上' logit=3.0707
+    token 154 '<0x97>' logit=2.7518
+    token 235 '<0xE8>' logit=2.6838
+
+  Logit range: 7.9221 (max=5.3783 min=-2.5438)
+  Softmax entropy: 14.6877 bits (uniform would be 8.00)
+  [OK]
+
+========================================
+  DIAGNOSIS SUMMARY
+========================================
+  If generation is garbage, likely causes:
+  1. Embeddings not spread (Section 1) → tokens sampled near-randomly
+  2. CORE activation too weak (Section 2) → model can't distinguish inputs
+  3. Weight norms not layered (Section 3) → logic mask is cosmetic
+  4. Logits collapsed/flat (Section 4) → repetitive or random output
+  Fix: train more steps, or increase logic_guided_regularization lr
+========================================
+
+
+[*] Done

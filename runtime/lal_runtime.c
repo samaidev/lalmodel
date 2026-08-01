@@ -3078,12 +3078,18 @@ void model_batch_alloc(Model *m) {
         }
     }
 
-    /* Allocate gradient accumulation + Adam state for wte and ln_f */
+    /* Allocate gradient accumulation + Adam state for wte, wpe and ln_f */
     if (!m->grad_wte_accum) {
         size_t wte_size = (size_t)m->cfg.vocab_size * m->cfg.n_embd;
         m->grad_wte_accum = calloc(wte_size, sizeof(float));
         m->m_wte = calloc(wte_size, sizeof(float));
         m->v_wte = calloc(wte_size, sizeof(float));
+    }
+    if (m->wpe && !m->grad_wpe_accum) {
+        size_t wpe_size = (size_t)m->cfg.n_ctx * m->cfg.n_embd;
+        m->grad_wpe_accum = calloc(wpe_size, sizeof(float));
+        m->m_wpe = calloc(wpe_size, sizeof(float));
+        m->v_wpe = calloc(wpe_size, sizeof(float));
     }
     if (!m->grad_ln_f_w_accum) {
         m->grad_ln_f_w_accum = calloc(m->cfg.n_embd, sizeof(float));
@@ -3131,6 +3137,8 @@ void model_batch_begin(Model *m) {
     /* Zero embedding and norm gradients */
     if (m->grad_wte_accum)
         memset(m->grad_wte_accum, 0, (size_t)m->cfg.vocab_size * m->cfg.n_embd * sizeof(float));
+    if (m->grad_wpe_accum)
+        memset(m->grad_wpe_accum, 0, (size_t)m->cfg.n_ctx * m->cfg.n_embd * sizeof(float));
     if (m->grad_ln_f_w_accum) {
         memset(m->grad_ln_f_w_accum, 0, m->cfg.n_embd * sizeof(float));
         memset(m->grad_ln_f_b_accum, 0, m->cfg.n_embd * sizeof(float));
@@ -3193,6 +3201,21 @@ void model_batch_backward(Model *m, const int *tokens, int n_tokens) {
             int input_token = tokens[t];
             if (input_token >= 0 && input_token < m->cfg.vocab_size) {
                 float *gw = &m->grad_wte_accum[(size_t)input_token * n];
+                for (int i = 0; i < n; i++)
+                    gw[i] += gh[i] * scale;
+            }
+        }
+    }
+
+    /* === Accumulate gradient for position embedding (wpe) ===
+     * x = wte[token] + wpe[pos], so grad_wpe[pos] += grad_x (same as wte grad).
+     * Without this, position embeddings are NEVER trained → model has no
+     * position awareness → attention treats all positions as same → collapse. */
+    if (m->grad_wpe_accum) {
+        float scale = 1.0f / n_tokens;
+        for (int t = 0; t < n_tokens; t++) {
+            if (t < m->cfg.n_ctx) {
+                float *gw = &m->grad_wpe_accum[(size_t)t * n];
                 for (int i = 0; i < n; i++)
                     gw[i] += gh[i] * scale;
             }
@@ -3497,6 +3520,33 @@ layer_done:
             for (int i = 0; i < n; i++) {
                 float g = gw[i] * inv_batch;
                 if (fabsf(g) < 1e-12f) continue;  /* skip unused tokens */
+                ma[i] = g_adam_beta1 * ma[i] + (1.0f - g_adam_beta1) * g;
+                va[i] = g_adam_beta2 * va[i] + (1.0f - g_adam_beta2) * g * g;
+                float mh = ma[i] / bc1;
+                float vh = sqrtf(va[i] / bc2) + g_adam_eps;
+                w[i] -= lr * mh / vh;
+            }
+        }
+    }
+
+    /* === Update position embeddings (wpe) with Adam ===
+     * Without this, position embeddings are random noise → model has no
+     * position awareness → attention collapses all positions → same output. */
+    if (m->grad_wpe_accum && m->m_wpe && m->v_wpe && g_use_adam && m->wpe) {
+        int n_ctx = m->cfg.n_ctx;
+        int t = g_opt_step + 1;
+        float bc1 = 1.0f - powf(g_adam_beta1, (float)t);
+        float bc2 = 1.0f - powf(g_adam_beta2, (float)t);
+        float inv_batch = 1.0f / (float)batch_size;
+
+        for (int pos = 0; pos < n_ctx; pos++) {
+            float *w  = &m->wpe[(size_t)pos * n];
+            float *gw = &m->grad_wpe_accum[(size_t)pos * n];
+            float *ma = &m->m_wpe[(size_t)pos * n];
+            float *va = &m->v_wpe[(size_t)pos * n];
+            for (int i = 0; i < n; i++) {
+                float g = gw[i] * inv_batch;
+                if (fabsf(g) < 1e-12f) continue;
                 ma[i] = g_adam_beta1 * ma[i] + (1.0f - g_adam_beta1) * g;
                 va[i] = g_adam_beta2 * va[i] + (1.0f - g_adam_beta2) * g * g;
                 float mh = ma[i] / bc1;
