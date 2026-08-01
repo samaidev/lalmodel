@@ -864,9 +864,10 @@ static void generate_text(Model *m, const char *prompt, const int *prompt_ids,
     for (int i = 0; i < prompt_len; i++) out_tokens[out_len++] = prompt_tokens[i];
 
     int vocab = m->cfg.vocab_size;
-    /* 重复惩罚:对已生成的 token 降权 */
-    static float penalty[40000];
-    memset(penalty, 0, vocab * sizeof(float));
+    /* 重复惩罚:对已生成的 token 降权 (每个 token 只惩罚一次,不重复)
+     * BUG #39 FIX: 用 char 数组标记是否已惩罚,避免 float 的精度问题 */
+    static char penalty[40000];
+    memset(penalty, 0, vocab * sizeof(char));
 
     for (int step = 0; step < max_gen && out_len < 2000; step++) {
         int next;
@@ -886,15 +887,39 @@ static void generate_text(Model *m, const char *prompt, const int *prompt_ids,
         adjusted_logits[1] = -1e30f;  /* <s> */
         adjusted_logits[2] = -1e30f;  /* </s> */
 
+        /* 重复惩罚:对已生成的 token logit 除以 1.5
+         * BUG #39 FIX: 旧代码对同一个 token 多次出现会重复惩罚
+         * (如 token 5 出现 3 次 → logit /= 1.5 三次 → logit / 3.375).
+         * 标准 HuggingFace 重复惩罚只对每个 token 惩罚一次,不管出现几次。
+         * 修复:用 penalty[] 数组标记已生成的 token,只惩罚一次。 */
         for (int j = 0; j < out_len; j++) {
-            if (out_tokens[j] >= 0 && out_tokens[j] < vocab) {
-                if (adjusted_logits[out_tokens[j]] > 0)
-                    adjusted_logits[out_tokens[j]] /= 1.5f;
+            int tok = out_tokens[j];
+            if (tok >= 0 && tok < vocab && !penalty[tok]) {
+                if (adjusted_logits[tok] > 0)
+                    adjusted_logits[tok] /= 1.5f;
                 else
-                    adjusted_logits[out_tokens[j]] *= 1.5f;
+                    adjusted_logits[tok] *= 1.5f;
+                penalty[tok] = 1;  /* 标记已惩罚,后续不再重复 */
             }
         }
-        
+
+        /* No-repeat-trigram: 如果当前 token 会和前 2 个 token 形成一个已经出现过的
+         * 3-gram,就屏蔽它。这防止模型陷入 "准和准和准和..." 这样的循环。
+         * 标准 GPT-2/LLaMA 生成都用这个技巧。
+         * 只在 out_len >= 2 时检查 (需要至少 2 个前缀 token)。 */
+        if (out_len >= 2) {
+            int prev1 = out_tokens[out_len - 1];
+            int prev2 = out_tokens[out_len - 2];
+            /* 搜索所有历史位置,看 (prev2, prev1, X) 是否出现过 */
+            for (int j = 0; j + 2 < out_len; j++) {
+                if (out_tokens[j] == prev2 && out_tokens[j+1] == prev1) {
+                    int banned = out_tokens[j+2];
+                    if (banned >= 0 && banned < vocab)
+                        adjusted_logits[banned] = -1e30f;
+                }
+            }
+        }
+
         if (temp <= 0.01f) {
             next = sample_argmax(adjusted_logits, vocab);
         } else {

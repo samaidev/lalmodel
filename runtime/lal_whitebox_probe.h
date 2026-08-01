@@ -660,8 +660,7 @@ static void whitebox_probe(Model *m) {
  * ======================================================================== */
 static void concept_similarity_probe(Model *m) {
     int n_embd = m->cfg.n_embd;
-    int mid_layer = m->cfg.n_layer / 2;
-    
+
     printf("--- Concept Similarity (mid-layer weights) ---\n\n");
     
     float *embs[32];
