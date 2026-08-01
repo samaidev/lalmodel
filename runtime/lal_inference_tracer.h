@@ -58,13 +58,41 @@ static float inference_trace_compact(Model *m, const char *prompt,
 
     int tokens[512];
     int n_tok = 0;
-    for (int i = 0; prompt[i] && n_tok < 512; i++)
-        tokens[n_tok++] = (unsigned char)prompt[i];
+
+    /* BUG #26 FIX: use BPE tokenization (prompt_tokenize) when vocab > 256.
+     * Old code treated prompt as raw UTF-8 bytes — for Chinese prompt "热"
+     * (3 UTF-8 bytes) it produced [231, 131, 173] (byte-fallback tokens)
+     * instead of [32226] (the single BPE token for 热). The model then
+     * processed 3 wrong tokens, and the trace showed garbage activations.
+     *
+     * prompt_tokenize is declared static in ste_train.c (the only file that
+     * includes this header), so it's visible here via forward declaration. */
+    if (V > 256) {
+        n_tok = prompt_tokenize(prompt, tokens, 512);
+    }
+    if (n_tok == 0) {
+        /* Byte-level fallback (byte mode or BPE tokenization failed) */
+        for (int i = 0; prompt[i] && n_tok < 512; i++)
+            tokens[n_tok++] = (unsigned char)prompt[i];
+    }
     if (n_tok == 0) return -1.0f;
 
-    /* REAL inference path */
+    /* BUG #27 FIX: use g_use_pure_float=1 to match training mode.
+     * Old code set g_use_pure_float=0, switching to binary forward
+     * (sign(w) * alpha * XNOR popcount). The activations seen by the
+     * trace were from a completely different forward path than training
+     * (which uses pure_float=1). CORE/BINARY values were meaningless.
+     *
+     * BUG #28 FIX: save/restore global flags. Old code set globals but
+     * never restored them → after trace at step 50, g_use_pure_float
+     * stayed at 0 for the rest of training, corrupting all subsequent
+     * forward passes (binary mode instead of pure float). */
+    int saved_pure_float = g_use_pure_float;
+    int saved_real_attn = g_use_real_attention;
+    int saved_ste = g_use_ste;
+
     g_use_real_attention = 1;
-    g_use_pure_float = 0;
+    g_use_pure_float = 1;  /* match training mode */
     g_use_ste = 1;
 
     model_stateful_begin(m);
@@ -73,7 +101,14 @@ static float inference_trace_compact(Model *m, const char *prompt,
     const float *logits = NULL;
     for (int i = 0; i < n_tok; i++)
         logits = model_stateful_forward_sliding(m, tokens[i]);
-    if (!logits) return -1.0f;
+
+    /* BUG #28 FIX: restore flags even on early return */
+    if (!logits) {
+        g_use_pure_float = saved_pure_float;
+        g_use_real_attention = saved_real_attn;
+        g_use_ste = saved_ste;
+        return -1.0f;
+    }
 
     /* Read REAL activations from m->acts */
     printf("  [TRACE] \"%s\": ", label);
@@ -149,8 +184,13 @@ static float inference_trace_compact(Model *m, const char *prompt,
 
     printf("| H=%.2f/%.0f top3=", eb, mb);
     for (int r = 0; r < 3; r++)
-        printf("0x%02X ", top3[r]);
+        printf("%d ", top3[r]);
     printf("\n");
+
+    /* BUG #28 FIX: restore global flags to pre-trace state */
+    g_use_pure_float = saved_pure_float;
+    g_use_real_attention = saved_real_attn;
+    g_use_ste = saved_ste;
 
     return eb;
 }
@@ -164,6 +204,7 @@ static void inference_compare_compact(Model *m, const char *pa, const char *la,
     int n = m->cfg.n_embd;
     int nL = m->cfg.n_layer;
     int mlp_dim = m->cfg.mlp_dim;
+    int V = m->cfg.vocab_size;
 
     const char *prompts[] = {pa, pb};
     const char *labels[] = {la, lb};
@@ -172,15 +213,26 @@ static void inference_compare_compact(Model *m, const char *pa, const char *la,
     float layer_bin[2][32];
     float layer_xnorm[2][32];
 
+    /* BUG #27/#28 FIX: save flags, use pure_float=1 (match training), restore after */
+    int saved_pure_float = g_use_pure_float;
+    int saved_real_attn = g_use_real_attention;
+    int saved_ste = g_use_ste;
+
     g_use_real_attention = 1;
-    g_use_pure_float = 0;
+    g_use_pure_float = 1;  /* match training mode */
     g_use_ste = 1;
 
     for (int inp = 0; inp < 2; inp++) {
         int tokens[512];
         int n_tok = 0;
-        for (int i = 0; prompts[inp][i] && n_tok < 512; i++)
-            tokens[n_tok++] = (unsigned char)prompts[inp][i];
+        /* BUG #26 FIX: use BPE tokenization when vocab > 256 */
+        if (V > 256) {
+            n_tok = prompt_tokenize(prompts[inp], tokens, 512);
+        }
+        if (n_tok == 0) {
+            for (int i = 0; prompts[inp][i] && n_tok < 512; i++)
+                tokens[n_tok++] = (unsigned char)prompts[inp][i];
+        }
 
         model_stateful_begin(m);
         model_set_sliding_window(m, m->cfg.sliding_window, m->cfg.n_sinks);
@@ -213,6 +265,11 @@ static void inference_compare_compact(Model *m, const char *pa, const char *la,
         }
     }
 
+    /* BUG #28 FIX: restore global flags */
+    g_use_pure_float = saved_pure_float;
+    g_use_real_attention = saved_real_attn;
+    g_use_ste = saved_ste;
+
     printf("  [CMP] %s vs %s:\n", la, lb);
     printf("  [CMP]  L  | CORE_a  CORE_b  diff  | BIN_a   BIN_b   diff  | ||x||_a ||x||_b\n");
     for (int l = 0; l < nL && l < 32; l++) {
@@ -238,14 +295,25 @@ static float inference_circuit_trace(Model *m, const char *prompt,
 
     int tokens[512];
     int n_tok = 0;
-    for (int i = 0; prompt[i] && n_tok < 512; i++)
-        tokens[n_tok++] = (unsigned char)prompt[i];
+    /* BUG #26 FIX: use BPE tokenization when vocab > 256 */
+    if (V > 256) {
+        n_tok = prompt_tokenize(prompt, tokens, 512);
+    }
+    if (n_tok == 0) {
+        for (int i = 0; prompt[i] && n_tok < 512; i++)
+            tokens[n_tok++] = (unsigned char)prompt[i];
+    }
     if (n_tok == 0) return -1.0f;
 
-    printf("\n  === Trace: \"%s\" (%d bytes) ===\n", label, n_tok);
+    printf("\n  === Trace: \"%s\" (%d tokens) ===\n", label, n_tok);
+
+    /* BUG #27/#28 FIX: save flags, use pure_float=1 (match training), restore after */
+    int saved_pure_float = g_use_pure_float;
+    int saved_real_attn = g_use_real_attention;
+    int saved_ste = g_use_ste;
 
     g_use_real_attention = 1;
-    g_use_pure_float = 0;
+    g_use_pure_float = 1;  /* match training mode */
     g_use_ste = 1;
 
     model_stateful_begin(m);
@@ -254,9 +322,16 @@ static float inference_circuit_trace(Model *m, const char *prompt,
     const float *logits = NULL;
     for (int i = 0; i < n_tok; i++)
         logits = model_stateful_forward_sliding(m, tokens[i]);
-    if (!logits) return -1.0f;
 
-    printf("  [INPUT] last token=0x%02X\n", tokens[n_tok-1]);
+    /* BUG #28 FIX: restore flags even on early return */
+    if (!logits) {
+        g_use_pure_float = saved_pure_float;
+        g_use_real_attention = saved_real_attn;
+        g_use_ste = saved_ste;
+        return -1.0f;
+    }
+
+    printf("  [INPUT] last token=%d\n", tokens[n_tok-1]);
 
     for (int l = 0; l < nL; l++) {
         TransAct *act = &m->acts[l];
@@ -301,6 +376,12 @@ static float inference_circuit_trace(Model *m, const char *prompt,
     float mb = logf(V) / logf(2.0f);
 
     printf("\n  [OUT] entropy=%.2f/%.2f bits (%.1f%% random)\n", eb, mb, 100.0f*eb/mb);
+
+    /* BUG #28 FIX: restore global flags */
+    g_use_pure_float = saved_pure_float;
+    g_use_real_attention = saved_real_attn;
+    g_use_ste = saved_ste;
+
     return eb;
 }
 
