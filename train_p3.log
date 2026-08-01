@@ -1,0 +1,39 @@
+[*] Loaded 32768 vocab pieces from tokenizer/chinese_bpe.vocab
+=== LAL STE Whitebox-Supervised Training ===
+
+[*] Method: Straight-Through Estimator + CORE/BINARY/PRUNE Logic Guidance
+[*]   forward:  CORE = w_float * core_gain * K     (精确计算)
+[*]             BINARY = sign(w) * alpha * K       (二值符号)
+[*]             PRUNE = 0                           (静默剪枝)
+[*]   backward: STE through w_float (CORE+BINARY), PRUNE 无梯度
+[*]   update:   Adam on w_float
+[*] Logic Guidance (每步,全层):
+[*]             CORE  → maximize |act(a) - act(b)|  (差异化反义词)
+[*]             BINARY → minimize (act(a) - act(b))^2 (收敛共性)
+[*]             PRUNE → skip (保持静默)
+[*] Whitebox probe: every 10 steps observe CORE/BINARY/PRUNE circuit
+
+[*] Loaded 69990 samples from data/general_bpe.bin
+[*] Using Phase 3: Bloom (14L/640d) (~68M params, vocab=32768)
+[*] Generated Phase 3: Bloom (14L/640d) weights: 14 layers, 640 embd, ~68M params
+[*] Logic mask: Phase 3: Full (20/75/05) (CORE=20% PRUNE=5%)
+[*] loaded 172 tensors
+[*] binarizing 14 layers (logic-guided)...
+    [logic] CORE=384 (20%), BINARY=1440 (75%), PRUNE=96 (5%)
+[*] done
+[*] freed 56 weight tensors (275 MB) after binarization
+[*] Model loaded: 14 layers, 640 embd, k_cache=YES
+
+
+=== LAL STE Training (B=4, max_pos=64, steps=200, logic_lr=0.0020) ===
+[*] STE: forward=sign(w), backward=w_float gradient
+[*] Whitebox probe every 10 steps
+[*] Semantic regularization every step
+
+  step     0/200  loss=10.6329  avg=10.6329  lr=0.000020  B=16  31999ms
+  [WB] boundary=83/100  core_diff=0.0248  bin_diff=0.0001  ratio=404.16  prune_act=0.0000
+  [WB] structure=28/28 (100%)  opp_sim=0.171
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [WB] boundary=83/100  core_diff=0.0248  bin_diff=0.0001  ratio=404.16  prune_act=0.0000
+  [WB] structure=28/28 (100%)  opp_sim=0.171
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
