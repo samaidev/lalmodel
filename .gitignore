@@ -1,0 +1,8 @@
+output_trace
+ste_train
+*.o
+*.ste
+data/cognitive_bpe.bin
+data/cog_large_bpe.bin
+__pycache__/
+*.pyc
