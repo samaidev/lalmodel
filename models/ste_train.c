@@ -817,13 +817,25 @@ static void generate_text(Model *m, const char *prompt, const int *prompt_ids,
     /* 重复惩罚:对已生成的 token 降权 */
     static float penalty[40000];
     memset(penalty, 0, vocab * sizeof(float));
-    
+
     for (int step = 0; step < max_gen && out_len < 2000; step++) {
         int next;
-        
+
         /* 应用重复惩罚:已生成的 token logit 除以 1.5 */
         static float adjusted_logits[40000];
         memcpy(adjusted_logits, logits, vocab * sizeof(float));
+
+        /* BUG #24 FIX: mask special tokens during generation.
+         * SentencePiece vocab reserves ids 0-2 for <unk>, <s>, </s>.
+         * These should NEVER be generated (the model can emit them due to
+         * untrained bias, polluting output with literal strings like
+         * "</s>" or "<s>"). Set their logits to -INFINITY.
+         * Byte-fallback tokens (id 3-258, format <0xNN>) are kept because
+         * the model legitimately needs them for OOV characters. */
+        adjusted_logits[0] = -1e30f;  /* <unk> */
+        adjusted_logits[1] = -1e30f;  /* <s> */
+        adjusted_logits[2] = -1e30f;  /* </s> */
+
         for (int j = 0; j < out_len; j++) {
             if (out_tokens[j] >= 0 && out_tokens[j] < vocab) {
                 if (adjusted_logits[out_tokens[j]] > 0)
@@ -845,7 +857,12 @@ static void generate_text(Model *m, const char *prompt, const int *prompt_ids,
                 int max_idx = j;
                 for (int k = j + 1; k < vocab; k++)
                     if (adjusted_logits[indices[k]] > adjusted_logits[indices[max_idx]]) max_idx = k;
-                int tmp = indices[j]; indices[j] = indices[max_idx]; indices[j] = tmp;
+                /* BUG #25 FIX: 旧代码写错成 indices[j] = tmp (无操作,没真正交换)
+                 * → indices 保持 0,1,2,...,k_limit-1 → 被mask的 token 0 被当 max_l,
+                 * 其他 token 的 expf 溢出成 +inf → sum=inf, r=inf → 采样永远 fallback
+                 * 到 indices[0]=0 → 一直输出 <unk>。
+                 * 正确的交换是 indices[max_idx] = tmp。 */
+                int tmp = indices[j]; indices[j] = indices[max_idx]; indices[max_idx] = tmp;
             }
             float max_l = adjusted_logits[indices[0]];
             static float probs[40000];
@@ -875,7 +892,9 @@ static void generate_text(Model *m, const char *prompt, const int *prompt_ids,
         out_tokens[out_len++] = next;
         decode_token(next);
         fflush(stdout);
-        if (next == 0) break;
+        /* BUG #24: stop on </s> (id=2) instead of <unk> (id=0).
+         * <unk> is now masked so never generated; </s> is the proper EOS. */
+        if (next == 2) break;
         logits = model_stateful_forward_sliding(m, next);
         if (!logits) break;
     }
