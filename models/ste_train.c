@@ -468,6 +468,8 @@ static int ste_save(Model *m, const char *path) {
     fwrite(&n_embd, 4, 1, f);
     fwrite(&mlp_dim, 4, 1, f);
     fwrite(&vocab, 4, 1, f);
+    /* BUG #41 FIX: g_opt_step is appended at END of file (after all weights)
+     * for backward compatibility with old .ste files. */
 
     /* wte */
     fwrite(m->wte, sizeof(float), (size_t)vocab * n_embd, f);
@@ -502,6 +504,8 @@ static int ste_save(Model *m, const char *path) {
         fwrite(tl->norm2_w, sizeof(float), n_embd, f);
         fwrite(tl->norm2_b, sizeof(float), n_embd, f);
     }
+    /* BUG #41 FIX: append g_opt_step at END of file for resume continuity */
+    fwrite(&g_opt_step, sizeof(int), 1, f);
     fclose(f);
     return 0;
 }
@@ -526,6 +530,10 @@ static int ste_load(Model *m, const char *path) {
         fclose(f);
         return -1;
     }
+
+    /* BUG #41: g_opt_step is saved at END of file (not here) for backward
+     * compatibility with old .ste files that don't have it. See ste_load
+     * epilogue after all weights are read. */
 
     fread(m->wte, sizeof(float), (size_t)vocab * n_embd, f);
     /* wpe */
@@ -557,6 +565,17 @@ static int ste_load(Model *m, const char *path) {
         fread(tl->norm1_b, sizeof(float), n_embd, f);
         fread(tl->norm2_w, sizeof(float), n_embd, f);
         fread(tl->norm2_b, sizeof(float), n_embd, f);
+    }
+    /* BUG #41 FIX: try to read g_opt_step from END of file.
+     * Old .ste files don't have this — fread returns 0, g_opt_step stays 0.
+     * New files have it — resume preserves Adam step count. */
+    {
+        int saved_opt_step = 0;
+        size_t rc = fread(&saved_opt_step, sizeof(int), 1, f);
+        if (rc == 1) {
+            g_opt_step = saved_opt_step;
+            printf("[*] Resumed g_opt_step = %d (Adam bias correction preserved)\n", g_opt_step);
+        }
     }
     fclose(f);
     return 0;
