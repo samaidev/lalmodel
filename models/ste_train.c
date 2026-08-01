@@ -309,7 +309,12 @@ static void deep_whitebox_diagnosis(Model *m) {
             if (fc0->logic_mask[j] == 0) { if(a>core_max)core_max=a; core_avg+=a; nc++; }
             else if (fc0->logic_mask[j] == 1) { if(a>bin_max)bin_max=a; bin_avg+=a; nb++; }
         }
-        core_avg /= nc; bin_avg /= nb;
+        /* BUG #43 FIX: guard against division by zero when nc or nb is 0.
+         * With standard logic ratios (CORE≥15%, BINARY≥60%) this shouldn't
+         * happen, but defensive coding prevents NaN in edge cases (e.g.
+         * custom logic mask with all-PRUNE or all-CORE layers). */
+        if (nc > 0) core_avg /= nc; else core_avg = 0;
+        if (nb > 0) bin_avg /= nb; else bin_avg = 0;
 
         printf("  Layer 0 mlp activation (for '热'):\n");
         printf("    CORE  : max=%.4f avg=%.4f  (n=%d)\n", core_max, core_avg, nc);
@@ -319,7 +324,8 @@ static void deep_whitebox_diagnosis(Model *m) {
         for (int j = 0; j < mlp_dim; j++)
             if (fc0->logic_mask[j] == 0)
                 core_diff += fabsf(act_hot[j] - act_cold[j]);
-        core_diff /= nc;
+        /* BUG #43: guard against nc=0 (same fix as above) */
+        if (nc > 0) core_diff /= nc;
         printf("    CORE diff (热 vs 冷): %.4f (%.1f%% of avg)\n",
                core_diff, core_avg > 0 ? 100*core_diff/core_avg : 0);
         if (core_diff < 0.05f) {
@@ -351,7 +357,10 @@ static void deep_whitebox_diagnosis(Model *m) {
             else if (bl->logic_mask[j] == 1) { bin_norm += row_norm; nb++; }
             else { prune_norm += row_norm; np++; }
         }
-        core_norm /= nc; bin_norm /= nb; prune_norm /= np;
+        /* BUG #43: guard against division by zero when nc/nb/np is 0 */
+        if (nc > 0) core_norm /= nc; else core_norm = 0;
+        if (nb > 0) bin_norm /= nb; else bin_norm = 0;
+        if (np > 0) prune_norm /= np; else prune_norm = 0;
         printf("  L%d: CORE=%.4f BIN=%.4f PRUNE=%.4f", l, core_norm, bin_norm, prune_norm);
         if (core_norm > bin_norm * 1.1f && bin_norm > prune_norm * 1.1f) {
             printf("  [OK layered]\n");
