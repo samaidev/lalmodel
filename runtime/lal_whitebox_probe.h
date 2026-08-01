@@ -134,31 +134,35 @@ static void simulate_activation(Model *m, const float *emb, int layer,
     int in_dim = fc->in_dim;
     memset(out_activations, 0, out_dim * sizeof(float));
 
-    /* Direct matmul: out[j] = sum(emb[i] * w_float[j*in + i]) + bias
-     * PRUNE (mask=2) outputs 0 (matches bin_forward logic_mask path).
-     * CORE (mask=0) applies core_gain = min(1/alpha, 5).
-     * BINARY (mask=1) applies alpha to approximate sign(w)*alpha scaling. */
+    /* Must match bin_forward_pure_float exactly:
+     *   CORE: s = w_core[core_idx] · x + bias  (no core_gain, no K)
+     *   BINARY: s = w_float[j] · x + bias
+     *   PRUNE: 0
+     * Previously used w_float for CORE (wrong!) and applied core_gain
+     * (not used in pure_float mode). This caused logic_guided to compute
+     * incorrect activations → semantic gradient on wrong values. */
+    int core_idx = 0;
     for (int j = 0; j < out_dim; j++) {
-        /* PRUNE: output 0, skip computation (matches forward path) */
+        /* PRUNE: output 0 */
         if (fc->logic_mask && fc->logic_mask[j] == 2) {
             out_activations[j] = 0.0f;
             continue;
         }
         float s = fc->bias ? fc->bias[j] : 0;
-        const float *wf = &fc->w_float[(size_t)j * in_dim];  /* [out,in] layout */
-        for (int i = 0; i < in_dim; i++) {
-            s += emb[i] * wf[i];
-        }
-        if (fc->logic_mask) {
-            if (fc->logic_mask[j] == 0) {
-                /* CORE: apply core_gain = min(1/alpha, 5) */
-                float cg = 1.0f / (fc->alpha[j] + 1e-8f);
-                if (cg > 5.0f) cg = 5.0f;
-                s *= cg;
-            } else if (fc->logic_mask[j] == 1) {
-                /* BINARY: apply alpha to approximate sign(w)*alpha scaling */
-                s *= fc->alpha[j];
+
+        if (fc->logic_mask && fc->logic_mask[j] == 0) {
+            /* CORE: use w_core (matches bin_forward_pure_float) */
+            if (fc->w_core) {
+                const float *wc = &fc->w_core[core_idx * in_dim];
+                for (int i = 0; i < in_dim; i++)
+                    s += emb[i] * wc[i];
             }
+            core_idx++;
+        } else {
+            /* BINARY: use w_float (matches bin_forward_pure_float) */
+            const float *wf = &fc->w_float[(size_t)j * in_dim];
+            for (int i = 0; i < in_dim; i++)
+                s += emb[i] * wf[i];
         }
         out_activations[j] = s;
     }
