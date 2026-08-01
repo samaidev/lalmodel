@@ -656,7 +656,7 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
             /* 在 apply 之前加语义引导梯度,与训练梯度一起更新 */
             float logic_loss = logic_guided_regularization(m, logic_lr);
             model_batch_apply(m, lr, n_valid);
-            g_opt_step++;
+            /* g_opt_step is incremented inside model_batch_apply — don't double-increment */
             if (step % 10 == 0) {
                 printf("  [LOGIC] loss=%.4f\n", logic_loss);
             }
