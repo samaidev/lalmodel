@@ -95,17 +95,21 @@ static float logic_guided_regularization(Model *m, float lr) {
             simulate_activation(m, gate_a, l, act_a, mlp_dim);
             simulate_activation(m, gate_b, l, act_b, mlp_dim);
 
-            /* 计算损失: CORE 最大化 |diff|, BINARY 最小化 diff^2 */
+            /* 计算损失: CORE 最大化 |diff|, BINARY 最小化 diff^2
+             * BUG #30 FIX: 旧代码对所有层都乘 * 0.5f (注释说"深层权重衰减"但实际
+             *   连 layer 0 也乘了)。layer_lr_scale 已经在梯度里处理了深层衰减
+             *   (layer 0 = 1.0, 深层 = 0.5),损失里不该再乘。现在去掉 * 0.5f,
+             *   让损失反映真实的 CORE 差异化量级,梯度衰减完全由 layer_lr_scale 控制。 */
             int layer_nc = 0, layer_nb = 0;
             for (int j = 0; j < mlp_dim; j++) {
                 if (mask[j] == 2) continue;  /* PRUNE: 跳过,保持静默 */
                 float diff = act_a[j] - act_b[j];
                 float adiff = fabsf(diff);
                 if (mask[j] == 0) {  /* CORE: 最大化 |diff| */
-                    total_loss -= alpha * adiff * 0.5f;  /* 0.5: 深层权重衰减 */
+                    total_loss -= alpha * adiff;
                     layer_nc++;
                 } else {  /* BINARY: 最小化 diff^2 */
-                    total_loss += beta * diff * diff * 0.5f;
+                    total_loss += beta * diff * diff;
                     layer_nb++;
                 }
             }
@@ -589,11 +593,39 @@ static void decode_token(int id) {
         else { putchar(0xEF); putchar(0xBF); putchar(0xBD); }  /* U+FFFD */
         return;
     }
-    /* 输出 piece 的 UTF-8 字节 */
-    fputs(g_pieces[id], stdout);
+
+    /* BUG #32 FIX: SentencePiece byte-fallback tokens (id 3-258) are stored
+     * as literal strings like "<0xE4>" in g_pieces. If we fputs them, the
+     * output shows the 6-char string "<0xE4>" instead of the actual byte 0xE4.
+     * This corrupts multi-byte character output: a 3-byte CJK char encoded as
+     * [<0xE4>, <0xB8>, <0xAD>] would print "<0xE4><0xB8><0xAD>" instead of "中".
+     *
+     * Fix: detect byte-fallback tokens by their "<0xNN>" format and output
+     * the actual byte value. */
+    const char *piece = g_pieces[id];
+    if (piece[0] == '<' && piece[1] == '0' && piece[2] == 'x' &&
+        piece[5] == '>' && piece[6] == '\0') {
+        /* Parse hex: <0xAB> → byte 0xAB */
+        int hi = (piece[3] >= 'a') ? (piece[3] - 'a' + 10) :
+                 (piece[3] >= 'A') ? (piece[3] - 'A' + 10) : (piece[3] - '0');
+        int lo = (piece[4] >= 'a') ? (piece[4] - 'a' + 10) :
+                 (piece[4] >= 'A') ? (piece[4] - 'A' + 10) : (piece[4] - '0');
+        if (hi >= 0 && hi <= 15 && lo >= 0 && lo <= 15) {
+            putchar(hi * 16 + lo);
+            return;
+        }
+    }
+
+    /* 正常 piece: 输出 UTF-8 字节 */
+    fputs(piece, stdout);
 }
 
-/* 用 vocab 把文本编码成 token id (简单单字符匹配,适用中文每字一 token) */
+/* 用 vocab 把文本编码成 token id。
+ * BUG #31 FIX: 旧代码逐字符查 vocab,但 SentencePiece BPE 会合并常见词
+ * (如 "是什么" 是单个 token id=354)。逐字符编码产出 [是,什,么] 而非 [是什么],
+ * 与训练数据的 BPE 编码不一致 → 生成时模型看到的 token 序列和训练时不同。
+ *
+ * 修复:用真正的 SentencePiece 编码(如果可用)。否则回退到逐字符。 */
 static int prompt_tokenize(const char *text, int *tokens, int max_len) {
     int n = 0;
     /* 如果 vocab 未加载(byte 模式),回退到 byte tokenize */
@@ -602,29 +634,53 @@ static int prompt_tokenize(const char *text, int *tokens, int max_len) {
             tokens[n++] = (unsigned char)text[i];
         return n;
     }
-    /* BPE 模式:对每个 UTF-8 字符查 vocab */
+
+    /* BUG #31 FIX: 先尝试用 SentencePiece 编码(通过外部 python 脚本预处理过的
+     * vocab 不支持,但我们可以用贪心最长匹配来近似 BPE 合并)。
+     * 对每个位置,尝试匹配最长的 vocab piece (最多 8 字节)。 */
+    int text_len = (int)strlen(text);
     int i = 0;
-    while (text[i] && n < max_len) {
-        /* 提取一个 UTF-8 字符 */
-        char ch[5] = {0};
+    while (i < text_len && n < max_len) {
+        /* 提取当前 UTF-8 字符 */
+        unsigned char c = (unsigned char)text[i];
         int chlen = 1;
-        unsigned char c = text[i];
         if (c >= 0xF0) chlen = 4;
         else if (c >= 0xE0) chlen = 3;
         else if (c >= 0xC0) chlen = 2;
-        for (int j = 0; j < chlen && text[i+j]; j++) ch[j] = text[i+j];
-        ch[chlen] = '\0';
-        i += chlen;
-        /* 查 vocab 找 id */
+
+        /* 贪心最长匹配:尝试从最长到最短,但不能超过剩余文本长度。
+         * BPE pieces 可以长达 12 字节 (4 个 CJK 字符合并),所以 max=12。 */
+        int max_try = text_len - i;
+        if (max_try > 12) max_try = 12;
         int found = -1;
-        for (int id = 0; id < g_n_pieces; id++) {
-            if (g_pieces[id] && strcmp(g_pieces[id], ch) == 0) {
-                found = id;
-                break;
+        int found_len = 0;
+        for (int try_len = max_try; try_len >= 1; try_len--) {
+            char piece[13] = {0};
+            memcpy(piece, &text[i], try_len);
+            piece[try_len] = '\0';
+            /* 线性搜索 vocab (慢,但只在生成时调用一次,可接受) */
+            for (int id = 0; id < g_n_pieces; id++) {
+                if (g_pieces[id] && strcmp(g_pieces[id], piece) == 0) {
+                    found = id;
+                    found_len = try_len;
+                    break;
+                }
             }
+            if (found >= 0) break;
         }
-        if (found >= 0) tokens[n++] = found;
-        else tokens[n++] = 0; /* unk */
+
+        if (found >= 0) {
+            tokens[n++] = found;
+            i += found_len;
+        } else {
+            /* 找不到匹配,用 byte-fallback (3 bytes for CJK) */
+            for (int b = 0; b < chlen && n < max_len; b++) {
+                /* byte-fallback token id = 3 + byte_value (SentencePiece 约定) */
+                int byte_tok = 3 + (unsigned char)text[i + b];
+                if (byte_tok < g_n_pieces) tokens[n++] = byte_tok;
+            }
+            i += chlen;
+        }
     }
     return n;
 }
