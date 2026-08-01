@@ -260,7 +260,8 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
     }
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
     for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
-    clip_array(x, n, 10.0f);
+    /* BUG #48 FIX: normalize residual stream to prevent ||x|| explosion */
+    normalize_residual(x, n, 3.0f);
 
     /* MLP */
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
@@ -311,7 +312,8 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
         float mlp_scale = attn_norm / mlp_norm;
         for (int i = 0; i < n; i++) x[i] += rs * (act->proj_out[i] + mlp_scale * act->mlp_out[i]);
     }
-    clip_array(x, n, 10.0f);
+    /* BUG #48 FIX: normalize residual stream after MLP residual too */
+    normalize_residual(x, n, 3.0f);
 }
 
 /* Pure-float forward: same as trans_layer_forward but uses bin_forward_pure_float
@@ -350,7 +352,8 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
 
     bin_forward_pure_float(act->proj_out, act->attn_out, &tl->attn_o);
     for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
-    clip_array(x, n, 10.0f);
+    /* BUG #48 FIX: normalize residual stream */
+    normalize_residual(x, n, 3.0f);
 
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
     norm_forward(act->norm2_out, x, tl->norm2_w, tl->norm2_b, cfg->norm_type, n);
@@ -385,7 +388,8 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
         float mlp_scale = attn_norm / mlp_norm;
         for (int i = 0; i < n; i++) x[i] += rs * (act->proj_out[i] + mlp_scale * act->mlp_out[i]);
     }
-    clip_array(x, n, 10.0f);
+    /* BUG #48 FIX: normalize residual stream after MLP */
+    normalize_residual(x, n, 3.0f);
 }
 
 /* Global flag: use STE backward (updates w_float + repacks wbits) */
@@ -2436,6 +2440,28 @@ void clip_array(float *x, int n, float clip_val) {
     }
 }
 
+/* BUG #48 FIX: Normalize residual stream ||x|| to target_norm.
+ * The residual stream accumulates: x = wte + sum(attn_residual + mlp_residual).
+ * With residual_scale=1.0 and 8+ layers, ||x|| grows from ~1 (L0) to ~210 (L7).
+ * This causes logits = dot(final_ln, wte) to explode, making sampling degenerate.
+ *
+ * LayerNorm normalizes the INPUT to each sublayer, but NOT the residual x itself.
+ * So x grows unboundedly between layers.
+ *
+ * Fix: after each residual addition, scale x so ||x|| = target_norm (~3.0).
+ * This is similar to "RMSNorm on residual stream" used in some architectures.
+ * target_norm=3.0 matches the natural ||x|| after embedding + position encoding
+ * in early layers (before the residual starts accumulating). */
+void normalize_residual(float *x, int n, float target_norm) {
+    float norm_sq = 0;
+    for (int i = 0; i < n; i++) norm_sq += x[i] * x[i];
+    float norm = sqrtf(norm_sq) + 1e-8f;
+    if (norm > target_norm) {
+        float scale = target_norm / norm;
+        for (int i = 0; i < n; i++) x[i] *= scale;
+    }
+}
+
 /* ========================================================================
  * Full-vocab softmax cross-entropy (replaces sampled softmax for training)
  *
@@ -3083,7 +3109,8 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
     /* Output projection */
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
     for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
-    clip_array(x, n, 10.0f);
+    /* BUG #48 FIX: normalize residual stream */
+    normalize_residual(x, n, 3.0f);
 
     /* Norm2 + MLP */
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
@@ -3122,7 +3149,8 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
     attn_norm = sqrtf(attn_norm) + 1e-8f;
     float mlp_scale = (attn_norm / mlp_norm);  /* scale MLP to match attention */
     for (int i = 0; i < n; i++) x[i] += rs * (act->proj_out[i] + mlp_scale * act->mlp_out[i]);
-    clip_array(x, n, 10.0f);
+    /* BUG #48 FIX: normalize residual stream after MLP */
+    normalize_residual(x, n, 3.0f);
 }
 
 /* ─── Stateful Inference: Begin New Session ─────────────────────── */

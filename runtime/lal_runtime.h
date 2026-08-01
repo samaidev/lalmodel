@@ -263,6 +263,7 @@ void gen_random_gpw2(const char *path, ModelConfig cfg);
 
 /* Utility */
 void clip_array(float *x, int n, float clip_val);
+void normalize_residual(float *x, int n, float target_norm);  /* BUG #48 */
 /* Cross-entropy loss + gradient (full softmax over entire vocab) */
 float cross_entropy_full(const float *hidden, const float *wte,
                          int target, int vocab_size, int n_embd,
