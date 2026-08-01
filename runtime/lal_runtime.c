@@ -3694,16 +3694,24 @@ const float *model_stateful_forward_sliding(Model *m, int token) {
     compute_mean_std(m->x_before_final, n, &m->final_mean, &m->final_std_inv);
 
     int V = m->cfg.vocab_size;
-    /* Logits with wte norm normalization (cosine-similarity style).
-     * Without this, tokens with large ||wte[j]|| dominate logits
     /* Logits: raw dot product (tied embeddings).
      * Cosine normalization removed — it compressed logit range too much,
      * making sampling unable to distinguish good tokens from noise.
-     * Repetition penalty in generation handles mode collapse instead. */
+     * Repetition penalty in generation handles mode collapse instead.
+     *
+     * BUG #42 FIX: was a scalar loop (1 mul-add per iteration).
+     * Same computation as compute_full_logits and model_forward_float_logits,
+     * which both use 8-way unrolled loops for SIMD vectorization.
+     * The scalar version was 4-8x slower on vocab=32768. Now matches. */
     for (int j = 0; j < V; j++) {
         const float *w = &m->wte[(size_t)j * n];
         float s = 0;
-        for (int k = 0; k < n; k++)
+        for (int k = 0; k + 7 < n; k += 8)
+            s += m->final_ln[k+0]*w[k+0] + m->final_ln[k+1]*w[k+1]
+               + m->final_ln[k+2]*w[k+2] + m->final_ln[k+3]*w[k+3]
+               + m->final_ln[k+4]*w[k+4] + m->final_ln[k+5]*w[k+5]
+               + m->final_ln[k+6]*w[k+6] + m->final_ln[k+7]*w[k+7];
+        for (int k = (n/8)*8; k < n; k++)
             s += m->final_ln[k] * w[k];
         g_sctx.logits[j] = s;
     }
