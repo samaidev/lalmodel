@@ -268,13 +268,20 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
     compute_mean_std(act->x_pre_norm2, n, &act->norm2_cache[0], &act->norm2_cache[1]);
 
     if (cfg->act_type == ACT_SWIGLU) {
-        /* SwiGLU: hidden = silu(gate(ln2)) * up(ln2) */
-        float *gate = malloc(m * sizeof(float));
-        float *up = malloc(m * sizeof(float));
-        bin_fwd(gate, act->norm2_out, &tl->mlp_gate);
-        bin_fwd(up,   act->norm2_out, &tl->mlp_up);
-        for (int i = 0; i < m; i++) act->mlp_hidden[i] = silu(gate[i]) * up[i];
-        free(gate); free(up);
+        /* BUG #44 FIX: was malloc/free per call (2 heap ops × n_layer ×
+         * batch × n_preds per step = thousands of heap ops/step).
+         * Now uses static buffer that's allocated once and reused. */
+        static float *sgate = NULL, *sup = NULL;
+        static int sg_m = 0;
+        if (sg_m != m) {
+            free(sgate); free(sup);
+            sgate = malloc(m * sizeof(float));
+            sup = malloc(m * sizeof(float));
+            sg_m = m;
+        }
+        bin_fwd(sgate, act->norm2_out, &tl->mlp_gate);
+        bin_fwd(sup,   act->norm2_out, &tl->mlp_up);
+        for (int i = 0; i < m; i++) act->mlp_hidden[i] = silu(sgate[i]) * sup[i];
     } else {
         /* GELU: hidden = gelu(c_fc(ln2)) */
         bin_fwd(act->mlp_hidden, act->norm2_out, &tl->mlp_gate);
@@ -328,12 +335,18 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
     norm_forward(act->norm2_out, x, tl->norm2_w, tl->norm2_b, cfg->norm_type, n);
 
     if (cfg->act_type == ACT_SWIGLU) {
-        float *gate = malloc(m * sizeof(float));
-        float *up = malloc(m * sizeof(float));
-        bin_forward_pure_float(gate, act->norm2_out, &tl->mlp_gate);
-        bin_forward_pure_float(up,   act->norm2_out, &tl->mlp_up);
-        for (int i = 0; i < m; i++) act->mlp_hidden[i] = silu(gate[i]) * up[i];
-        free(gate); free(up);
+        /* BUG #44 FIX: static buffer instead of malloc/free per call */
+        static float *sgate = NULL, *sup = NULL;
+        static int sg_m = 0;
+        if (sg_m != m) {
+            free(sgate); free(sup);
+            sgate = malloc(m * sizeof(float));
+            sup = malloc(m * sizeof(float));
+            sg_m = m;
+        }
+        bin_forward_pure_float(sgate, act->norm2_out, &tl->mlp_gate);
+        bin_forward_pure_float(sup,   act->norm2_out, &tl->mlp_up);
+        for (int i = 0; i < m; i++) act->mlp_hidden[i] = silu(sgate[i]) * sup[i];
     } else {
         bin_forward_pure_float(act->mlp_hidden, act->norm2_out, &tl->mlp_gate);
         for (int i = 0; i < m; i++) act->mlp_hidden[i] = gelu(act->mlp_hidden[i]);
@@ -3017,12 +3030,18 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
     compute_mean_std(act->x_pre_norm2, n, &act->norm2_cache[0], &act->norm2_cache[1]);
 
     if (cfg->act_type == ACT_SWIGLU) {
-        float *gate = malloc(m * sizeof(float));
-        float *up = malloc(m * sizeof(float));
-        bin_fwd(gate, act->norm2_out, &tl->mlp_gate);
-        bin_fwd(up, act->norm2_out, &tl->mlp_up);
-        for (int i = 0; i < m; i++) act->mlp_hidden[i] = silu(gate[i]) * up[i];
-        free(gate); free(up);
+        /* BUG #44 FIX: static buffer instead of malloc/free per call */
+        static float *sgate = NULL, *sup = NULL;
+        static int sg_m = 0;
+        if (sg_m != m) {
+            free(sgate); free(sup);
+            sgate = malloc(m * sizeof(float));
+            sup = malloc(m * sizeof(float));
+            sg_m = m;
+        }
+        bin_fwd(sgate, act->norm2_out, &tl->mlp_gate);
+        bin_fwd(sup, act->norm2_out, &tl->mlp_up);
+        for (int i = 0; i < m; i++) act->mlp_hidden[i] = silu(sgate[i]) * sup[i];
     } else {
         bin_fwd(act->mlp_hidden, act->norm2_out, &tl->mlp_gate);
         for (int i = 0; i < m; i++) act->mlp_hidden[i] = gelu(act->mlp_hidden[i]);
