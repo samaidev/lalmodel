@@ -62,22 +62,64 @@ static float cosine_sim(const float *a, const float *b, int dim) {
  * Get concept embedding: sum of byte token embeddings
  * Direct wte read — no model_forward needed.
  * ======================================================================== */
+/* get_concept_embedding: lookup wte for a concept.
+ * For BPE mode (vocab > 256), use a hash→token-id mapping table
+ * that maps UTF-8 concept strings to their BPE token ids.
+ * For byte-level mode (vocab == 256), average UTF-8 byte embeddings. */
+
+/* BPE token ids for probe concepts (precomputed via SentencePiece) */
+typedef struct { const char *utf8; int bpe_id; } BpeTokenMap;
+static BpeTokenMap bpe_token_map[] = {
+    {"\xe7\x83\xad", 32226},  /* 热 */
+    {"\xe5\x86\xb7", 32551},  /* 冷 */
+    {"\xe5\xa4\xa7", 31974},  /* 大 */
+    {"\xe5\xb0\x8f", 31928},  /* 小 */
+    {"\xe4\xb8\x8a", 31926},  /* 上 */
+    {"\xe4\xb8\x8b", 31968},  /* 下 */
+    {"\xe4\xba\xae", 32545},  /* 亮 */
+    {"\xe6\x9a\x97", 32723},  /* 暗 */
+    {"\xe9\x87\x8d", 31995},  /* 重 */
+    {"\xe8\xbd\xbb", 235},    /* 轻 */
+    {"\xe5\xbf\xab", 32391},  /* 快 */
+    {"\xe6\x85\xa2", 32356},  /* 慢 */
+    {"\xe6\xb9\xbf", 233},    /* 湿 */
+    {"\xe5\xb9\xb2", 232},    /* 干 */
+};
+#define N_BPE_MAP (sizeof(bpe_token_map) / sizeof(bpe_token_map[0]))
+
 static void get_concept_embedding(Model *m, const char *utf8_bytes,
                                    float *out, int n_embd) {
     memset(out, 0, n_embd * sizeof(float));
-    int n_bytes = 0;
-    for (int i = 0; utf8_bytes[i]; i++) {
-        int tok = (unsigned char)utf8_bytes[i];
-        if (tok < m->cfg.vocab_size) {
-            float *row = m->wte + (size_t)tok * n_embd;
-            for (int j = 0; j < n_embd; j++)
-                out[j] += row[j];
-            n_bytes++;
+
+    if (m->cfg.vocab_size > 256) {
+        /* BPE mode: look up token id from mapping table */
+        int tok = -1;
+        for (int i = 0; i < (int)N_BPE_MAP; i++) {
+            if (strcmp(utf8_bytes, bpe_token_map[i].utf8) == 0) {
+                tok = bpe_token_map[i].bpe_id;
+                break;
+            }
         }
-    }
-    if (n_bytes > 0) {
+        if (tok < 0 || tok >= m->cfg.vocab_size) return;
+        float *row = m->wte + (size_t)tok * n_embd;
         for (int j = 0; j < n_embd; j++)
-            out[j] /= n_bytes;
+            out[j] = row[j];
+    } else {
+        /* Byte-level mode: average UTF-8 byte embeddings */
+        int n_bytes = 0;
+        for (int i = 0; utf8_bytes[i]; i++) {
+            int tok = (unsigned char)utf8_bytes[i];
+            if (tok < m->cfg.vocab_size) {
+                float *row = m->wte + (size_t)tok * n_embd;
+                for (int j = 0; j < n_embd; j++)
+                    out[j] += row[j];
+                n_bytes++;
+            }
+        }
+        if (n_bytes > 0) {
+            for (int j = 0; j < n_embd; j++)
+                out[j] /= n_bytes;
+        }
     }
 }
 
