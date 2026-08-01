@@ -907,13 +907,16 @@ int main(int argc, char **argv) {
     printf("[*]             PRUNE → skip (保持静默)\n");
     printf("[*] Whitebox probe: every 10 steps observe CORE/BINARY/PRUNE circuit\n\n");
 
-    /* 加载数据 */
+    /* 加载数据(diagnose-only 模式跳过) */
     DataLoader dl;
-    if (dataloader_init(&dl, data_path) != 0) {
-        fprintf(stderr, "[!] Failed to load %s\n", data_path);
-        return 1;
+    memset(&dl, 0, sizeof(dl));
+    if (n_steps > 0) {
+        if (dataloader_init(&dl, data_path) != 0) {
+            fprintf(stderr, "[!] Failed to load %s\n", data_path);
+            return 1;
+        }
+        printf("[*] Loaded %d samples from %s\n", dl.n_samples, data_path);
     }
-    printf("[*] Loaded %d samples from %s\n", dl.n_samples, data_path);
 
     /* 模型 Phase 选择: 0=8L/448d(22M), 1=10L/512d(35M), 2=12L/576d(50M), 3=14L/640d(68M) */
     if (phase_idx < 0 || phase_idx >= N_GROWTH_PHASES) phase_idx = 0;
