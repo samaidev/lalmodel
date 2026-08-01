@@ -293,7 +293,24 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_fwd(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    for (int i = 0; i < n; i++) x[i] += rs * act->mlp_out[i];
+    /* BUG #46/#47 FIX: MLP output normalization (matches sliding window path).
+     * Without this, training uses raw MLP output but inference normalizes
+     * MLP to match attention magnitude → train/infer mismatch.
+     * Also prevents ||x|| explosion: MLP weights grow larger than attention
+     * (CORE has 3x lr multiplier), so raw MLP output dominates the residual,
+     * causing ||x|| to grow from ~1 (L0) to ~210 (L7) over layers.
+     * The clip_array(x, 10) can't prevent this because individual elements
+     * may be <10 but the vector norm still grows. */
+    {
+        float mlp_norm = 0;
+        for (int i = 0; i < n; i++) mlp_norm += act->mlp_out[i] * act->mlp_out[i];
+        mlp_norm = sqrtf(mlp_norm) + 1e-8f;
+        float attn_norm = 0;
+        for (int i = 0; i < n; i++) attn_norm += act->proj_out[i] * act->proj_out[i];
+        attn_norm = sqrtf(attn_norm) + 1e-8f;
+        float mlp_scale = attn_norm / mlp_norm;
+        for (int i = 0; i < n; i++) x[i] += rs * (act->proj_out[i] + mlp_scale * act->mlp_out[i]);
+    }
     clip_array(x, n, 10.0f);
 }
 
@@ -357,7 +374,17 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_forward_pure_float(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    for (int i = 0; i < n; i++) x[i] += rs * act->mlp_out[i];
+    /* BUG #46/#47 FIX: MLP normalization (same as trans_layer_forward) */
+    {
+        float mlp_norm = 0;
+        for (int i = 0; i < n; i++) mlp_norm += act->mlp_out[i] * act->mlp_out[i];
+        mlp_norm = sqrtf(mlp_norm) + 1e-8f;
+        float attn_norm = 0;
+        for (int i = 0; i < n; i++) attn_norm += act->proj_out[i] * act->proj_out[i];
+        attn_norm = sqrtf(attn_norm) + 1e-8f;
+        float mlp_scale = attn_norm / mlp_norm;
+        for (int i = 0; i < n; i++) x[i] += rs * (act->proj_out[i] + mlp_scale * act->mlp_out[i]);
+    }
     clip_array(x, n, 10.0f);
 }
 
