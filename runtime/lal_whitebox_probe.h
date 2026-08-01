@@ -169,23 +169,37 @@ static void compute_gate_input(Model *m, const float *initial_emb,
     int n = n_embd;
     float rs = m->cfg.residual_scale;
 
-    /* Scratch buffers (heap-allocated to avoid stack overflow on large n_embd).
-     * BUG #20 FIX: when qkv_merged=1, attn_q produces [Q|K|V] concatenated
-     * (out_dim = 3*n). The original code allocated q as n floats → heap
-     * overflow. Now allocate 3n for the merged QKV buffer and extract V
-     * from offset 2n (matches trans_layer_forward_pure_float in lal_runtime.c). */
-    float *x        = malloc(n * sizeof(float));
-    float *norm1    = malloc(n * sizeof(float));
-    float *norm2    = malloc(n * sizeof(float));
-    float *qkv_buf  = m->cfg.qkv_merged ? malloc(3 * n * sizeof(float)) : NULL;
-    float *q        = m->cfg.qkv_merged ? NULL : malloc(n * sizeof(float));
-    float *v        = m->cfg.qkv_merged ? (qkv_buf + 2 * n) : malloc(n * sizeof(float));
-    float *attn_out = malloc(n * sizeof(float));
-    float *proj_out = malloc(n * sizeof(float));
-    float *gate_buf = malloc(mlp_dim * sizeof(float));
-    float *up_buf   = malloc(mlp_dim * sizeof(float));
-    float *hidden   = malloc(mlp_dim * sizeof(float));
-    float *mlp_out  = malloc(n * sizeof(float));
+    /* Static scratch buffers — allocated once, reused across calls.
+     * PERFORMANCE FIX: logic_guided_regularization calls this 112 times per
+     * training step (8 layers × 7 pairs × 2 concepts). Old code did 11
+     * malloc+free per call = 1232 heap ops/step. Now zero heap ops after
+     * first call. Buffers grow if model size increases (checked at runtime). */
+    static float *x = NULL, *norm1 = NULL, *norm2 = NULL;
+    static float *qkv_buf = NULL, *q = NULL, *v = NULL;
+    static float *attn_out = NULL, *proj_out = NULL;
+    static float *gate_buf = NULL, *up_buf = NULL, *hidden = NULL, *mlp_out = NULL;
+    static int s_n = 0, s_mlp = 0, s_qkv = 0;
+
+    int qkv_size = m->cfg.qkv_merged ? 3 * n : 0;
+    if (s_n != n || s_mlp != mlp_dim || s_qkv != qkv_size) {
+        free(x); free(norm1); free(norm2);
+        free(qkv_buf); free(q); free(v);
+        free(attn_out); free(proj_out);
+        free(gate_buf); free(up_buf); free(hidden); free(mlp_out);
+        x = malloc(n * sizeof(float));
+        norm1 = malloc(n * sizeof(float));
+        norm2 = malloc(n * sizeof(float));
+        qkv_buf = qkv_size > 0 ? malloc(qkv_size * sizeof(float)) : NULL;
+        q = qkv_size > 0 ? NULL : malloc(n * sizeof(float));
+        v = qkv_size > 0 ? (qkv_buf + 2 * n) : malloc(n * sizeof(float));
+        attn_out = malloc(n * sizeof(float));
+        proj_out = malloc(n * sizeof(float));
+        gate_buf = malloc(mlp_dim * sizeof(float));
+        up_buf = malloc(mlp_dim * sizeof(float));
+        hidden = malloc(mlp_dim * sizeof(float));
+        mlp_out = malloc(n * sizeof(float));
+        s_n = n; s_mlp = mlp_dim; s_qkv = qkv_size;
+    }
 
     /* x = initial_emb + wpe[0] */
     memcpy(x, initial_emb, n * sizeof(float));
@@ -244,12 +258,8 @@ static void compute_gate_input(Model *m, const float *initial_emb,
         for (int i = 0; i < n; i++) x[i] += rs * mlp_out[i];
         clip_array(x, n, 10.0f);
     }
-
-    free(x); free(norm1); free(norm2);
-    free(qkv_buf); free(q);
-    if (!m->cfg.qkv_merged) free(v);  /* v points into qkv_buf when merged */
-    free(attn_out); free(proj_out);
-    free(gate_buf); free(up_buf); free(hidden); free(mlp_out);
+    /* Static buffers — NOT freed here (reused on next call).
+     * They persist for the program lifetime and are auto-freed on exit. */
 }
 
 /* ========================================================================

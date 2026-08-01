@@ -157,6 +157,15 @@ static float logic_guided_regularization(Model *m, float lr) {
                         float g = grad_scale * (gate_a[i] - gate_b[i]);  /* BUG #19: gate_input, not emb */
                         ga[i] += g;  /* 累加,不直接改 w_float */
                     }
+                    /* BUG #33 FIX: bias gradient.
+                     * act[j] = w·gate + bias[j], so dL/d(bias[j]) = dL/d(act[j]) = -alpha*sign(diff)
+                     * (input term is 1, not gate_a-gate_b).
+                     * bias 直接平移激活水平,是调整 |diff| 最有效的参数。
+                     * 旧代码从不更新 bias_grad_accum → bias 只能通过主训练损失更新,
+                     * 逻辑引导对 bias 完全没有控制。 */
+                    if (fc->bias_grad_accum) {
+                        fc->bias_grad_accum[j] += -alpha * s * inv_nc * layer_lr_scale * lr;
+                    }
                 } else {  /* BINARY: 梯度推动收敛 */
                     /* BUG #21 FIX: Loss L = +beta * diff^2, minimize → dL/dw = +beta*2*diff*(gate_a-gate_b)
                      * w -= lr*grad_accum → w -= lr*beta*2*diff*(gate_a-gate_b) → diff^2 减小 ✓
@@ -172,6 +181,11 @@ static float logic_guided_regularization(Model *m, float lr) {
                     for (int i = 0; i < in_dim; i++) {
                         float g = grad_scale * (gate_a[i] - gate_b[i]);  /* BUG #19: gate_input, not emb */
                         ga[i] += g;  /* BUG #21: was -=, should be += (sign was reversed) */
+                    }
+                    /* BUG #33 FIX: bias gradient for BINARY.
+                     * dL/d(bias[j]) = +beta*2*diff (input term is 1). */
+                    if (fc->bias_grad_accum) {
+                        fc->bias_grad_accum[j] += beta * 2.0f * diff * inv_nb * layer_lr_scale * lr;
                     }
                 }
             }
@@ -784,20 +798,11 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
             if (recent_loss < best_recent_loss) best_recent_loss = recent_loss;
         }
 
-        /* 白箱探针:每 10 步检查 CORE/BINARY/PRUNE 逻辑电路 */
+        /* 白箱探针:每 10 步检查 CORE/BINARY/PRUNE 逻辑电路
+         * BUG #34 FIX: whitebox_probe_compact 内部已经打印 3 行 WB 指标,
+         * 这里不再重复打印 (旧代码会打印两遍相同的信息)。 */
         if (step % 10 == 0) {
-            ProbeMetrics pm = whitebox_probe_compact(m);
-            printf("  [WB] boundary=%.0f/100  core_diff=%.4f  bin_diff=%.4f  ratio=%.2f  prune_act=%.4f\n",
-                   pm.boundary_score, pm.core_diff_avg, pm.bin_diff_avg,
-                   pm.core_bin_ratio, pm.prune_act_avg);
-            printf("  [WB] structure=%d/%d (%.0f%%)  opp_sim=%.3f\n",
-                   pm.n_layers_ok, pm.n_layers_total,
-                   pm.n_layers_total > 0 ? 100.0f * pm.n_layers_ok / pm.n_layers_total : 0,
-                   1.0f - pm.boundary_score / 100.0f);
-            printf("  [WB] %s | %s | %s\n",
-                   pm.boundary_score > 70 ? "BOUNDARY OK" : "BOUNDARY weak",
-                   pm.core_bin_ratio > 1.0f ? "CORE>BIN OK" : "CORE<BIN!",
-                   pm.prune_act_avg < 0.01f ? "PRUNE silent OK" : "PRUNE noisy");
+            whitebox_probe_compact(m);
         }
 
         /* 逻辑引导已在 model_batch_apply 前累加梯度 */
