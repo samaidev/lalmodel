@@ -268,9 +268,10 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
     compute_mean_std(act->x_pre_norm2, n, &act->norm2_cache[0], &act->norm2_cache[1]);
 
     if (cfg->act_type == ACT_SWIGLU) {
-        /* BUG #44 FIX: was malloc/free per call (2 heap ops × n_layer ×
-         * batch × n_preds per step = thousands of heap ops/step).
-         * Now uses static buffer that's allocated once and reused. */
+        /* BUG #44 FIX: static buffer instead of malloc/free per call.
+         * BUG #45 FIX: cache gate/up in act->swiglu_gate/swiglu_up for backward.
+         *   Backward needs gate (pre-SiLU) to compute silu_grad(gate) * up.
+         *   Without caching, backward used silu_grad(hidden) which is wrong. */
         static float *sgate = NULL, *sup = NULL;
         static int sg_m = 0;
         if (sg_m != m) {
@@ -282,6 +283,9 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
         bin_fwd(sgate, act->norm2_out, &tl->mlp_gate);
         bin_fwd(sup,   act->norm2_out, &tl->mlp_up);
         for (int i = 0; i < m; i++) act->mlp_hidden[i] = silu(sgate[i]) * sup[i];
+        /* Cache for backward */
+        if (act->swiglu_gate) memcpy(act->swiglu_gate, sgate, m * sizeof(float));
+        if (act->swiglu_up) memcpy(act->swiglu_up, sup, m * sizeof(float));
     } else {
         /* GELU: hidden = gelu(c_fc(ln2)) */
         bin_fwd(act->mlp_hidden, act->norm2_out, &tl->mlp_gate);
@@ -536,8 +540,29 @@ void trans_layer_backward(float *grad_x, TransLayer *tl, TransAct *act,
     for (int i = 0; i < n; i++) g_mlp[i] = grad_x[i] * rs;
     BIN_BW(g_hidden, g_mlp, act->mlp_hidden, &tl->mlp_down, lr);
     if (cfg->act_type == ACT_SWIGLU) {
-        for (int i = 0; i < m; i++) g_hidden[i] *= silu_grad(act->mlp_hidden[i]);
-        BIN_BW(g_norm2, g_hidden, act->norm2_out, &tl->mlp_gate, lr);
+        /* BUG #45 FIX: correct SwiGLU backward.
+         * Forward: hidden[i] = silu(gate[i]) * up[i]
+         *   d(hidden)/d(gate) = silu_grad(gate) * up
+         *   d(hidden)/d(up) = silu(gate)
+         * So: g_gate[i] = g_hidden[i] * silu_grad(gate[i]) * up[i]
+         *     g_up[i]   = g_hidden[i] * silu(gate[i])
+         * Then g_norm2 = W_gate^T · g_gate + W_up^T · g_up
+         *
+         * Old code (WRONG):
+         *   g_hidden[i] *= silu_grad(act->mlp_hidden[i])  // used hidden, not gate!
+         *   BIN_BW(g_norm2, g_hidden, ...)                // only backprop'd mlp_gate
+         * Missing: mlp_up gradient entirely. And silu_grad(hidden) != silu_grad(gate). */
+        static float g_gate[16384], g_up[16384];
+        static float g_norm2_gate[16384], g_norm2_up[16384];
+        for (int i = 0; i < m; i++) {
+            float sv = silu(act->swiglu_gate[i]);
+            float sg = silu_grad(act->swiglu_gate[i]);
+            g_gate[i] = g_hidden[i] * sg * act->swiglu_up[i];
+            g_up[i]   = g_hidden[i] * sv;
+        }
+        BIN_BW(g_norm2_gate, g_gate, act->norm2_out, &tl->mlp_gate, lr);
+        BIN_BW(g_norm2_up,   g_up,   act->norm2_out, &tl->mlp_up,   lr);
+        for (int i = 0; i < n; i++) g_norm2[i] = g_norm2_gate[i] + g_norm2_up[i];
     } else {
         for (int i = 0; i < m; i++) g_hidden[i] *= gelu_grad(act->mlp_hidden[i]);
         BIN_BW(g_norm2, g_hidden, act->norm2_out, &tl->mlp_gate, lr);
@@ -601,6 +626,14 @@ TransAct *trans_act_alloc(ModelConfig *cfg) {
         acts[l].norm2_out = malloc(n * sizeof(float));
         acts[l].mlp_hidden = malloc(m * sizeof(float));
         acts[l].mlp_out = malloc(n * sizeof(float));
+        /* BUG #45 FIX: allocate SwiGLU gate/up cache (NULL for GELU mode) */
+        if (cfg->act_type == ACT_SWIGLU) {
+            acts[l].swiglu_gate = malloc(m * sizeof(float));
+            acts[l].swiglu_up = malloc(m * sizeof(float));
+        } else {
+            acts[l].swiglu_gate = NULL;
+            acts[l].swiglu_up = NULL;
+        }
     }
     return acts;
 }
@@ -611,6 +644,7 @@ void trans_act_free(TransAct *acts, int n_layer) {
         free(acts[l].q); free(acts[l].attn_out); free(acts[l].proj_out);
         free(acts[l].x_pre_norm2); free(acts[l].norm2_out);
         free(acts[l].mlp_hidden); free(acts[l].mlp_out);
+        free(acts[l].swiglu_gate); free(acts[l].swiglu_up);
     }
     free(acts);
 }

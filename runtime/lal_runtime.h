@@ -312,6 +312,13 @@ typedef struct {
     float norm2_cache[4];
     float *mlp_hidden;    /* MLP hidden state (after activation) */
     float *mlp_out;       /* MLP output */
+    /* BUG #45 FIX: cache gate/up for SwiGLU backward.
+     * Forward: hidden = silu(gate) * up. Backward needs gate (not hidden)
+     * to compute silu_grad(gate) * up. Without caching, backward used
+     * silu_grad(hidden) which is mathematically wrong.
+     * For GELU mode, these are NULL (unused). */
+    float *swiglu_gate;   /* gate = W_gate · norm2 (pre-SiLU) */
+    float *swiglu_up;     /* up = W_up · norm2 */
     int   seq_pos;        /* position of the cached forward pass (for attention bwd) */
 } TransAct;
 
