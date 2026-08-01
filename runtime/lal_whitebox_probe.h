@@ -555,38 +555,39 @@ static void core_activation_analysis(Model *m) {
     int n_embd = m->cfg.n_embd;
     int mlp_dim = m->cfg.mlp_dim;
     int n_layer = m->cfg.n_layer;
-    
+
     printf("--- CORE Activation (simulated, layer 0) ---\n\n");
-    
+
+    /* PERF: reuse stack buffers (was malloc/free per pair = 28 heap ops) */
+    float emb_a[4096], emb_b[4096];
+    float gate_a[4096], gate_b[4096];
+    float *act_a = (float *)malloc(mlp_dim * sizeof(float));
+    float *act_b = (float *)malloc(mlp_dim * sizeof(float));
+
     /* For each concept pair, compute layer-0 MLP activation */
     for (int p = 0; p < (int)N_PROBE_PAIRS; p++) {
         ConceptPair *cp = &probe_pairs[p];
-        
-        float emb_a[4096], emb_b[4096];
+
         get_concept_embedding(m, cp->bytes_a, emb_a, n_embd);
         get_concept_embedding(m, cp->bytes_b, emb_b, n_embd);
 
         /* BUG #19 FIX: compute proper gate_input (LN1 + attn + residual + LN2)
          * instead of feeding raw wte to mlp_gate. */
-        float *gate_a = (float *)malloc(n_embd * sizeof(float));
-        float *gate_b = (float *)malloc(n_embd * sizeof(float));
         compute_gate_input(m, emb_a, 0, gate_a, n_embd);
         compute_gate_input(m, emb_b, 0, gate_b, n_embd);
-        
+
         /* Simulate: activation = gate_input * W_layer0_mlp_gate */
-        float *act_a = (float *)malloc(mlp_dim * sizeof(float));
-        float *act_b = (float *)malloc(mlp_dim * sizeof(float));
         simulate_activation(m, gate_a, 0, act_a, mlp_dim);
         simulate_activation(m, gate_b, 0, act_b, mlp_dim);
-        
+
         uint8_t *mask = m->layers[0].mlp_gate.logic_mask;
-        if (!mask) { free(act_a); free(act_b); free(gate_a); free(gate_b); continue; }
-        
+        if (!mask) continue;
+
         /* Measure CORE vs BINARY differentiation */
         float core_diff = 0, bin_diff = 0, prune_diff = 0;
         float core_act = 0, bin_act = 0, prune_act = 0;
         int nc = 0, nb = 0, np = 0;
-        
+
         for (int j = 0; j < mlp_dim; j++) {
             float diff = fabsf(act_a[j] - act_b[j]);
             float mag = fabsf(act_a[j]);
@@ -601,18 +602,15 @@ static void core_activation_analysis(Model *m) {
         core_act = nc > 0 ? core_act / nc : 0;
         bin_act = nb > 0 ? bin_act / nb : 0;
         prune_act = np > 0 ? prune_act / np : 0;
-        
+
         printf("  %s vs %s: CORE diff=%.4f act=%.4f %s | BIN diff=%.4f | PRUNE act=%.4f\n",
                cp->name_a, cp->name_b,
                core_diff, core_act,
                core_diff > bin_diff ? "OK" : "X",
                bin_diff, prune_act);
-        
-        free(act_a);
-        free(act_b);
-        free(gate_a);
-        free(gate_b);
     }
+    free(act_a);
+    free(act_b);
     printf("\n");
 }
 
@@ -736,21 +734,21 @@ static ProbeMetrics whitebox_probe_compact(Model *m) {
 
     /* 2. CORE vs BINARY differentiation (layer 0 simulated activation).
      * BUG #19 FIX: use compute_gate_input() to get the proper LN2'd input
-     * that mlp_gate actually sees at runtime, instead of raw wte. */
+     * that mlp_gate actually sees at runtime, instead of raw wte.
+     * PERF: reuse stack buffers (was malloc/free per pair = 28 heap ops/step). */
     float core_diff_sum = 0, bin_diff_sum = 0, prune_act_sum = 0;
+    float emb_a[4096], emb_b[4096];
+    float gate_a[4096], gate_b[4096];
+    float *act_a = (float *)malloc(mlp_dim * sizeof(float));
+    float *act_b = (float *)malloc(mlp_dim * sizeof(float));
     for (int p = 0; p < (int)N_PROBE_PAIRS; p++) {
         ConceptPair *cp = &probe_pairs[p];
-        float emb_a[4096], emb_b[4096];
         get_concept_embedding(m, cp->bytes_a, emb_a, n_embd);
         get_concept_embedding(m, cp->bytes_b, emb_b, n_embd);
 
-        float *gate_a = (float *)malloc(n_embd * sizeof(float));
-        float *gate_b = (float *)malloc(n_embd * sizeof(float));
         compute_gate_input(m, emb_a, 0, gate_a, n_embd);
         compute_gate_input(m, emb_b, 0, gate_b, n_embd);
 
-        float *act_a = (float *)malloc(mlp_dim * sizeof(float));
-        float *act_b = (float *)malloc(mlp_dim * sizeof(float));
         simulate_activation(m, gate_a, 0, act_a, mlp_dim);
         simulate_activation(m, gate_b, 0, act_b, mlp_dim);
 
@@ -771,11 +769,9 @@ static ProbeMetrics whitebox_probe_compact(Model *m) {
             bin_diff_sum  += nb > 0 ? bd / nb : 0;
             prune_act_sum += np > 0 ? pa / np : 0;
         }
-        free(act_a);
-        free(act_b);
-        free(gate_a);
-        free(gate_b);
     }
+    free(act_a);
+    free(act_b);
     pm.core_diff_avg = core_diff_sum / N_PROBE_PAIRS;
     pm.bin_diff_avg  = bin_diff_sum / N_PROBE_PAIRS;
     pm.prune_act_avg = prune_act_sum / N_PROBE_PAIRS;
