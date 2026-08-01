@@ -67,23 +67,35 @@ static float cosine_sim(const float *a, const float *b, int dim) {
  * that maps UTF-8 concept strings to their BPE token ids.
  * For byte-level mode (vocab == 256), average UTF-8 byte embeddings. */
 
-/* BPE token ids for probe concepts (precomputed via SentencePiece) */
-typedef struct { const char *utf8; int bpe_id; } BpeTokenMap;
+/* BPE token ids for probe concepts (verified via sentencepiece).
+ * Most common Chinese chars have a single BPE token (e.g. 热=32226).
+ * But 轻/湿/干 fall back to byte-level encoding (3 byte-fallback tokens each)
+ * because they're not in the BPE vocab as single tokens.
+ *
+ * BUG #18 FIX: Previously only the FIRST byte-fallback token was stored,
+ * so get_concept_embedding returned the embedding of <0xE8>/<0xE6>/<0xE5>
+ * (shared by ALL chars starting with that byte) instead of the actual char.
+ * This corrupted 2/7 probe pairs (weight: 重 vs 轻; moisture: 湿 vs 干)
+ * AND the logic_guided_regularization gradient signal for those pairs.
+ *
+ * Fix: store up to 4 token ids per concept (n_ids = how many to sum).
+ * For single-token concepts, n_ids=1. For byte-fallback, n_ids=3. */
+typedef struct { const char *utf8; int n_ids; int bpe_ids[4]; } BpeTokenMap;
 static BpeTokenMap bpe_token_map[] = {
-    {"\xe7\x83\xad", 32226},  /* 热 */
-    {"\xe5\x86\xb7", 32551},  /* 冷 */
-    {"\xe5\xa4\xa7", 31974},  /* 大 */
-    {"\xe5\xb0\x8f", 31928},  /* 小 */
-    {"\xe4\xb8\x8a", 31926},  /* 上 */
-    {"\xe4\xb8\x8b", 31968},  /* 下 */
-    {"\xe4\xba\xae", 32545},  /* 亮 */
-    {"\xe6\x9a\x97", 32723},  /* 暗 */
-    {"\xe9\x87\x8d", 31995},  /* 重 */
-    {"\xe8\xbd\xbb", 235},    /* 轻 */
-    {"\xe5\xbf\xab", 32391},  /* 快 */
-    {"\xe6\x85\xa2", 32356},  /* 慢 */
-    {"\xe6\xb9\xbf", 233},    /* 湿 */
-    {"\xe5\xb9\xb2", 232},    /* 干 */
+    {"\xe7\x83\xad", 1, {32226}},                 /* 热 */
+    {"\xe5\x86\xb7", 1, {32551}},                 /* 冷 */
+    {"\xe5\xa4\xa7", 1, {31974}},                 /* 大 */
+    {"\xe5\xb0\x8f", 1, {31928}},                 /* 小 */
+    {"\xe4\xb8\x8a", 1, {31926}},                 /* 上 */
+    {"\xe4\xb8\x8b", 1, {31968}},                 /* 下 */
+    {"\xe4\xba\xae", 1, {32545}},                 /* 亮 */
+    {"\xe6\x9a\x97", 1, {32723}},                 /* 暗 */
+    {"\xe9\x87\x8d", 1, {31995}},                 /* 重 */
+    {"\xe8\xbd\xbb", 3, {235, 192, 190}},         /* 轻 = <0xE8><0xBD><0xBB> */
+    {"\xe5\xbf\xab", 1, {32391}},                 /* 快 */
+    {"\xe6\x85\xa2", 1, {32356}},                 /* 慢 */
+    {"\xe6\xb9\xbf", 3, {233, 188, 194}},         /* 湿 = <0xE6><0xB9><0xBF> */
+    {"\xe5\xb9\xb2", 3, {232, 188, 181}},         /* 干 = <0xE5><0xB9><0xB2> */
 };
 #define N_BPE_MAP (sizeof(bpe_token_map) / sizeof(bpe_token_map[0]))
 
@@ -92,18 +104,26 @@ static void get_concept_embedding(Model *m, const char *utf8_bytes,
     memset(out, 0, n_embd * sizeof(float));
 
     if (m->cfg.vocab_size > 256) {
-        /* BPE mode: look up token id from mapping table */
-        int tok = -1;
+        /* BPE mode: look up token id sequence from mapping table.
+         * For single-token concepts: copy that token's wte row.
+         * For byte-fallback concepts (轻/湿/干): SUM all byte-fallback
+         *   token embeddings. Sum (not average) matches how the model
+         *   embeds a multi-token sequence at the input layer. */
+        BpeTokenMap *entry = NULL;
         for (int i = 0; i < (int)N_BPE_MAP; i++) {
             if (strcmp(utf8_bytes, bpe_token_map[i].utf8) == 0) {
-                tok = bpe_token_map[i].bpe_id;
+                entry = &bpe_token_map[i];
                 break;
             }
         }
-        if (tok < 0 || tok >= m->cfg.vocab_size) return;
-        float *row = m->wte + (size_t)tok * n_embd;
-        for (int j = 0; j < n_embd; j++)
-            out[j] = row[j];
+        if (!entry) return;
+        for (int t = 0; t < entry->n_ids; t++) {
+            int tok = entry->bpe_ids[t];
+            if (tok < 0 || tok >= m->cfg.vocab_size) continue;
+            const float *row = m->wte + (size_t)tok * n_embd;
+            for (int j = 0; j < n_embd; j++)
+                out[j] += row[j];
+        }
     } else {
         /* Byte-level mode: average UTF-8 byte embeddings */
         int n_bytes = 0;
@@ -250,13 +270,19 @@ static WeightStruct analyze_weights(BinLayer *bl) {
     
     int in_dim = bl->in_dim, out_dim = bl->out_dim;
     float cn = 0, bn = 0, pn = 0;
-    
+
+    /* BUG #16 FIX: w_float is stored as [out, in] row-major
+     * (see bin_layer_init / bin_layer_init_logic in lal_runtime.c:
+     *  "w_float[j*in + i] is contiguous per output j").
+     * Previously this read w_float[i*out_dim + j] which is the [in, out]
+     * stride -- that accesses scattered elements across multiple output
+     * rows, producing meaningless "norms". The reported structure %
+     * metric was effectively random. */
     for (int j = 0; j < out_dim; j++) {
+        const float *wj = &bl->w_float[(size_t)j * in_dim];  /* contiguous [in] for output j */
         float ns = 0;
-        for (int i = 0; i < in_dim; i++) {
-            float w = bl->w_float[i * out_dim + j];
-            ns += w * w;
-        }
+        for (int i = 0; i < in_dim; i++)
+            ns += wj[i] * wj[i];
         float norm = sqrtf(ns);
         switch (bl->logic_mask[j]) {
             case 0: cn += norm; r.n_core++; break;
@@ -518,135 +544,23 @@ static ProbeMetrics whitebox_probe_compact(Model *m) {
 
 
 /* ========================================================================
- * Semantic Regularization: Contrastive loss to guide CORE/BINARY roles
+ * Semantic Regularization (DEPRECATED — kept only for reference)
  *
- * CORE neurons should DIFFERENTIATE opposite concepts (热 vs 冷)
- * BINARY neurons should CONVERGE for opposite concepts (coarse logic)
+ * The original semantic_regularization_step had three issues that made it
+ * unsuitable for production training:
+ *   1. Updated w_float directly, bypassing Adam (no LAL-aware CORE 3x lr).
+ *   2. Applied wte gradient to BYTE tokens (0-255) instead of BPE tokens —
+ *      in BPE mode this wrote to byte-fallback tokens, polluting the
+ *      embedding space shared by all multi-byte chars.
+ *   3. Only regularized layer 0; deeper layers got no semantic structure.
  *
- * Loss: L = -alpha * mean(|CORE_act_a - CORE_act_b|)
- *       + beta  * mean((BIN_act_a - BIN_act_b)^2)
+ * The replacement is logic_guided_regularization() in models/ste_train.c:
+ *   - Accumulates gradients into grad_accum (uses LAL-aware Adam)
+ *   - Skips wte updates entirely (CORE differentiation propagates
+ *     embedding separation indirectly through the main loss)
+ *   - Applies to ALL layers (with 0.5x decay for deeper layers)
  *
- * Gradient applied directly to w_float and wte for layer 0 mlp_gate.
+ * The function body has been removed to prevent accidental use.
  * ======================================================================== */
-
-/* Apply one semantic regularization step.
- * Returns the regularization loss for logging. */
-static float semantic_regularization_step(Model *m, float lr) {
-    int n_embd = m->cfg.n_embd;
-    int mlp_dim = m->cfg.mlp_dim;
-    BinLayer *fc = &m->layers[0].mlp_gate;
-    uint8_t *mask = fc->logic_mask;
-    if (!mask) return 0.0f;
-
-    float alpha = 2.0f;  /* CORE differentiation weight (was 0.5 -- too weak) */
-    float beta = 0.2f;   /* BINARY convergence weight (was 0.1) */
-    float total_loss = 0.0f;
-
-    for (int p = 0; p < (int)N_PROBE_PAIRS; p++) {
-        ConceptPair *cp = &probe_pairs[p];
-
-        /* Get embeddings for both concepts */
-        float emb_a[4096], emb_b[4096];
-        get_concept_embedding(m, cp->bytes_a, emb_a, n_embd);
-        get_concept_embedding(m, cp->bytes_b, emb_b, n_embd);
-
-        /* Compute current activations (using CORRECT [out,in] layout) */
-        float *act_a = (float *)malloc(mlp_dim * sizeof(float));
-        float *act_b = (float *)malloc(mlp_dim * sizeof(float));
-        simulate_activation(m, emb_a, 0, act_a, mlp_dim);
-        simulate_activation(m, emb_b, 0, act_b, mlp_dim);
-
-        /* Compute loss and gradients */
-        int nc = 0, nb = 0;
-        for (int j = 0; j < mlp_dim; j++) {
-            if (mask[j] == 2) continue;  /* skip PRUNE */
-            float diff = act_a[j] - act_b[j];
-            float adiff = fabsf(diff);
-
-            if (mask[j] == 0) {  /* CORE: maximize |diff| */
-                total_loss -= alpha * adiff;
-                nc++;
-            } else {  /* BINARY: minimize diff^2 */
-                total_loss += beta * diff * diff;
-                nb++;
-            }
-        }
-
-        /* Apply gradient to w_float for layer 0 mlp_gate */
-        /* For CORE: dL/dw[j,i] = -alpha * sign(diff) * (emb_a[i] - emb_b[i]) */
-        /* For BIN:  dL/dw[j,i] = beta * 2 * diff * (emb_a[i] - emb_b[i]) */
-        float inv_nc = nc > 0 ? 1.0f / sqrtf((float)nc) : 0;  /* sqrt norm: 24x stronger than 1/nc */
-        float inv_nb = nb > 0 ? 1.0f / sqrtf((float)nb) : 0;  /* sqrt norm: 24x stronger than 1/nb */
-
-        for (int j = 0; j < mlp_dim; j++) {
-            if (mask[j] == 2) continue;
-            float diff = act_a[j] - act_b[j];
-            float *wf = &fc->w_float[(size_t)j * n_embd];
-            float clip_val = (mask[j] == 0) ? 2.0f : 1.0f;
-
-            if (mask[j] == 0) {  /* CORE */
-                float s = diff > 0 ? 1.0f : -1.0f;
-                float grad_scale = -alpha * s * inv_nc * lr;
-                for (int i = 0; i < n_embd; i++) {
-                    float g = grad_scale * (emb_a[i] - emb_b[i]);
-                    wf[i] += g;
-                    if (wf[i] > clip_val) wf[i] = clip_val;
-                    else if (wf[i] < -clip_val) wf[i] = -clip_val;
-                }
-            } else {  /* BINARY */
-                float grad_scale = beta * 2.0f * diff * inv_nb * lr;
-                for (int i = 0; i < n_embd; i++) {
-                    float g = grad_scale * (emb_a[i] - emb_b[i]);
-                    wf[i] -= g;
-                    if (wf[i] > clip_val) wf[i] = clip_val;
-                    else if (wf[i] < -clip_val) wf[i] = -clip_val;
-                }
-            }
-        }
-
-        /* Also apply gradient to wte (push concept embeddings apart for CORE) */
-        /* dL/demb_a[i] = sum_j (grad_w[j] * w[j,i]) */
-        for (int i = 0; i < n_embd; i++) {
-            float grad_a = 0, grad_b = 0;
-            for (int j = 0; j < mlp_dim; j++) {
-                if (mask[j] == 2) continue;
-                float diff = act_a[j] - act_b[j];
-                float wf = fc->w_float[(size_t)j * n_embd + i];
-                if (mask[j] == 0) {
-                    float s = diff > 0 ? 1.0f : -1.0f;
-                    grad_a += -alpha * s * inv_nc * wf;
-                    grad_b += alpha * s * inv_nc * wf;
-                } else {
-                    grad_a += beta * 2.0f * diff * inv_nb * wf;
-                    grad_b -= beta * 2.0f * diff * inv_nb * wf;
-                }
-            }
-            /* Apply to token embeddings for each byte of the concept */
-            float scale = lr * 0.5f;  /* larger step for embeddings */
-            int n_bytes_a = 0, n_bytes_b = 0;
-            for (int b = 0; cp->bytes_a[b]; b++) n_bytes_a++;
-            for (int b = 0; cp->bytes_b[b]; b++) n_bytes_b++;
-
-            for (int b = 0; cp->bytes_a[b]; b++) {
-                int tok = (unsigned char)cp->bytes_a[b];
-                if (tok < m->cfg.vocab_size)
-                    m->wte[(size_t)tok * n_embd + i] += scale * grad_a / n_bytes_a;
-            }
-            for (int b = 0; cp->bytes_b[b]; b++) {
-                int tok = (unsigned char)cp->bytes_b[b];
-                if (tok < m->cfg.vocab_size)
-                    m->wte[(size_t)tok * n_embd + i] += scale * grad_b / n_bytes_b;
-            }
-        }
-
-        free(act_a);
-        free(act_b);
-    }
-
-    /* Repack to sync w_core and wbits */
-    bin_layer_repack(fc);
-
-    return total_loss / N_PROBE_PAIRS;
-}
 
 #endif /* LAL_WHITEBOX_PROBE_H */
