@@ -96,6 +96,28 @@ static BpeTokenMap bpe_token_map[] = {
     {"\xe6\x85\xa2", 1, {32356}},                 /* 慢 */
     {"\xe6\xb9\xbf", 3, {233, 188, 194}},         /* 湿 = <0xE6><0xB9><0xBF> */
     {"\xe5\xb9\xb2", 3, {232, 188, 181}},         /* 干 = <0xE5><0xB9><0xB2> */
+    /* BUG #36 FIX: deep_whitebox_diagnosis uses 火/水 but they weren't in
+     * the map → get_concept_embedding returned all-zeros → embedding norms
+     * showed 0.000, cosine sim was meaningless, diagnosis was wrong.
+     * Added common concepts used in diagnosis and generation testing. */
+    {"\xe7\x81\xab", 1, {32646}},                 /* 火 */
+    {"\xe6\xb0\xb4", 1, {31940}},                 /* 水 */
+    {"\xe5\xb1\xb1", 1, {32170}},                 /* 山 */
+    {"\xe8\x8a\xb1", 1, {32223}},                 /* 花 */
+    {"\xe6\xa0\x91", 1, {32121}},                 /* 树 */
+    {"\xe9\xb8\x9f", 1, {32765}},                 /* 鸟 */
+    {"\xe9\xb1\xbc", 1, {32766}},                 /* 鱼 */
+    {"\xe4\xba\xba", 1, {31920}},                 /* 人 */
+    {"\xe5\xa4\xa9", 1, {31925}},                 /* 天 */
+    {"\xe5\x9c\xb0", 1, {31989}},                 /* 地 */
+    {"\xe6\x9c\x88", 1, {31967}},                 /* 月 */
+    {"\xe6\x98\x9f", 1, {32224}},                 /* 星 */
+    {"\xe9\xa3\x8e", 1, {32171}},                 /* 风 */
+    {"\xe9\x9b\xa8", 1, {32561}},                 /* 雨 */
+    {"\xe4\xba\x91", 1, {32604}},                 /* 云 */
+    {"\xe5\xa4\xaa\xe9\x98\xb3", 1, {348}},       /* 太阳 = single BPE token */
+    {"\xe5\xa4\xaa", 1, {31924}},                 /* 太 */
+    {"\xe9\x98\xb3", 1, {32039}},                 /* 阳 */
 };
 #define N_BPE_MAP (sizeof(bpe_token_map) / sizeof(bpe_token_map[0]))
 
@@ -116,13 +138,27 @@ static void get_concept_embedding(Model *m, const char *utf8_bytes,
                 break;
             }
         }
-        if (!entry) return;
-        for (int t = 0; t < entry->n_ids; t++) {
-            int tok = entry->bpe_ids[t];
-            if (tok < 0 || tok >= m->cfg.vocab_size) continue;
-            const float *row = m->wte + (size_t)tok * n_embd;
-            for (int j = 0; j < n_embd; j++)
-                out[j] += row[j];
+        if (entry) {
+            for (int t = 0; t < entry->n_ids; t++) {
+                int tok = entry->bpe_ids[t];
+                if (tok < 0 || tok >= m->cfg.vocab_size) continue;
+                const float *row = m->wte + (size_t)tok * n_embd;
+                for (int j = 0; j < n_embd; j++)
+                    out[j] += row[j];
+            }
+        } else {
+            /* BUG #36 FIX: concept not in map → fall back to byte-fallback
+             * tokens (SentencePiece convention: id = 3 + byte_value).
+             * This handles any UTF-8 string, not just the 14 hardcoded ones.
+             * Sum (not average) all byte-fallback embeddings. */
+            for (int i = 0; utf8_bytes[i]; i++) {
+                int tok = 3 + (unsigned char)utf8_bytes[i];
+                if (tok < m->cfg.vocab_size) {
+                    const float *row = m->wte + (size_t)tok * n_embd;
+                    for (int j = 0; j < n_embd; j++)
+                        out[j] += row[j];
+                }
+            }
         }
     } else {
         /* Byte-level mode: average UTF-8 byte embeddings */
