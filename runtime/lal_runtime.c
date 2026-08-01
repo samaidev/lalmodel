@@ -3334,8 +3334,18 @@ void model_batch_apply(Model *m, float lr, int batch_size) {
                     }
 
                     float lr_j = (m == 0) ? lr * g_core_lr_multiplier : lr;
-                    /* Shared normalization: use bin_sqrt_v for both groups. */
-                    float sqrt_v = bin_sqrt_v;
+                    /* BUG #22 FIX: use the right group's sqrt_v for each neuron.
+                     * Previously hardcoded bin_sqrt_v for BOTH groups, which
+                     * artificially amplified CORE updates (CORE has 10x larger
+                     * gradients from alpha=2 vs beta=0.2 + sqrt(807/201) normalization,
+                     * so core_v >> bin_v; using bin_sqrt_v as denominator makes
+                     * CORE effective lr explode on top of g_core_lr_multiplier=3.0).
+                     *
+                     * With this fix, each group is normalized by its own
+                     * second moment — relative gradient magnitudes within a
+                     * group are preserved, and cross-group scaling is left
+                     * to g_core_lr_multiplier alone. */
+                    float sqrt_v = (m == 0) ? core_sqrt_v : bin_sqrt_v;
                     float *ga = &bl->grad_accum[j * in];
 
                     if (g_use_adam && bl->m_adam) {

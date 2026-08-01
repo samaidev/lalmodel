@@ -119,7 +119,13 @@ static float logic_guided_regularization(Model *m, float lr) {
              *
              * BUG #19: 梯度公式 dL/dw[j,i] = grad_scale * (gate_a[i] - gate_b[i])
              *   不是 (emb_a[i] - emb_b[i])!因为 s = w · gate_input,不是 w · emb。
-             *   之前用 emb 算梯度,相当于在错误的输入空间上优化,引导方向偏了。 */
+             *   之前用 emb 算梯度,相当于在错误的输入空间上优化,引导方向偏了。
+             *
+             * BUG #23 FIX: 旧代码把 *lr 乘进 grad_scale,但 model_batch_apply
+             *   再用 lr 缩放 grad_accum → 逻辑梯度被乘了 lr^2 (≈2.5e-6 而非 0.002)。
+             *   现在去掉 *lr,让 logic_lr 表示"逻辑梯度相对于主训练梯度的倍率"
+             *   (logic_lr=1.0 表示逻辑梯度与主梯度同量级,>1 表示逻辑引导更强)。
+             *   实际有效 lr = logic_lr * base_lr (例如 4.0 * 0.0005 = 0.002)。 */
 
             float inv_nc = layer_nc > 0 ? 1.0f / sqrtf((float)layer_nc) : 0;
             float inv_nb = layer_nb > 0 ? 1.0f / sqrtf((float)layer_nb) : 0;
@@ -132,17 +138,36 @@ static float logic_guided_regularization(Model *m, float lr) {
                 float layer_lr_scale = (l == 0) ? 1.0f : 0.5f;
 
                 if (mask[j] == 0) {  /* CORE: 梯度推动差异化 */
+                    /* Loss L = -alpha * |diff|, minimize → dL/dw = -alpha*sign(diff)*(gate_a-gate_b)
+                     * w -= lr*grad_accum → w += lr*alpha*sign(diff)*(gate_a-gate_b) → diff 增大 ✓
+                     *
+                     * BUG #23 FIX: 旧代码在 grad_scale 中乘 *lr (=logic_lr=0.002),
+                     *   但 model_batch_apply 又乘一次 main_lr=0.0005 → 逻辑梯度被乘 lr^2
+                     *   (逻辑梯度 ≈ 1e-6, 主梯度 ≈ 5e-4, 相差 500x,逻辑引导几乎无效).
+                     *   而且由于 LAL-aware Adam 的 group_v 会 EMA grad^2, 逻辑梯度的缩放会被
+                     *   sqrt_v 抵消,使得 *lr 参数实际上对 CORE/BINARY 梯度无影响.
+                     *   现在用 lr 作为相对倍率 (1.0 = 同主梯度量级),默认 4.0 (4x 主梯度). */
                     float s = diff > 0 ? 1.0f : -1.0f;
-                    float grad_scale = -alpha * s * inv_nc * lr * layer_lr_scale;
+                    float grad_scale = -alpha * s * inv_nc * layer_lr_scale * lr;
                     for (int i = 0; i < in_dim; i++) {
                         float g = grad_scale * (gate_a[i] - gate_b[i]);  /* BUG #19: gate_input, not emb */
                         ga[i] += g;  /* 累加,不直接改 w_float */
                     }
                 } else {  /* BINARY: 梯度推动收敛 */
-                    float grad_scale = beta * 2.0f * diff * inv_nb * lr * layer_lr_scale;
+                    /* BUG #21 FIX: Loss L = +beta * diff^2, minimize → dL/dw = +beta*2*diff*(gate_a-gate_b)
+                     * w -= lr*grad_accum → w -= lr*beta*2*diff*(gate_a-gate_b) → diff^2 减小 ✓
+                     *
+                     * 旧代码用 ga[i] -= grad_scale * ... (= grad_accum -= beta*2*diff*(gate_a-gate_b))
+                     * 这相当于 grad_accum 取负,update 时 w += lr*beta*2*diff*(gate_a-gate_b)
+                     * → diff^2 被最大化了!收敛目标完全反了。
+                     * 这解释了为什么 BIN diff 一直和 CORE diff 差不多大 (ratio≈0.99):
+                     * BINARY 神经元没在收敛,而是在被推开。
+                     *
+                     * BUG #23 FIX: lr 现在是相对倍率 (见 CORE 注释). */
+                    float grad_scale = beta * 2.0f * diff * inv_nb * layer_lr_scale * lr;
                     for (int i = 0; i < in_dim; i++) {
                         float g = grad_scale * (gate_a[i] - gate_b[i]);  /* BUG #19: gate_input, not emb */
-                        ga[i] -= g;  /* 累加到 grad_accum(符号与 CORE 相反) */
+                        ga[i] += g;  /* BUG #21: was -=, should be += (sign was reversed) */
                     }
                 }
             }
@@ -862,7 +887,7 @@ int main(int argc, char **argv) {
     int n_steps = 200;
     int batch_size = 4;
     float base_lr = 0.0005f;
-    float logic_lr = 0.002f;  /* --logic-lr 调整 */
+    float logic_lr = 1.0f;  /* --logic-lr 调整:相对倍率 (1.0=同主梯度量级) */
     int phase_idx = 0;
     int vocab_size = 256;  /* --vocab 256=byte, 32768=BPE */
     const char *data_path = "data/curriculum/stage_grounding_combined.bin";
@@ -907,6 +932,7 @@ int main(int argc, char **argv) {
                    "  --steps N         Training steps (default 200)\n"
                    "  --batch-size N    Batch size (default 4)\n"
                    "  --lr F            Base learning rate (default 0.0005)\n"
+                   "  --logic-lr F      Logic guidance multiplier (default 1.0 = same as main grad)\n"
                    "  --data PATH       Data .bin path\n"
                    "  --save PATH       Save trained weights to .ste file\n"
                    "  --resume PATH     Load .ste weights and continue training\n"

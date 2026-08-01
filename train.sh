@@ -44,19 +44,19 @@ rm -f model.ste
 
 # 第一阶段: lr=0.001, 200步
 echo "  --- 阶段1: lr=0.001, 200步 ---"
-./ste_train --steps 200 --batch-size 4 --lr 0.001 --logic-lr 0.002 \
+./ste_train --steps 200 --batch-size 4 --lr 0.001 --logic-lr 1.0 \
     --phase 1 --vocab 32768 --data data/general_bpe.bin \
     --no-generate --save model.ste 2>&1 | grep -E "step.*loss=|STE training done"
 
 # 第二阶段: lr=0.0005, 200步
 echo "  --- 阶段2: lr=0.0005, 200步 ---"
-./ste_train --steps 200 --batch-size 4 --lr 0.0005 --logic-lr 0.002 \
+./ste_train --steps 200 --batch-size 4 --lr 0.0005 --logic-lr 1.0 \
     --phase 1 --vocab 32768 --data data/general_bpe.bin \
     --no-generate --resume model.ste --save model.ste 2>&1 | grep -E "step.*loss=|STE training done"
 
 # 第三阶段: lr=0.0002, 100步
 echo "  --- 阶段3: lr=0.0002, 100步 ---"
-./ste_train --steps 100 --batch-size 4 --lr 0.0002 --logic-lr 0.002 \
+./ste_train --steps 100 --batch-size 4 --lr 0.0002 --logic-lr 1.0 \
     --phase 1 --vocab 32768 --data data/general_bpe.bin \
     --no-generate --resume model.ste --save model.ste 2>&1 | grep -E "step.*loss=|STE training done"
 
