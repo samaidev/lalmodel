@@ -3342,12 +3342,8 @@ void model_batch_apply(Model *m, float lr, int batch_size) {
                     }
 
                     float lr_j = (m == 0) ? lr * g_core_lr_multiplier : lr;
-                    /* Shared normalization: use bin_sqrt_v for both groups.
-                     * CORE has 5x larger gradients (from core_gain), and shared
-                     * normalization preserves this 5x advantage in the update.
-                     * bin_sqrt_v is the smaller of the two, giving both groups
-                     * a fair (not over-normalized) learning rate. */
-                    float sqrt_v = bin_sqrt_v;  /* shared for both groups */
+                    /* Shared normalization: use bin_sqrt_v for both groups. */
+                    float sqrt_v = bin_sqrt_v;
                     float *ga = &bl->grad_accum[j * in];
 
                     if (g_use_adam && bl->m_adam) {
@@ -3599,6 +3595,24 @@ layer_done:
             float mhb = m->m_ln_f_b[i] / bc1, vhb = sqrtf(m->v_ln_f_b[i] / bc2) + g_adam_eps;
             m->ln_f_w[i] -= lr * mhw / vhw;
             m->ln_f_b[i] -= lr * mhb / vhb;
+        }
+    }
+
+    /* === Sync w_core and wbits from updated w_float ===
+     * model_batch_apply updates w_float, but forward pass uses:
+     * - w_core for CORE neurons (bin_forward_pure_float)
+     * - wbits (sign(w_float)) for BINARY neurons (bin_forward)
+     * - alpha (mean(|w_float|)) for BINARY scaling
+     * Without this sync, CORE weights are FROZEN at init! */
+    for (int l = 0; l < m->cfg.n_layer; l++) {
+        BinLayer *bls[8] = {&m->layers[l].attn_q, &m->layers[l].attn_o,
+                            &m->layers[l].mlp_gate, &m->layers[l].mlp_down};
+        int n_bl = 4;
+        if (!m->cfg.qkv_merged) { bls[4] = &m->layers[l].attn_k; bls[5] = &m->layers[l].attn_v; n_bl = 6; }
+        if (m->cfg.act_type == ACT_SWIGLU) { bls[n_bl] = &m->layers[l].mlp_up; n_bl++; }
+        for (int b = 0; b < n_bl; b++) {
+            if (bls[b]->w_float && bls[b]->logic_mask)
+                bin_layer_repack(bls[b]);
         }
     }
 
