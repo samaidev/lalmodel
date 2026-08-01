@@ -376,11 +376,14 @@ static void deep_whitebox_diagnosis(Model *m) {
     float *logits = malloc(vocab * sizeof(float));
     model_forward_float_logits(m, tokens, n_tok, logits);
 
-    /* top-5 */
+    /* top-5 (BUG #38 FIX: mask special tokens id 0-2, same as generation) */
     printf("  Prompt '热' → top-5 next-token logits:\n");
     /* used 标记数组要覆盖整个 vocab */
     static int used[40000];
     memset(used, 0, vocab * sizeof(int));
+    used[0] = 1;  /* <unk> */
+    used[1] = 1;  /* <s> */
+    used[2] = 1;  /* </s> */
     for (int k = 0; k < 5; k++) {
         int best = -1;
         float bestv = -1e10;
@@ -407,8 +410,13 @@ static void deep_whitebox_diagnosis(Model *m) {
         if (p > 1e-10f) entropy -= p * logf(p);
     }
     printf("\n  Logit range: %.4f (max=%.4f min=%.4f)\n", max_l-min_l, max_l, min_l);
+    /* BUG #37 FIX: 旧代码硬编码 logf(256)/logf(2) = 8 bits 作为"均匀分布熵",
+     *   但 BPE 模式 vocab=32768,均匀分布熵应该是 log2(32768)=15 bits。
+     *   这导致诊断报告显示"uniform would be 8.00"而非 15.00,让 8 bits 的熵
+     *   看起来"接近均匀",实际上只有均匀分布的 53% (8/15),模型远未充分分散。 */
+    float uniform_bits = logf((float)vocab) / logf(2.0f);
     printf("  Softmax entropy: %.4f bits (uniform would be %.2f)\n",
-           entropy/logf(2), logf(256)/logf(2));
+           entropy/logf(2), uniform_bits);
     if (entropy < 1.0f) {
         printf("  [FAIL] entropy %.2f bits — MODE COLLAPSE, generation will repeat same token\n", entropy/logf(2));
     } else if (max_l - min_l < 2.0f) {
