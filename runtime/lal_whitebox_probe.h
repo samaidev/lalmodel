@@ -263,6 +263,96 @@ static void compute_gate_input(Model *m, const float *initial_emb,
 }
 
 /* ========================================================================
+ * BUG #35 FIX: Compute gate_inputs for ALL layers in ONE forward pass.
+ *
+ * Old logic_guided_regularization called compute_gate_input(l) for each
+ * layer l=0..n_layer-1. Each call runs forward 0..l, so total forwards =
+ * 1+2+...+n_layer = O(n_layer²). For n_layer=8: 36 forwards/concept.
+ *
+ * This function does a SINGLE forward pass through all layers, capturing
+ * the LN2 output (gate_input) at each layer. Result: n_layer forwards
+ * instead of n_layer*(n_layer+1)/2. For n_layer=8: 8 instead of 36 (4.5x).
+ *
+ * out_gate_inputs: [n_layer * n_embd] — gate_input for each layer.
+ * ======================================================================== */
+static void compute_all_gate_inputs(Model *m, const float *initial_emb,
+                                     float *out_gate_inputs, int n_embd) {
+    int n_layer = m->cfg.n_layer;
+    int mlp_dim = m->cfg.mlp_dim;
+    int n = n_embd;
+    float rs = m->cfg.residual_scale;
+
+    /* Reuse the same static buffers as compute_gate_input */
+    static float *x = NULL, *norm1 = NULL, *norm2 = NULL;
+    static float *qkv_buf = NULL, *q = NULL, *v = NULL;
+    static float *attn_out = NULL, *proj_out = NULL;
+    static float *gate_buf = NULL, *up_buf = NULL, *hidden = NULL, *mlp_out = NULL;
+    static int s_n = 0, s_mlp = 0, s_qkv = 0;
+
+    int qkv_size = m->cfg.qkv_merged ? 3 * n : 0;
+    if (s_n != n || s_mlp != mlp_dim || s_qkv != qkv_size) {
+        free(x); free(norm1); free(norm2);
+        free(qkv_buf); free(q); free(v);
+        free(attn_out); free(proj_out);
+        free(gate_buf); free(up_buf); free(hidden); free(mlp_out);
+        x = malloc(n * sizeof(float));
+        norm1 = malloc(n * sizeof(float));
+        norm2 = malloc(n * sizeof(float));
+        qkv_buf = qkv_size > 0 ? malloc(qkv_size * sizeof(float)) : NULL;
+        q = qkv_size > 0 ? NULL : malloc(n * sizeof(float));
+        v = qkv_size > 0 ? (qkv_buf + 2 * n) : malloc(n * sizeof(float));
+        attn_out = malloc(n * sizeof(float));
+        proj_out = malloc(n * sizeof(float));
+        gate_buf = malloc(mlp_dim * sizeof(float));
+        up_buf = malloc(mlp_dim * sizeof(float));
+        hidden = malloc(mlp_dim * sizeof(float));
+        mlp_out = malloc(n * sizeof(float));
+        s_n = n; s_mlp = mlp_dim; s_qkv = qkv_size;
+    }
+
+    memcpy(x, initial_emb, n * sizeof(float));
+    if (m->wpe) {
+        const float *wpe0 = &m->wpe[0];
+        for (int i = 0; i < n; i++) x[i] += wpe0[i];
+    }
+
+    for (int l = 0; l < n_layer; l++) {
+        TransLayer *tl = &m->layers[l];
+
+        norm_forward(norm1, x, tl->norm1_w, tl->norm1_b, m->cfg.norm_type, n);
+
+        if (m->cfg.qkv_merged) {
+            bin_forward_pure_float(qkv_buf, norm1, &tl->attn_q);
+        } else {
+            bin_forward_pure_float(v, norm1, &tl->attn_v);
+        }
+        memcpy(attn_out, v, n * sizeof(float));
+
+        bin_forward_pure_float(proj_out, attn_out, &tl->attn_o);
+        for (int i = 0; i < n; i++) x[i] += rs * proj_out[i];
+        clip_array(x, n, 10.0f);
+
+        norm_forward(norm2, x, tl->norm2_w, tl->norm2_b, m->cfg.norm_type, n);
+
+        /* Capture gate_input for this layer */
+        memcpy(&out_gate_inputs[(size_t)l * n], norm2, n * sizeof(float));
+
+        /* MLP to feed next layer */
+        if (m->cfg.act_type == ACT_SWIGLU) {
+            bin_forward_pure_float(gate_buf, norm2, &tl->mlp_gate);
+            bin_forward_pure_float(up_buf,   norm2, &tl->mlp_up);
+            for (int i = 0; i < mlp_dim; i++) hidden[i] = silu(gate_buf[i]) * up_buf[i];
+        } else {
+            bin_forward_pure_float(hidden, norm2, &tl->mlp_gate);
+            for (int i = 0; i < mlp_dim; i++) hidden[i] = gelu(hidden[i]);
+        }
+        bin_forward_pure_float(mlp_out, hidden, &tl->mlp_down);
+        for (int i = 0; i < n; i++) x[i] += rs * mlp_out[i];
+        clip_array(x, n, 10.0f);
+    }
+}
+
+/* ========================================================================
  * Simulated activation: gate_input * W for one layer's mlp_gate
  * Direct matmul using w_core (CORE) or w_float (BINARY) — no model_forward.
  *

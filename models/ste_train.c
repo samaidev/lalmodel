@@ -44,6 +44,7 @@ static int prompt_tokenize(const char *text, int *tokens, int max_len);
 static float logic_guided_regularization(Model *m, float lr) {
     int n_embd = m->cfg.n_embd;
     int n_layer = m->cfg.n_layer;
+    int mlp_dim = m->cfg.mlp_dim;
     float alpha = 2.0f;   /* CORE 差异化权重 */
     float beta = 0.2f;    /* BINARY 收敛权重 */
     float total_loss = 0.0f;
@@ -51,153 +52,133 @@ static float logic_guided_regularization(Model *m, float lr) {
 
     /* 统计三类神经元总数 */
     int total_core = 0, total_binary = 0, total_prune = 0;
-
     for (int l = 0; l < n_layer; l++) {
         BinLayer *fc = &m->layers[l].mlp_gate;
-        uint8_t *mask = fc->logic_mask;
-        if (!mask) continue;
-
-        int mlp_dim = fc->out_dim;
-        int in_dim = fc->in_dim;
-
-        /* 统计该层三类神经元数 */
-        int nc = 0, nb = 0, np = 0;
-        for (int j = 0; j < mlp_dim; j++) {
-            if (mask[j] == 0) nc++;
-            else if (mask[j] == 1) nb++;
-            else np++;
+        if (!fc->logic_mask) continue;
+        for (int j = 0; j < fc->out_dim; j++) {
+            if (fc->logic_mask[j] == 0) total_core++;
+            else if (fc->logic_mask[j] == 1) total_binary++;
+            else total_prune++;
         }
-        total_core += nc;
-        total_binary += nb;
-        total_prune += np;
+        n_guided_layers++;
+    }
+    if (n_guided_layers == 0) return 0.0f;
 
-        /* 对每个反义词对,计算激活并引导 */
-        for (int p = 0; p < (int)N_PROBE_PAIRS; p++) {
-            ConceptPair *cp = &probe_pairs[p];
+    /* BUG #35 FIX: 旧代码结构是 for(layer) for(pair) { compute_gate_input(layer) }
+     * 这导致:
+     *   1. get_concept_embedding 被调用 n_layer × N_PROBE_PAIRS × 2 = 112 次/步
+     *      (实际只需 14 次,emb 不随 layer 变化)
+     *   2. compute_gate_input(l) 内部跑 layer 0..l 的完整 forward。
+     *      对 layer 7,每次调用跑 8 层 forward。n_layer 个 layer 总共跑
+     *      1+2+...+8 = 36 次 forward/pair = 36×14 = 504 次 forward/步 (O(n²))
+     *
+     * 修复:外层循环 pair,内层循环 layer。对每个 pair,只做一次 0→n_layer-1 的
+     * forward,在每层捕获 gate_input。forward 次数从 504 降到 14 (36x 加速)。
+     * emb 计算从 112 降到 14 (8x 加速)。
+     *
+     * 需要缓存每层的 gate_input:gate_a[layer][n_embd], gate_b[layer][n_embd] */
 
-            float *emb_a = (float *)malloc(n_embd * sizeof(float));
-            float *emb_b = (float *)malloc(n_embd * sizeof(float));
-            get_concept_embedding(m, cp->bytes_a, emb_a, n_embd);
-            get_concept_embedding(m, cp->bytes_b, emb_b, n_embd);
+    /* 静态缓存:gate_inputs[pair][concept][layer][n_embd]
+     * N_PROBE_PAIRS=7, 2 concepts, n_layer≤32, n_embd≤4096
+     * 用静态指针数组,按需分配 */
+    static float *gate_cache_a = NULL;  /* [n_layer * n_embd] */
+    static float *gate_cache_b = NULL;  /* [n_layer * n_embd] */
+    static int gc_n = 0, gc_layers = 0;
+    if (gc_n != n_embd || gc_layers != n_layer) {
+        free(gate_cache_a); free(gate_cache_b);
+        gate_cache_a = malloc((size_t)n_layer * n_embd * sizeof(float));
+        gate_cache_b = malloc((size_t)n_layer * n_embd * sizeof(float));
+        gc_n = n_embd; gc_layers = n_layer;
+    }
 
-            /* BUG #19 FIX: 用 compute_gate_input 算出该层 mlp_gate 真实输入
-             * (经过 LN1 + attn + residual + LN2),不再用原始 wte 喂 mlp_gate。
-             * 这让 simulate_activation 算出的激活和真实 forward 一致,
-             * 梯度也是在"真实输入空间"上算的,不是原始 embedding 空间。 */
-            float *gate_a = (float *)malloc(n_embd * sizeof(float));
-            float *gate_b = (float *)malloc(n_embd * sizeof(float));
-            compute_gate_input(m, emb_a, l, gate_a, n_embd);
-            compute_gate_input(m, emb_b, l, gate_b, n_embd);
+    /* 静态 emb 缓存 (避免每对重复计算) */
+    static float *emb_cache_a = NULL;  /* [N_PROBE_PAIRS * n_embd] */
+    static float *emb_cache_b = NULL;
+    static int ec_n = 0;
+    if (ec_n != n_embd) {
+        free(emb_cache_a); free(emb_cache_b);
+        emb_cache_a = malloc((size_t)N_PROBE_PAIRS * n_embd * sizeof(float));
+        emb_cache_b = malloc((size_t)N_PROBE_PAIRS * n_embd * sizeof(float));
+        ec_n = n_embd;
+    }
 
-            /* 模拟该层激活:gate_input * W (CORE 用 w_core, BINARY 用 w_float) */
-            float *act_a = (float *)malloc(mlp_dim * sizeof(float));
-            float *act_b = (float *)malloc(mlp_dim * sizeof(float));
+    /* 预计算所有 emb (14 次,不是 112 次) */
+    for (int p = 0; p < (int)N_PROBE_PAIRS; p++) {
+        ConceptPair *cp = &probe_pairs[p];
+        get_concept_embedding(m, cp->bytes_a, &emb_cache_a[(size_t)p * n_embd], n_embd);
+        get_concept_embedding(m, cp->bytes_b, &emb_cache_b[(size_t)p * n_embd], n_embd);
+    }
+
+    /* 对每个 pair,用 compute_all_gate_inputs 一次拿到所有层 gate_input
+     * BUG #35 FIX: 旧代码对每层调 compute_gate_input(l),内部跑 0..l 的 forward,
+     * 总共 1+2+...+8 = 36 次 forward/pair。现在用 compute_all_gate_inputs 一次
+     * 跑完所有层,只需 8 次 forward/pair (4.5x 加速)。 */
+    float *act_a = malloc(mlp_dim * sizeof(float));
+    float *act_b = malloc(mlp_dim * sizeof(float));
+
+    for (int p = 0; p < (int)N_PROBE_PAIRS; p++) {
+        /* 一次 forward 拿到 concept a/b 的所有层 gate_input */
+        compute_all_gate_inputs(m, &emb_cache_a[(size_t)p * n_embd],
+                                gate_cache_a, n_embd);
+        compute_all_gate_inputs(m, &emb_cache_b[(size_t)p * n_embd],
+                                gate_cache_b, n_embd);
+
+        /* 对每层用缓存的 gate_input 算激活和梯度 */
+        for (int l = 0; l < n_layer; l++) {
+            BinLayer *fc = &m->layers[l].mlp_gate;
+            uint8_t *mask = fc->logic_mask;
+            if (!mask) continue;
+
+            int layer_in_dim = fc->in_dim;
+            float *gate_a = &gate_cache_a[(size_t)l * n_embd];
+            float *gate_b = &gate_cache_b[(size_t)l * n_embd];
+
             simulate_activation(m, gate_a, l, act_a, mlp_dim);
             simulate_activation(m, gate_b, l, act_b, mlp_dim);
 
-            /* 计算损失: CORE 最大化 |diff|, BINARY 最小化 diff^2
-             * BUG #30 FIX: 旧代码对所有层都乘 * 0.5f (注释说"深层权重衰减"但实际
-             *   连 layer 0 也乘了)。layer_lr_scale 已经在梯度里处理了深层衰减
-             *   (layer 0 = 1.0, 深层 = 0.5),损失里不该再乘。现在去掉 * 0.5f,
-             *   让损失反映真实的 CORE 差异化量级,梯度衰减完全由 layer_lr_scale 控制。 */
+            /* 计算损失 + 统计 */
             int layer_nc = 0, layer_nb = 0;
             for (int j = 0; j < mlp_dim; j++) {
-                if (mask[j] == 2) continue;  /* PRUNE: 跳过,保持静默 */
+                if (mask[j] == 2) continue;
                 float diff = act_a[j] - act_b[j];
                 float adiff = fabsf(diff);
-                if (mask[j] == 0) {  /* CORE: 最大化 |diff| */
+                if (mask[j] == 0) {
                     total_loss -= alpha * adiff;
                     layer_nc++;
-                } else {  /* BINARY: 最小化 diff^2 */
+                } else {
                     total_loss += beta * diff * diff;
                     layer_nb++;
                 }
             }
 
-            /* === 将语义引导梯度累加到 grad_accum,由 LAL-aware Adam 统一更新 ===
-             * 之前直接改 w_float 绕过了 Adam,导致:
-             * 1. 没有 g_core_lr_multiplier=3.0 的 CORE 加成
-             * 2. 没有分组二阶矩归一化
-             * 3. 与主训练循环的 Adam 更新冲突
-             * 现在改为:梯度 → grad_accum → model_batch_apply(LAL-aware Adam)
-             *
-             * BUG #19: 梯度公式 dL/dw[j,i] = grad_scale * (gate_a[i] - gate_b[i])
-             *   不是 (emb_a[i] - emb_b[i])!因为 s = w · gate_input,不是 w · emb。
-             *   之前用 emb 算梯度,相当于在错误的输入空间上优化,引导方向偏了。
-             *
-             * BUG #23 FIX: 旧代码把 *lr 乘进 grad_scale,但 model_batch_apply
-             *   再用 lr 缩放 grad_accum → 逻辑梯度被乘了 lr^2 (≈2.5e-6 而非 0.002)。
-             *   现在去掉 *lr,让 logic_lr 表示"逻辑梯度相对于主训练梯度的倍率"
-             *   (logic_lr=1.0 表示逻辑梯度与主梯度同量级,>1 表示逻辑引导更强)。
-             *   实际有效 lr = logic_lr * base_lr (例如 4.0 * 0.0005 = 0.002)。 */
-
             float inv_nc = layer_nc > 0 ? 1.0f / sqrtf((float)layer_nc) : 0;
             float inv_nb = layer_nb > 0 ? 1.0f / sqrtf((float)layer_nb) : 0;
+            float layer_lr_scale = (l == 0) ? 1.0f : 0.5f;
 
             for (int j = 0; j < mlp_dim; j++) {
-                if (mask[j] == 2) continue;  /* PRUNE: 无梯度 */
+                if (mask[j] == 2) continue;
                 float diff = act_a[j] - act_b[j];
-                float *ga = &fc->grad_accum[(size_t)j * in_dim];  /* 累加到 grad_accum */
-                /* 深层 lr 衰减:layer 0 全量,深层 0.5x */
-                float layer_lr_scale = (l == 0) ? 1.0f : 0.5f;
+                float *ga = &fc->grad_accum[(size_t)j * layer_in_dim];
 
-                if (mask[j] == 0) {  /* CORE: 梯度推动差异化 */
-                    /* Loss L = -alpha * |diff|, minimize → dL/dw = -alpha*sign(diff)*(gate_a-gate_b)
-                     * w -= lr*grad_accum → w += lr*alpha*sign(diff)*(gate_a-gate_b) → diff 增大 ✓
-                     *
-                     * BUG #23 FIX: 旧代码在 grad_scale 中乘 *lr (=logic_lr=0.002),
-                     *   但 model_batch_apply 又乘一次 main_lr=0.0005 → 逻辑梯度被乘 lr^2
-                     *   (逻辑梯度 ≈ 1e-6, 主梯度 ≈ 5e-4, 相差 500x,逻辑引导几乎无效).
-                     *   而且由于 LAL-aware Adam 的 group_v 会 EMA grad^2, 逻辑梯度的缩放会被
-                     *   sqrt_v 抵消,使得 *lr 参数实际上对 CORE/BINARY 梯度无影响.
-                     *   现在用 lr 作为相对倍率 (1.0 = 同主梯度量级),默认 4.0 (4x 主梯度). */
+                if (mask[j] == 0) {  /* CORE */
                     float s = diff > 0 ? 1.0f : -1.0f;
                     float grad_scale = -alpha * s * inv_nc * layer_lr_scale * lr;
-                    for (int i = 0; i < in_dim; i++) {
-                        float g = grad_scale * (gate_a[i] - gate_b[i]);  /* BUG #19: gate_input, not emb */
-                        ga[i] += g;  /* 累加,不直接改 w_float */
-                    }
-                    /* BUG #33 FIX: bias gradient.
-                     * act[j] = w·gate + bias[j], so dL/d(bias[j]) = dL/d(act[j]) = -alpha*sign(diff)
-                     * (input term is 1, not gate_a-gate_b).
-                     * bias 直接平移激活水平,是调整 |diff| 最有效的参数。
-                     * 旧代码从不更新 bias_grad_accum → bias 只能通过主训练损失更新,
-                     * 逻辑引导对 bias 完全没有控制。 */
-                    if (fc->bias_grad_accum) {
+                    for (int i = 0; i < layer_in_dim; i++)
+                        ga[i] += grad_scale * (gate_a[i] - gate_b[i]);
+                    if (fc->bias_grad_accum)
                         fc->bias_grad_accum[j] += -alpha * s * inv_nc * layer_lr_scale * lr;
-                    }
-                } else {  /* BINARY: 梯度推动收敛 */
-                    /* BUG #21 FIX: Loss L = +beta * diff^2, minimize → dL/dw = +beta*2*diff*(gate_a-gate_b)
-                     * w -= lr*grad_accum → w -= lr*beta*2*diff*(gate_a-gate_b) → diff^2 减小 ✓
-                     *
-                     * 旧代码用 ga[i] -= grad_scale * ... (= grad_accum -= beta*2*diff*(gate_a-gate_b))
-                     * 这相当于 grad_accum 取负,update 时 w += lr*beta*2*diff*(gate_a-gate_b)
-                     * → diff^2 被最大化了!收敛目标完全反了。
-                     * 这解释了为什么 BIN diff 一直和 CORE diff 差不多大 (ratio≈0.99):
-                     * BINARY 神经元没在收敛,而是在被推开。
-                     *
-                     * BUG #23 FIX: lr 现在是相对倍率 (见 CORE 注释). */
+                } else {  /* BINARY */
                     float grad_scale = beta * 2.0f * diff * inv_nb * layer_lr_scale * lr;
-                    for (int i = 0; i < in_dim; i++) {
-                        float g = grad_scale * (gate_a[i] - gate_b[i]);  /* BUG #19: gate_input, not emb */
-                        ga[i] += g;  /* BUG #21: was -=, should be += (sign was reversed) */
-                    }
-                    /* BUG #33 FIX: bias gradient for BINARY.
-                     * dL/d(bias[j]) = +beta*2*diff (input term is 1). */
-                    if (fc->bias_grad_accum) {
+                    for (int i = 0; i < layer_in_dim; i++)
+                        ga[i] += grad_scale * (gate_a[i] - gate_b[i]);
+                    if (fc->bias_grad_accum)
                         fc->bias_grad_accum[j] += beta * 2.0f * diff * inv_nb * layer_lr_scale * lr;
-                    }
                 }
             }
-
-            free(emb_a); free(emb_b);
-            free(gate_a); free(gate_b);
-            free(act_a); free(act_b);
         }
-
-        /* 不再调 bin_layer_repack — 由 model_batch_apply 的 LAL-aware Adam 统一更新 */
-        n_guided_layers++;
     }
+
+    free(act_a); free(act_b);
 
     /* 注:wte 推开试验过,但 byte-level 下反义词共享首 byte(热=0xE783AD, 冷=0xE586B7),
      * 推开单个 byte embedding 会污染所有以该 byte 开头的字符,适得其反。
