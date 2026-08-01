@@ -80,11 +80,20 @@ static float logic_guided_regularization(Model *m, float lr) {
             get_concept_embedding(m, cp->bytes_a, emb_a, n_embd);
             get_concept_embedding(m, cp->bytes_b, emb_b, n_embd);
 
-            /* 模拟该层激活:emb * W (用 w_float) */
+            /* BUG #19 FIX: 用 compute_gate_input 算出该层 mlp_gate 真实输入
+             * (经过 LN1 + attn + residual + LN2),不再用原始 wte 喂 mlp_gate。
+             * 这让 simulate_activation 算出的激活和真实 forward 一致,
+             * 梯度也是在"真实输入空间"上算的,不是原始 embedding 空间。 */
+            float *gate_a = (float *)malloc(n_embd * sizeof(float));
+            float *gate_b = (float *)malloc(n_embd * sizeof(float));
+            compute_gate_input(m, emb_a, l, gate_a, n_embd);
+            compute_gate_input(m, emb_b, l, gate_b, n_embd);
+
+            /* 模拟该层激活:gate_input * W (CORE 用 w_core, BINARY 用 w_float) */
             float *act_a = (float *)malloc(mlp_dim * sizeof(float));
             float *act_b = (float *)malloc(mlp_dim * sizeof(float));
-            simulate_activation(m, emb_a, l, act_a, mlp_dim);
-            simulate_activation(m, emb_b, l, act_b, mlp_dim);
+            simulate_activation(m, gate_a, l, act_a, mlp_dim);
+            simulate_activation(m, gate_b, l, act_b, mlp_dim);
 
             /* 计算损失: CORE 最大化 |diff|, BINARY 最小化 diff^2 */
             int layer_nc = 0, layer_nb = 0;
@@ -106,7 +115,11 @@ static float logic_guided_regularization(Model *m, float lr) {
              * 1. 没有 g_core_lr_multiplier=3.0 的 CORE 加成
              * 2. 没有分组二阶矩归一化
              * 3. 与主训练循环的 Adam 更新冲突
-             * 现在改为:梯度 → grad_accum → model_batch_apply(LAL-aware Adam) */
+             * 现在改为:梯度 → grad_accum → model_batch_apply(LAL-aware Adam)
+             *
+             * BUG #19: 梯度公式 dL/dw[j,i] = grad_scale * (gate_a[i] - gate_b[i])
+             *   不是 (emb_a[i] - emb_b[i])!因为 s = w · gate_input,不是 w · emb。
+             *   之前用 emb 算梯度,相当于在错误的输入空间上优化,引导方向偏了。 */
 
             float inv_nc = layer_nc > 0 ? 1.0f / sqrtf((float)layer_nc) : 0;
             float inv_nb = layer_nb > 0 ? 1.0f / sqrtf((float)layer_nb) : 0;
@@ -122,19 +135,21 @@ static float logic_guided_regularization(Model *m, float lr) {
                     float s = diff > 0 ? 1.0f : -1.0f;
                     float grad_scale = -alpha * s * inv_nc * lr * layer_lr_scale;
                     for (int i = 0; i < in_dim; i++) {
-                        float g = grad_scale * (emb_a[i] - emb_b[i]);
+                        float g = grad_scale * (gate_a[i] - gate_b[i]);  /* BUG #19: gate_input, not emb */
                         ga[i] += g;  /* 累加,不直接改 w_float */
                     }
                 } else {  /* BINARY: 梯度推动收敛 */
                     float grad_scale = beta * 2.0f * diff * inv_nb * lr * layer_lr_scale;
                     for (int i = 0; i < in_dim; i++) {
-                        float g = grad_scale * (emb_a[i] - emb_b[i]);
+                        float g = grad_scale * (gate_a[i] - gate_b[i]);  /* BUG #19: gate_input, not emb */
                         ga[i] -= g;  /* 累加到 grad_accum(符号与 CORE 相反) */
                     }
                 }
             }
 
-            free(emb_a); free(emb_b); free(act_a); free(act_b);
+            free(emb_a); free(emb_b);
+            free(gate_a); free(gate_b);
+            free(act_a); free(act_b);
         }
 
         /* 不再调 bin_layer_repack — 由 model_batch_apply 的 LAL-aware Adam 统一更新 */
@@ -251,10 +266,16 @@ static void deep_whitebox_diagnosis(Model *m) {
     int mlp_dim = m->cfg.mlp_dim;
     BinLayer *fc0 = &m->layers[0].mlp_gate;
     if (fc0->logic_mask) {
+        /* BUG #19 FIX: 用 compute_gate_input 算 mlp_gate 真实输入 */
+        float *gate_hot = malloc(n_embd * sizeof(float));
+        float *gate_cold = malloc(n_embd * sizeof(float));
+        compute_gate_input(m, embs[0], 0, gate_hot, n_embd);
+        compute_gate_input(m, embs[1], 0, gate_cold, n_embd);
+
         float *act_hot = malloc(mlp_dim * sizeof(float));
         float *act_cold = malloc(mlp_dim * sizeof(float));
-        simulate_activation(m, embs[0], 0, act_hot, mlp_dim);
-        simulate_activation(m, embs[1], 0, act_cold, mlp_dim);
+        simulate_activation(m, gate_hot, 0, act_hot, mlp_dim);
+        simulate_activation(m, gate_cold, 0, act_cold, mlp_dim);
 
         float core_max = -1e10, core_avg = 0;
         float bin_max = -1e10, bin_avg = 0;
@@ -286,6 +307,7 @@ static void deep_whitebox_diagnosis(Model *m) {
         }
         printf("\n");
         free(act_hot); free(act_cold);
+        free(gate_hot); free(gate_cold);
     }
 
     /* === 3. 三类权重范数分层 === */

@@ -144,11 +144,124 @@ static void get_concept_embedding(Model *m, const char *utf8_bytes,
 }
 
 /* ========================================================================
- * Simulated activation: emb * W for one layer's mlp_gate
- * Direct matmul using w_float — no model_forward needed.
- * This shows what CORE/BINARY/PRUNE neurons would fire.
+ * Compute the input to mlp_gate at target_layer for a single concept.
+ *
+ * BUG #19 FIX: Previously simulate_activation computed W_gate * raw_emb,
+ * completely skipping the LayerNorm + attention + residual path that the
+ * real forward applies before mlp_gate. The reported CORE/BINARY diff
+ * metrics and the logic_guided_regularization gradient were both computed
+ * on raw wte values, which have a totally different distribution from
+ * the LN'd, attention-mixed, residual-added activations the model sees.
+ *
+ * This function does a proper single-position forward through layers
+ * 0..target_layer using V-copy attention (matches training default
+ * g_use_real_attention=0). Uses scratch buffers — does NOT touch m->acts.
+ *
+ * For single-token concepts: initial_emb = wte[token].
+ * For multi-byte concepts (轻/湿/干): initial_emb = sum of byte-fallback
+ *   wte rows (approximation — model never sees this exact vector, but
+ *   it captures the concept's direction in wte space).
  * ======================================================================== */
-static void simulate_activation(Model *m, const float *emb, int layer,
+static void compute_gate_input(Model *m, const float *initial_emb,
+                                int target_layer, float *out, int n_embd) {
+    int n_layer = m->cfg.n_layer;
+    int mlp_dim = m->cfg.mlp_dim;
+    int n = n_embd;
+    float rs = m->cfg.residual_scale;
+
+    /* Scratch buffers (heap-allocated to avoid stack overflow on large n_embd).
+     * BUG #20 FIX: when qkv_merged=1, attn_q produces [Q|K|V] concatenated
+     * (out_dim = 3*n). The original code allocated q as n floats → heap
+     * overflow. Now allocate 3n for the merged QKV buffer and extract V
+     * from offset 2n (matches trans_layer_forward_pure_float in lal_runtime.c). */
+    float *x        = malloc(n * sizeof(float));
+    float *norm1    = malloc(n * sizeof(float));
+    float *norm2    = malloc(n * sizeof(float));
+    float *qkv_buf  = m->cfg.qkv_merged ? malloc(3 * n * sizeof(float)) : NULL;
+    float *q        = m->cfg.qkv_merged ? NULL : malloc(n * sizeof(float));
+    float *v        = m->cfg.qkv_merged ? (qkv_buf + 2 * n) : malloc(n * sizeof(float));
+    float *attn_out = malloc(n * sizeof(float));
+    float *proj_out = malloc(n * sizeof(float));
+    float *gate_buf = malloc(mlp_dim * sizeof(float));
+    float *up_buf   = malloc(mlp_dim * sizeof(float));
+    float *hidden   = malloc(mlp_dim * sizeof(float));
+    float *mlp_out  = malloc(n * sizeof(float));
+
+    /* x = initial_emb + wpe[0] */
+    memcpy(x, initial_emb, n * sizeof(float));
+    if (m->wpe) {
+        const float *wpe0 = &m->wpe[0];  /* position 0 */
+        for (int i = 0; i < n; i++) x[i] += wpe0[i];
+    }
+
+    for (int l = 0; l <= target_layer && l < n_layer; l++) {
+        TransLayer *tl = &m->layers[l];
+
+        /* LN1: norm1 = LN1(x) */
+        norm_forward(norm1, x, tl->norm1_w, tl->norm1_b, m->cfg.norm_type, n);
+
+        /* Q, V projections. For qkv_merged, attn_q produces [Q|K|V] (3n);
+         * V is at offset 2n. For non-merged, call attn_q and attn_v
+         * separately (K not needed for V-copy attention). */
+        if (m->cfg.qkv_merged) {
+            bin_forward_pure_float(qkv_buf, norm1, &tl->attn_q);
+            /* v already points to qkv_buf + 2*n */
+        } else {
+            bin_forward_pure_float(q, norm1, &tl->attn_q);  /* unused but matches forward */
+            bin_forward_pure_float(v, norm1, &tl->attn_v);
+        }
+
+        /* V-copy attention (matches training default g_use_real_attention=0):
+         *   attn_out = v
+         * For single token this is exact. For multi-token concepts we're
+         * already collapsing to one position, so this is still the right
+         * degenerate attention. */
+        memcpy(attn_out, v, n * sizeof(float));
+
+        /* Output projection + residual */
+        bin_forward_pure_float(proj_out, attn_out, &tl->attn_o);
+        for (int i = 0; i < n; i++) x[i] += rs * proj_out[i];
+        clip_array(x, n, 10.0f);
+
+        /* LN2: norm2 = LN2(x) — this is the mlp_gate input */
+        norm_forward(norm2, x, tl->norm2_w, tl->norm2_b, m->cfg.norm_type, n);
+
+        if (l == target_layer) {
+            memcpy(out, norm2, n * sizeof(float));
+            break;
+        }
+
+        /* MLP (needed to feed next layer) */
+        if (m->cfg.act_type == ACT_SWIGLU) {
+            bin_forward_pure_float(gate_buf, norm2, &tl->mlp_gate);
+            bin_forward_pure_float(up_buf,   norm2, &tl->mlp_up);
+            for (int i = 0; i < mlp_dim; i++) hidden[i] = silu(gate_buf[i]) * up_buf[i];
+        } else {
+            bin_forward_pure_float(hidden, norm2, &tl->mlp_gate);
+            for (int i = 0; i < mlp_dim; i++) hidden[i] = gelu(hidden[i]);
+        }
+        bin_forward_pure_float(mlp_out, hidden, &tl->mlp_down);
+        for (int i = 0; i < n; i++) x[i] += rs * mlp_out[i];
+        clip_array(x, n, 10.0f);
+    }
+
+    free(x); free(norm1); free(norm2);
+    free(qkv_buf); free(q);
+    if (!m->cfg.qkv_merged) free(v);  /* v points into qkv_buf when merged */
+    free(attn_out); free(proj_out);
+    free(gate_buf); free(up_buf); free(hidden); free(mlp_out);
+}
+
+/* ========================================================================
+ * Simulated activation: gate_input * W for one layer's mlp_gate
+ * Direct matmul using w_core (CORE) or w_float (BINARY) — no model_forward.
+ *
+ * NOTE: 'gate_input' should be the output of compute_gate_input() — i.e.
+ * the LN2'd, attention-mixed, residual-added activation that mlp_gate
+ * actually sees at runtime. Passing raw wte here will produce meaningless
+ * results (this was BUG #19).
+ * ======================================================================== */
+static void simulate_activation(Model *m, const float *gate_input, int layer,
                                  float *out_activations, int out_dim) {
     BinLayer *fc = &m->layers[layer].mlp_gate;
     int in_dim = fc->in_dim;
@@ -175,14 +288,14 @@ static void simulate_activation(Model *m, const float *emb, int layer,
             if (fc->w_core) {
                 const float *wc = &fc->w_core[core_idx * in_dim];
                 for (int i = 0; i < in_dim; i++)
-                    s += emb[i] * wc[i];
+                    s += gate_input[i] * wc[i];
             }
             core_idx++;
         } else {
             /* BINARY: use w_float (matches bin_forward_pure_float) */
             const float *wf = &fc->w_float[(size_t)j * in_dim];
             for (int i = 0; i < in_dim; i++)
-                s += emb[i] * wf[i];
+                s += gate_input[i] * wf[i];
         }
         out_activations[j] = s;
     }
@@ -299,8 +412,8 @@ static WeightStruct analyze_weights(BinLayer *bl) {
 
 /* ========================================================================
  * Simulated CORE Activation Analysis
- * Compute emb * W directly to see which neurons fire for each concept.
- * No model_forward — pure weight analysis.
+ * Compute gate_input * W to see which neurons fire for each concept.
+ * Uses compute_gate_input() for proper LN+attn+residual forward.
  * ======================================================================== */
 static void core_activation_analysis(Model *m) {
     int n_embd = m->cfg.n_embd;
@@ -316,15 +429,22 @@ static void core_activation_analysis(Model *m) {
         float emb_a[4096], emb_b[4096];
         get_concept_embedding(m, cp->bytes_a, emb_a, n_embd);
         get_concept_embedding(m, cp->bytes_b, emb_b, n_embd);
+
+        /* BUG #19 FIX: compute proper gate_input (LN1 + attn + residual + LN2)
+         * instead of feeding raw wte to mlp_gate. */
+        float *gate_a = (float *)malloc(n_embd * sizeof(float));
+        float *gate_b = (float *)malloc(n_embd * sizeof(float));
+        compute_gate_input(m, emb_a, 0, gate_a, n_embd);
+        compute_gate_input(m, emb_b, 0, gate_b, n_embd);
         
-        /* Simulate: activation = emb * W_layer0_mlp_gate */
+        /* Simulate: activation = gate_input * W_layer0_mlp_gate */
         float *act_a = (float *)malloc(mlp_dim * sizeof(float));
         float *act_b = (float *)malloc(mlp_dim * sizeof(float));
-        simulate_activation(m, emb_a, 0, act_a, mlp_dim);
-        simulate_activation(m, emb_b, 0, act_b, mlp_dim);
+        simulate_activation(m, gate_a, 0, act_a, mlp_dim);
+        simulate_activation(m, gate_b, 0, act_b, mlp_dim);
         
         uint8_t *mask = m->layers[0].mlp_gate.logic_mask;
-        if (!mask) { free(act_a); free(act_b); continue; }
+        if (!mask) { free(act_a); free(act_b); free(gate_a); free(gate_b); continue; }
         
         /* Measure CORE vs BINARY differentiation */
         float core_diff = 0, bin_diff = 0, prune_diff = 0;
@@ -354,6 +474,8 @@ static void core_activation_analysis(Model *m) {
         
         free(act_a);
         free(act_b);
+        free(gate_a);
+        free(gate_b);
     }
     printf("\n");
 }
@@ -476,7 +598,9 @@ static ProbeMetrics whitebox_probe_compact(Model *m) {
     avg_opp_sim = n_pairs > 0 ? avg_opp_sim / n_pairs : 0;
     pm.boundary_score = 100.0f * (1.0f - avg_opp_sim);
 
-    /* 2. CORE vs BINARY differentiation (layer 0 simulated activation) */
+    /* 2. CORE vs BINARY differentiation (layer 0 simulated activation).
+     * BUG #19 FIX: use compute_gate_input() to get the proper LN2'd input
+     * that mlp_gate actually sees at runtime, instead of raw wte. */
     float core_diff_sum = 0, bin_diff_sum = 0, prune_act_sum = 0;
     for (int p = 0; p < (int)N_PROBE_PAIRS; p++) {
         ConceptPair *cp = &probe_pairs[p];
@@ -484,10 +608,15 @@ static ProbeMetrics whitebox_probe_compact(Model *m) {
         get_concept_embedding(m, cp->bytes_a, emb_a, n_embd);
         get_concept_embedding(m, cp->bytes_b, emb_b, n_embd);
 
+        float *gate_a = (float *)malloc(n_embd * sizeof(float));
+        float *gate_b = (float *)malloc(n_embd * sizeof(float));
+        compute_gate_input(m, emb_a, 0, gate_a, n_embd);
+        compute_gate_input(m, emb_b, 0, gate_b, n_embd);
+
         float *act_a = (float *)malloc(mlp_dim * sizeof(float));
         float *act_b = (float *)malloc(mlp_dim * sizeof(float));
-        simulate_activation(m, emb_a, 0, act_a, mlp_dim);
-        simulate_activation(m, emb_b, 0, act_b, mlp_dim);
+        simulate_activation(m, gate_a, 0, act_a, mlp_dim);
+        simulate_activation(m, gate_b, 0, act_b, mlp_dim);
 
         uint8_t *mask = m->layers[0].mlp_gate.logic_mask;
         if (mask) {
@@ -508,6 +637,8 @@ static ProbeMetrics whitebox_probe_compact(Model *m) {
         }
         free(act_a);
         free(act_b);
+        free(gate_a);
+        free(gate_b);
     }
     pm.core_diff_avg = core_diff_sum / N_PROBE_PAIRS;
     pm.bin_diff_avg  = bin_diff_sum / N_PROBE_PAIRS;
