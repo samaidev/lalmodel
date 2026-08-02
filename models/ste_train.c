@@ -742,12 +742,15 @@ static int sample_argmax(const float *logits, int vocab_size) {
     return best;
 }
 
-/* === STE 训练:单阶段,固定模型 === */
+/* === STE 训练:单阶段,固定模型 ===
+ * start_step: 用于续训时正确恢复 LR schedule (cosine decay 从 start_step 开始计算)
+ * total_schedule_steps: LR schedule 的总步数 (分块训练时保持 cosine 连续)
+ */
 static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
                        int warmup, int batch_size, int max_pos, int eval_interval,
-                       float logic_lr) {
-    printf("\n=== LAL STE Training (B=%d, max_pos=%d, steps=%d, logic_lr=%.4f) ===\n",
-           batch_size, max_pos, n_steps, logic_lr);
+                       float logic_lr, int start_step, int total_schedule_steps) {
+    printf("\n=== LAL STE Training (B=%d, max_pos=%d, steps=%d, start_step=%d, total_sched=%d, logic_lr=%.4f) ===\n",
+           batch_size, max_pos, n_steps, start_step, total_schedule_steps, logic_lr);
     printf("[*] STE: forward=sign(w), backward=w_float gradient\n");
     printf("[*] Whitebox probe every %d steps\n", eval_interval);
     printf("[*] Semantic regularization every step\n\n");
@@ -765,7 +768,9 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
     float best_recent_loss = 1e10f;
 
     for (int step = 0; step < n_steps; step++) {
-        float lr = lr_schedule(step, warmup, n_steps, base_lr);
+        int global_step = start_step + step;
+        /* 用 total_schedule_steps 让分块训练的 cosine LR 连续 */
+        float lr = lr_schedule(global_step, warmup, total_schedule_steps, base_lr);
         model_batch_begin(m);
 
         float batch_loss = 0;
@@ -817,17 +822,15 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
         if (step % eval_interval == 0 || step == n_steps - 1) {
             clock_gettime(CLOCK_MONOTONIC, &t1);
             double dt = (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9;
-            printf("  step %5d/%d  loss=%.4f  avg=%.4f  lr=%.6f  B=%d  %.0fms\n",
-                   step, n_steps, avg_loss, recent_loss, lr, n_valid,
+            printf("  step %5d/%d (global=%d)  loss=%.4f  avg=%.4f  lr=%.6f  B=%d  %.0fms\n",
+                   step, n_steps, global_step, avg_loss, recent_loss, lr, n_valid,
                    dt / (step + 1) * 1000);
             fflush(stdout);
 
             if (recent_loss < best_recent_loss) best_recent_loss = recent_loss;
         }
 
-        /* 白箱探针:每 10 步检查 CORE/BINARY/PRUNE 逻辑电路
-         * BUG #34 FIX: whitebox_probe_compact 内部已经打印 3 行 WB 指标,
-         * 这里不再重复打印 (旧代码会打印两遍相同的信息)。 */
+        /* 白箱探针:每 10 步检查 CORE/BINARY/PRUNE 逻辑电路 */
         if (step % 10 == 0) {
             whitebox_probe_compact(m);
         }
@@ -841,7 +844,7 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
                 "\xe6\xb0\xb4", "\xe5\xa4\xa7", "\xe5\xb0\x8f"
             };
             const char *trace_labels[] = {"热","冷","火","水","大","小"};
-            int ti = (step / 50) % 6;
+            int ti = (global_step / 50) % 6;
             inference_trace_compact(m, trace_prompts[ti], trace_labels[ti]);
         }
     }
@@ -1022,6 +1025,8 @@ int main(int argc, char **argv) {
     float logic_lr = 1.0f;  /* --logic-lr 调整:相对倍率 (1.0=同主梯度量级) */
     int phase_idx = 0;
     int vocab_size = 256;  /* --vocab 256=byte, 32768=BPE */
+    int start_step = 0;    /* --start-step: 续训时跳过的步数,用于正确恢复 LR schedule */
+    int total_schedule_steps = 0; /* --total-steps: LR schedule 总步数 (0=用 n_steps) */
     const char *data_path = "data/curriculum/stage_grounding_combined.bin";
     const char *weights_path = "/tmp/lal_ste_model.bin";
     const char *save_path = NULL;   /* --save: 训练后保存 */
@@ -1040,6 +1045,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--lr") && i+1 < argc) base_lr = atof(argv[++i]);
         else if (!strcmp(argv[i], "--logic-lr") && i+1 < argc) logic_lr = atof(argv[++i]);
         else if (!strcmp(argv[i], "--phase") && i+1 < argc) phase_idx = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--start-step") && i+1 < argc) start_step = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--total-steps") && i+1 < argc) total_schedule_steps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--vocab") && i+1 < argc) vocab_size = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--data") && i+1 < argc) data_path = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i+1 < argc) prompt = argv[++i];
@@ -1065,6 +1072,8 @@ int main(int argc, char **argv) {
                    "  --batch-size N    Batch size (default 4)\n"
                    "  --lr F            Base learning rate (default 0.0005)\n"
                    "  --logic-lr F      Logic guidance multiplier (default 1.0 = same as main grad)\n"
+                   "  --start-step N    Skip N steps for LR schedule (used with --resume for chunked training)\n"
+                   "  --total-steps N   Total steps for LR schedule (default: --steps; set larger for chunked training)\n"
                    "  --data PATH       Data .bin path\n"
                    "  --save PATH       Save trained weights to .ste file\n"
                    "  --resume PATH     Load .ste weights and continue training\n"
@@ -1151,7 +1160,8 @@ int main(int argc, char **argv) {
 
     /* STE 训练 */
     if (n_steps > 0) {
-        ste_train(&model, &dl, n_steps, base_lr, 50, batch_size, 64, 10, logic_lr);
+        int total_steps = total_schedule_steps > 0 ? total_schedule_steps : n_steps;
+        ste_train(&model, &dl, n_steps, base_lr, 50, batch_size, 64, 10, logic_lr, start_step, total_steps);
     }
 
     /* 保存训练后权重 */
