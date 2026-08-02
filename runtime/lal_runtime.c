@@ -3775,6 +3775,71 @@ layer_done:
                     }
                 }
             }
+            /* v12: Orthogonal regularization on W_o (attn output projection)
+             * Same formula as W_v: Loss += lambda * ||W_o^T @ W_o - I||^2_F
+             * Gradient: dW_o = 4 * lambda * W_o @ (W_o^T @ W_o - I)
+             *
+             * v11 SVD showed W_o eff_rank=5-11 (severely rank-deficient).
+             * This causes layer collapse: different inputs project to same
+             * low-dimensional subspace → cosine(火,水)→1.0 after attention.
+             *
+             * W_o is the entire BinLayer (b==1), shape [n_embd, n_embd].
+             * Simpler than W_v (no QKV merge offset needed). */
+            if (b == 1) {
+                int n = m->cfg.n_embd;
+                int in = bl->in_dim;
+                float lambda_ortho_o = 0.02f;
+
+                static float *Go = NULL;
+                static int Go_n = 0;
+                if (Go_n != n) {
+                    free(Go);
+                    Go = (float *)malloc((size_t)n * n * sizeof(float));
+                    Go_n = n;
+                }
+
+                /* Go = W_o^T @ W_o  (W_o[j][i] = w_float[j*in + i]) */
+                for (int i = 0; i < n; i++) {
+                    for (int j = i; j < n; j++) {
+                        float dot = 0;
+                        for (int k = 0; k < n; k++) {
+                            float *wf_row = &bl->w_float[(size_t)k * in];
+                            dot += wf_row[i] * wf_row[j];
+                        }
+                        Go[i * n + j] = dot;
+                        Go[j * n + i] = dot;
+                    }
+                }
+
+                /* Go -= I */
+                for (int i = 0; i < n; i++)
+                    Go[i * n + i] -= 1.0f;
+
+                /* dW_o = 4 * lambda * W_o @ Go, apply directly */
+                float scale_o = 4.0f * lambda_ortho_o;
+                for (int k = 0; k < n; k++) {
+                    float *wf_row = &bl->w_float[(size_t)k * in];
+                    for (int i = 0; i < n; i++) {
+                        float grad = 0;
+                        for (int j = 0; j < n; j++)
+                            grad += wf_row[j] * Go[j * n + i];
+                        wf_row[i] -= scale_o * grad;
+                    }
+                }
+
+                /* Log W_o orthogonal stats every 50 steps */
+                if (g_opt_step % 50 == 49) {
+                    float off_diag_o = 0, diag_dev_o = 0;
+                    for (int i = 0; i < n; i++) {
+                        diag_dev_o += Go[i * n + i] * Go[i * n + i];
+                        for (int j = 0; j < n; j++) {
+                            if (i != j) off_diag_o += Go[i * n + j] * Go[i * n + j];
+                        }
+                    }
+                    printf("    [ortho] step %d L%d W_o off_diag=%.2f diag_dev=%.4f\n",
+                           g_opt_step, l, off_diag_o, diag_dev_o);
+                }
+            }
             /* Weight clipping + repack: per-neuron based on logic_mask.
              * CORE (float): ±2.0 — needs room for precise differentiation.
              * BINARY (sign): ±1.0 — must stay near ±1 for sign function.
