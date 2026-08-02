@@ -1,0 +1,53 @@
+=== SVD Diagnosis: model.ste ===
+
+Header: n_layer=6, n_embd=512, mlp_dim=2048, vocab=32768
+Phase 0.5: 6L/512d, ACT_GELU (no mlp_up)
+
+=== Layer 0 ===
+  W_q           rank= 512/512  S[0]=   5.032  S[1]=   2.605  S[0]/S[1]=    1.93  eff_rank=54.7
+  W_k           rank= 512/512  S[0]=   5.708  S[1]=   2.345  S[0]/S[1]=    2.43  eff_rank=48.6
+  W_v           rank= 512/512  S[0]=   1.023  S[1]=   1.022  S[0]/S[1]=    1.00  eff_rank=497.9
+  W_o           rank= 509/512  S[0]=  54.495  S[1]=   8.176  S[0]/S[1]=    6.66  eff_rank=5.9
+  mlp_gate      rank= 512/512  S[0]=   9.139  S[1]=   1.400  S[0]/S[1]=    6.53  eff_rank=37.6
+  mlp_down      rank= 512/512  S[0]=   8.657  S[1]=   5.462  S[0]/S[1]=    1.58  eff_rank=39.3
+
+=== Layer 1 ===
+  W_q           rank= 512/512  S[0]=   5.525  S[1]=   1.647  S[0]/S[1]=    3.36  eff_rank=47.1
+  W_k           rank= 511/512  S[0]=   9.263  S[1]=   2.300  S[0]/S[1]=    4.03  eff_rank=28.8
+  W_v           rank= 512/512  S[0]=   1.023  S[1]=   1.023  S[0]/S[1]=    1.00  eff_rank=496.9
+  W_o           rank= 511/512  S[0]=  26.639  S[1]=   6.519  S[0]/S[1]=    4.09  eff_rank=10.8
+  mlp_gate      rank= 512/512  S[0]=   6.020  S[1]=   1.237  S[0]/S[1]=    4.87  eff_rank=56.4
+  mlp_down      rank= 512/512  S[0]=   4.616  S[1]=   4.293  S[0]/S[1]=    1.08  eff_rank=73.0
+
+=== Layer 2 ===
+  W_q           rank= 512/512  S[0]=   3.088  S[1]=   1.914  S[0]/S[1]=    1.61  eff_rank=83.1
+  W_k           rank= 512/512  S[0]=   5.027  S[1]=   2.941  S[0]/S[1]=    1.71  eff_rank=52.2
+  W_v           rank= 510/512  S[0]=   1.023  S[1]=   1.022  S[0]/S[1]=    1.00  eff_rank=495.9
+  W_o           rank= 511/512  S[0]=  30.381  S[1]=   6.076  S[0]/S[1]=    5.00  eff_rank=9.5
+  mlp_gate      rank= 512/512  S[0]=   6.870  S[1]=   1.134  S[0]/S[1]=    6.06  eff_rank=49.5
+  mlp_down      rank= 512/512  S[0]=  21.485  S[1]=   5.768  S[0]/S[1]=    3.72  eff_rank=16.5
+
+=== Layer 3 ===
+  W_q           rank= 512/512  S[0]=   2.791  S[1]=   2.008  S[0]/S[1]=    1.39  eff_rank=91.7
+  W_k           rank= 512/512  S[0]=   3.399  S[1]=   2.863  S[0]/S[1]=    1.19  eff_rank=76.3
+  W_v           rank= 511/512  S[0]=   1.129  S[1]=   1.023  S[0]/S[1]=    1.10  eff_rank=448.4
+  W_o           rank= 509/512  S[0]=  34.965  S[1]=   6.067  S[0]/S[1]=    5.76  eff_rank=8.4
+  mlp_gate      rank= 512/512  S[0]=   7.196  S[1]=   1.122  S[0]/S[1]=    6.41  eff_rank=47.2
+  mlp_down      rank= 512/512  S[0]=  24.818  S[1]=   6.854  S[0]/S[1]=    3.62  eff_rank=14.0
+
+=== Layer 4 ===
+  W_q           rank= 512/512  S[0]=   3.675  S[1]=   1.506  S[0]/S[1]=    2.44  eff_rank=69.6
+  W_k           rank= 511/512  S[0]=   4.360  S[1]=   1.611  S[0]/S[1]=    2.71  eff_rank=59.2
+  W_v           rank= 511/512  S[0]=   1.114  S[1]=   1.023  S[0]/S[1]=    1.09  eff_rank=453.8
+  W_o           rank= 511/512  S[0]=  25.618  S[1]=   7.961  S[0]/S[1]=    3.22  eff_rank=11.1
+  mlp_gate      rank= 512/512  S[0]=   5.768  S[1]=   1.109  S[0]/S[1]=    5.20  eff_rank=58.7
+  mlp_down      rank= 512/512  S[0]=  32.208  S[1]=   5.052  S[0]/S[1]=    6.37  eff_rank=11.3
+
+=== Layer 5 ===
+  W_q           rank= 511/512  S[0]=   4.371  S[1]=   2.136  S[0]/S[1]=    2.05  eff_rank=59.2
+  W_k           rank= 512/512  S[0]=   4.057  S[1]=   2.148  S[0]/S[1]=    1.89  eff_rank=64.2
+  W_v           rank= 512/512  S[0]=   1.297  S[1]=   1.219  S[0]/S[1]=    1.06  eff_rank=389.3
+  W_o           rank= 509/512  S[0]=  38.774  S[1]=   4.356  S[0]/S[1]=    8.90  eff_rank=7.6
+  mlp_gate      rank= 512/512  S[0]=   1.754  S[1]=   1.049  S[0]/S[1]=    1.67  eff_rank=190.3
+  mlp_down      rank= 512/512  S[0]=  34.321  S[1]=   2.567  S[0]/S[1]=   13.37  eff_rank=10.7
+

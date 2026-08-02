@@ -3649,6 +3649,80 @@ layer_done:
                         wf[i] += 0.001f * ((float)rand() / RAND_MAX * 2.0f - 1.0f);  /* noise */
                     }
                 }
+
+                /* v11: Orthogonal regularization on W_v
+                 * Loss += lambda * ||W_v^T @ W_v - I||^2_F
+                 * Gradient: dW_v = 4 * lambda * W_v @ (W_v^T @ W_v - I)
+                 *
+                 * Effect: pulls all singular values toward 1.
+                 *   - Caps S[0] (currently 30-72) down toward 1
+                 *   - Boosts S[1:] (currently 1-2.5) up toward 1
+                 *   - SVD: if W = U S V^T, then W^T W = V S^2 V^T
+                 *     Gradient W @ (W^T W - I) = U S V^T V (S^2 - I) V^T = U S (S^2-I) V^T
+                 *     So dW_v moves S[i] toward: S[i] - 4*lambda*S[i]*(S[i]^2-1)
+                 *     S[0]>1 → decrease, S[i]<1 → increase. Perfect!
+                 *
+                 * Compute: G = W_v^T @ W_v  (n x n, only n=512)
+                 *          G -= I
+                 *          dW_v = 4 * lambda * W_v @ G
+                 * Cost: 2 * n^2 * n = 2 * 512^3 ≈ 268M FLOPs per layer (negligible vs training) */
+                {
+                    float lambda_ortho = 0.02f;  /* orthogonal reg strength */
+                    /* Allocate G on stack: n x n = 512*512 = 262144 floats = 1MB */
+                    /* Use static to avoid stack overflow */
+                    static float *G = NULL;
+                    static int G_n = 0;
+                    if (G_n != n) {
+                        free(G);
+                        G = (float *)malloc((size_t)n * n * sizeof(float));
+                        G_n = n;
+                    }
+
+                    /* Step 1: G = W_v^T @ W_v  (W_v is rows 2n..3n of w_float, shape [n, in=n]) */
+                    /* G[i][j] = sum_k W_v[k][i] * W_v[k][j]  where W_v[k][i] = wf[(2n+k)*in + i] */
+                    for (int i = 0; i < n; i++) {
+                        for (int j = i; j < n; j++) {
+                            float dot = 0;
+                            for (int k = 0; k < n; k++) {
+                                float *wf_row = &bl->w_float[(size_t)(2*n + k) * in];
+                                dot += wf_row[i] * wf_row[j];
+                            }
+                            G[i * n + j] = dot;
+                            G[j * n + i] = dot;  /* symmetric */
+                        }
+                    }
+
+                    /* Step 2: G -= I */
+                    for (int i = 0; i < n; i++)
+                        G[i * n + i] -= 1.0f;
+
+                    /* Step 3: dW_v = 4 * lambda * W_v @ G, apply directly to w_float */
+                    /* W_v[k][i] -= 4 * lambda * sum_j W_v[k][j] * G[j][i] */
+                    float scale = 4.0f * lambda_ortho;
+                    for (int k = 0; k < n; k++) {
+                        float *wf_row = &bl->w_float[(size_t)(2*n + k) * in];
+                        for (int i = 0; i < n; i++) {
+                            float grad = 0;
+                            for (int j = 0; j < n; j++)
+                                grad += wf_row[j] * G[j * n + i];
+                            wf_row[i] -= scale * grad;
+                        }
+                    }
+
+                    /* Log orthogonal regularization stats every 50 steps */
+                    if (g_opt_step % 50 == 49) {
+                        /* Recompute Frobenius of (W^T W - I) for monitoring */
+                        float off_diag = 0, diag_dev = 0;
+                        for (int i = 0; i < n; i++) {
+                            diag_dev += G[i * n + i] * G[i * n + i];
+                            for (int j = 0; j < n; j++) {
+                                if (i != j) off_diag += G[i * n + j] * G[i * n + j];
+                            }
+                        }
+                        printf("    [ortho] step %d L%d W_v off_diag=%.2f diag_dev=%.4f\n",
+                               g_opt_step, l, off_diag, diag_dev);
+                    }
+                }
             }
             /* Weight clipping + repack: per-neuron based on logic_mask.
              * CORE (float): ±2.0 — needs room for precise differentiation.
