@@ -3119,7 +3119,7 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
     for (int i = 0; i < n; i++) x[i] += rs * g_attn_residual_scale * act->proj_out[i];
     /* BUG #48 FIX: normalize residual stream */
-    normalize_residual(x, n, 1.0f);
+    // normalize_residual(x, n, 1.0f);  // 方案M: 删除 attention 后归一化 (sliding window 版)
 
     /* Norm2 + MLP */
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
@@ -3606,7 +3606,7 @@ void model_batch_apply(Model *m, float lr, int batch_size) {
             }
 
 layer_done:
-            /* BUG #54 FIX 方案I: 定期 Xavier 重新初始化退化 W_v
+            /* BUG #54 FIX 方案I + v10: 定期检查 W_v effective rank + decay 0.999
              *
              * 根因: 正反馈循环让 W_v 退化为 rank-1
              * v8 step100 rank=300 (好), step200 rank=5 (退化)
@@ -3614,10 +3614,14 @@ layer_done:
              * 方案I: 每 50 步检查 W_v 的 effective rank,
              * 如果 rank 太低 (Frobenius/max_row 比值 < 5), 用 Xavier 重新初始化.
              *
+             * v10: decay 0.99→0.999 (0.999^200=0.819 vs 0.99^200=0.134)
+             *      数值 rank 从 5→509, 但 S[0] 仍主导 (eff_rank 5-8)
+             *      下一步需 orthogonal regularization 来 cap S[0]
+             *
              * 近似 rank: ||W||_F / ||W||_max_row
              * 满秩时 ≈ sqrt(out), rank-1 时 ≈ 1
              */
-            if (b == 0 && m->cfg.qkv_merged && (g_opt_step % 50 == 49)) {
+            if (b == 0 && m->cfg.qkv_merged) {
                 int n = m->cfg.n_embd;
                 int in = bl->in_dim;
                 /* 只检查 W_v 部分 (rows 2*n 到 3*n) */
@@ -3632,14 +3636,17 @@ layer_done:
                 float frob = sqrtf(frob_sq);
                 float max_row = sqrtf(max_row_sq);
                 float approx_rank = frob / (max_row + 1e-12f);
-                printf("    [plan-I] step %d W_v approx_rank=%.1f (frob=%.2f max_row=%.2f)\n",
-                       g_opt_step, approx_rank, frob, max_row);
+                if (g_opt_step % 50 == 49) {
+                    printf("    [plan-I] step %d W_v approx_rank=%.1f (frob=%.2f max_row=%.2f)\n",
+                           g_opt_step, approx_rank, frob, max_row);
+                }
 
-                /* v8: W_v weight decay 0.99 (best so far, rank=300 at step100) */
+                /* v10: W_v weight decay 0.999 + noise */
                 for (int j = 2*n; j < 3*n; j++) {
                     float *wf = &bl->w_float[(size_t)j * in];
                     for (int i = 0; i < in; i++) {
-                        wf[i] *= 0.99f;
+                        wf[i] *= 0.999f;  /* v10: gentle decay, 0.999^200=0.819 */
+                        wf[i] += 0.001f * ((float)rand() / RAND_MAX * 2.0f - 1.0f);  /* noise */
                     }
                 }
             }
