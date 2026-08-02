@@ -154,7 +154,7 @@ static float logic_guided_regularization(Model *m, float lr) {
                     /* OPTIMIZATION v3: 激活幅度惩罚 — 防止 CORE 对所有概念高激活但不区分
                      * 惩罚 |act_a| + |act_b| 过大, 强制 CORE 保持适度激活
                      * gamma=0.1 让幅度惩罚和差异化惩罚平衡 */
-                    float gamma = 0.1f;
+                    float gamma = 0.3f;
                     total_loss += gamma * (fabsf(act_a[j]) + fabsf(act_b[j]));
                     layer_nc++;
                 } else {
@@ -182,7 +182,7 @@ static float logic_guided_regularization(Model *m, float lr) {
                     /* OPTIMIZATION v3: 激活幅度惩罚梯度
                      * d/dw [gamma*(|act_a|+|act_b|)] = gamma * sign(act) * d_act/dw
                      * 对 gate_a: gamma*sign(act_a), 对 gate_b: gamma*sign(act_b) */
-                    float gamma = 0.1f;
+                    float gamma = 0.3f;
                     float mag_grad_a = gamma * (act_a[j] > 0 ? 1.0f : -1.0f);
                     float mag_grad_b = gamma * (act_b[j] > 0 ? 1.0f : -1.0f);
                     float grad_scale = (diff_grad + mag_grad_a) * inv_nc * layer_lr_scale * lr;
