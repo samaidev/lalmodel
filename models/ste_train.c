@@ -149,7 +149,13 @@ static float logic_guided_regularization(Model *m, float lr) {
                 float diff = act_a[j] - act_b[j];
                 float adiff = fabsf(diff);
                 if (mask[j] == 0) {
-                    total_loss -= alpha * tanhf(adiff * 0.5f);  /* OPTIMIZATION v2: tanh(adiff*0.5) 放宽饱和点 (v1: tanh(adiff)) */
+                    /* OPTIMIZATION v2: tanh(adiff*0.5) 放宽饱和点 */
+                    total_loss -= alpha * tanhf(adiff * 0.5f);
+                    /* OPTIMIZATION v3: 激活幅度惩罚 — 防止 CORE 对所有概念高激活但不区分
+                     * 惩罚 |act_a| + |act_b| 过大, 强制 CORE 保持适度激活
+                     * gamma=0.1 让幅度惩罚和差异化惩罚平衡 */
+                    float gamma = 0.1f;
+                    total_loss += gamma * (fabsf(act_a[j]) + fabsf(act_b[j]));
                     layer_nc++;
                 } else {
                     total_loss += beta * diff * diff;
@@ -172,11 +178,19 @@ static float logic_guided_regularization(Model *m, float lr) {
                      * The 0.5 factor and (1-tanh²) provide gentler saturation than v1. */
                     float s = diff > 0 ? 1.0f : -1.0f;
                     float tanh_adiff = tanhf(fabsf(diff) * 0.5f);
-                    float grad_scale = -alpha * 0.5f * s * (1.0f - tanh_adiff * tanh_adiff) * inv_nc * layer_lr_scale * lr;
+                    float diff_grad = -alpha * 0.5f * s * (1.0f - tanh_adiff * tanh_adiff);
+                    /* OPTIMIZATION v3: 激活幅度惩罚梯度
+                     * d/dw [gamma*(|act_a|+|act_b|)] = gamma * sign(act) * d_act/dw
+                     * 对 gate_a: gamma*sign(act_a), 对 gate_b: gamma*sign(act_b) */
+                    float gamma = 0.1f;
+                    float mag_grad_a = gamma * (act_a[j] > 0 ? 1.0f : -1.0f);
+                    float mag_grad_b = gamma * (act_b[j] > 0 ? 1.0f : -1.0f);
+                    float grad_scale = (diff_grad + mag_grad_a) * inv_nc * layer_lr_scale * lr;
+                    /* 对 gate_a 和 gate_b 分别应用 (diff_grad 对 a 用 +, 对 b 用 -) */
                     for (int i = 0; i < layer_in_dim; i++)
-                        ga[i] += grad_scale * (gate_a[i] - gate_b[i]);
+                        ga[i] += grad_scale * (gate_a[i] - gate_b[i]) + mag_grad_b * inv_nc * layer_lr_scale * lr * gate_b[i];
                     if (fc->bias_grad_accum)
-                        fc->bias_grad_accum[j] += grad_scale;
+                        fc->bias_grad_accum[j] += grad_scale + mag_grad_b * inv_nc * layer_lr_scale * lr;
                 } else {  /* BINARY */
                     float grad_scale = beta * 2.0f * diff * inv_nb * layer_lr_scale * lr;
                     for (int i = 0; i < layer_in_dim; i++)
