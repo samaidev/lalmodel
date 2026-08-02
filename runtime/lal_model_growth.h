@@ -85,7 +85,7 @@ static void growth_write_tensor(FILE *f, const char *key,
 /* Generate Xavier-initialized random weights for a given phase
  * vocab 参数:256=byte-level, 32768=BPE */
 static void gen_phase_weights(const char *path, GrowthPhase *phase, int vocab_size) {
-    int n = phase->n_embd, m = phase->mlp_dim, V = vocab_size, C = 512;
+    int n = phase->n_embd, m = phase->mlp_dim, V = vocab_size, C = 10240;  /* n_ctx=10240 for 10k context */
     FILE *f = fopen(path, "wb");
     if (!f) {
         fprintf(stderr, "gen_phase_weights: cannot write %s\n", path);
@@ -268,7 +268,7 @@ static ModelConfig growth_phase_config(GrowthPhase *phase, int vocab_size) {
         .n_layer = phase->n_layer,
         .n_embd = phase->n_embd,
         .n_head = phase->n_head,
-        .n_ctx = 512,
+        .n_ctx = 10240,                 /* 10k context window */
         .vocab_size = vocab_size,
         .mlp_dim = phase->mlp_dim,
         .norm_type = NORM_LAYER,
@@ -276,7 +276,7 @@ static ModelConfig growth_phase_config(GrowthPhase *phase, int vocab_size) {
         .act_type = ACT_GELU,
         .residual_scale = 1.0f,  /* Fixed: 0.5 caused signal vanishing in 8+ layer models */
         .qkv_merged = 1,
-        .sliding_window = 256,
+        .sliding_window = 9996,         /* 9996 + 4 sinks = 10000 effective context */
         .n_sinks = 4,
     };
 }

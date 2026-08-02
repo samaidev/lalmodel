@@ -712,17 +712,17 @@ void attention_forward(float *attn_out, const float *qkv,
     memcpy(k_cache_layer + (size_t)seq_pos * n_embd, K_new, n_embd * sizeof(float));
     memcpy(v_cache_layer + (size_t)seq_pos * n_embd, V_new, n_embd * sizeof(float));
 
-    /* Stack scratch — max n_ctx per head. 1024 is GPT-2 default; if n_ctx
-     * grows beyond this, switch to malloc. */
-    float scores[1024];
-    float attn_weights[1024];
+    /* Stack scratch — supports up to 10240 context (10k tokens).
+     * For larger contexts, switch to malloc. */
+    float scores[10240];
+    float attn_weights[10240];
 
     for (int h = 0; h < n_head; h++) {
         const float *Q_h = Q + h * head_dim;
         /* scores[j] = Q_h · K[j, h] * scale, j = 0..seq_pos (causal) */
         float max_score = -1e30f;
         int n_attend = seq_pos + 1;  /* positions 0..seq_pos inclusive */
-        if (n_attend > 1024) n_attend = 1024;  /* clip to scratch size */
+        if (n_attend > 10240) n_attend = 10240;  /* clip to scratch size */
         for (int j = 0; j < n_attend; j++) {
             const float *K_jh = k_cache_layer + (size_t)j * n_embd + h * head_dim;
             float dot = 0.0f;
@@ -772,7 +772,7 @@ void attention_backward(float *grad_qkv, const float *grad_attn_out,
     int head_dim = n_embd / n_head;
     float scale = 1.0f / sqrtf((float)head_dim);
     int n_attend = seq_pos + 1;  /* positions 0..seq_pos inclusive */
-    if (n_attend > 1024) n_attend = 1024;  /* clip to scratch size */
+    if (n_attend > 10240) n_attend = 10240;  /* clip to scratch size */
 
     const float *Q = qkv;
     float *gQ = grad_qkv;
@@ -784,7 +784,7 @@ void attention_backward(float *grad_qkv, const float *grad_attn_out,
      * there is no self-attention gradient to propagate. */
     int have_self = (seq_pos >= 0 && seq_pos < n_attend);
 
-    float scores[1024], w[1024], g_w[1024];
+    float scores[10240], w[10240], g_w[10240];
 
     for (int h = 0; h < n_head; h++) {
         const float *Q_h = Q + h * head_dim;
@@ -2916,16 +2916,16 @@ void attention_forward_sliding(float *attn_out, const float *qkv,
     if (n_attend > n_ctx) n_attend = n_ctx;
 
     /* Position index list */
-    int pos_idx[2048];
-    int *pos_list = (n_attend <= 2048) ? pos_idx : malloc(n_attend * sizeof(int));
+    int pos_idx[10240];
+    int *pos_list = (n_attend <= 10240) ? pos_idx : malloc(n_attend * sizeof(int));
     int idx = 0;
     for (int j = 0; j < n_sink && idx < n_attend; j++) pos_list[idx++] = j;
     for (int j = win_start; j <= seq_pos && idx < n_attend; j++) pos_list[idx++] = j;
 
     /* Scratch buffers */
-    float scores_stack[256];
-    float *scores = (n_attend <= 256) ? scores_stack : malloc(n_attend * sizeof(float));
-    float *attn_w = (n_attend <= 256) ? scores_stack : malloc(n_attend * sizeof(float));
+    float scores_stack[10240];
+    float *scores = (n_attend <= 10240) ? scores_stack : malloc(n_attend * sizeof(float));
+    float *attn_w = (n_attend <= 10240) ? scores_stack : malloc(n_attend * sizeof(float));
 
     for (int h = 0; h < n_head; h++) {
         const float *Q_h = Q + h * head_dim;
@@ -2993,8 +2993,8 @@ void attention_backward_sliding(float *grad_qkv, const float *grad_attn_out,
     memset(grad_qkv, 0, 3 * n_embd * sizeof(float));
 
     /* Build position index */
-    int pos_idx[2048];
-    int *pos_list = (n_attend <= 2048) ? pos_idx : malloc(n_attend * sizeof(int));
+    int pos_idx[10240];
+    int *pos_list = (n_attend <= 10240) ? pos_idx : malloc(n_attend * sizeof(int));
     int idx = 0;
     for (int j = 0; j < n_sink; j++) pos_list[idx++] = j;
     for (int j = win_start; j <= seq_pos; j++) pos_list[idx++] = j;
@@ -3006,12 +3006,12 @@ void attention_backward_sliding(float *grad_qkv, const float *grad_attn_out,
         if (pos_list[i] == seq_pos) { have_self = 1; self_idx = i; break; }
     }
 
-    float scores_stack[256];
-    float *scores = (n_attend <= 256) ? scores_stack : malloc(n_attend * sizeof(float));
-    float w_stack[256];
-    float *w = (n_attend <= 256) ? w_stack : malloc(n_attend * sizeof(float));
-    float gw_stack[256];
-    float *g_w = (n_attend <= 256) ? gw_stack : malloc(n_attend * sizeof(float));
+    float scores_stack[10240];
+    float *scores = (n_attend <= 10240) ? scores_stack : malloc(n_attend * sizeof(float));
+    float w_stack[10240];
+    float *w = (n_attend <= 10240) ? w_stack : malloc(n_attend * sizeof(float));
+    float gw_stack[10240];
+    float *g_w = (n_attend <= 10240) ? gw_stack : malloc(n_attend * sizeof(float));
 
     for (int h = 0; h < n_head; h++) {
         const float *Q_h = Q + h * head_dim;
