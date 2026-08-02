@@ -841,13 +841,6 @@ void attention_backward(float *grad_qkv, const float *grad_attn_out,
             for (int d = 0; d < head_dim; d++) gV_h[d] += w_cur * g_out_h[d];
         }
     }
-
-    static int diag_count = 0;
-        float nq = 0, nk = 0, nv = 0;
-        for (int i = 0; i < n_embd; i++) {
-        }
-               seq_pos, n_attend, sqrtf(nq), sqrtf(nk), sqrtf(nv), w[seq_pos]);
-    }
 }
 
 void model_kv_cache_alloc(Model *m) {
