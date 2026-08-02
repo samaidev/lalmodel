@@ -293,6 +293,9 @@ typedef struct {
     float *norm2_w, *norm2_b;  /* second norm weight/bias */
     float *grad_norm1_w, *grad_norm1_b;  /* norm1 weight/bias gradients */
     float *grad_norm2_w, *grad_norm2_b;  /* norm2 weight/bias gradients */
+    /* BUG #50 FIX: Adam state for LayerNorm weights (was SGD+clip, caused norm_w→0) */
+    float *m_norm1_w, *v_norm1_w, *m_norm1_b, *v_norm1_b;
+    float *m_norm2_w, *v_norm2_w, *m_norm2_b, *v_norm2_b;
     /* KV cache pointers (set by model_load when g_use_real_attention is on).
      * Each points to Model-owned [n_ctx * n_embd] float array.
      * NULL in legacy V-copy mode. */

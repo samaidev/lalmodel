@@ -3217,6 +3217,17 @@ void model_batch_alloc(Model *m) {
             tl->grad_norm2_w = calloc(m->cfg.n_embd, sizeof(float));
             tl->grad_norm2_b = calloc(m->cfg.n_embd, sizeof(float));
         }
+        /* BUG #50 FIX: Allocate Adam state for LayerNorm weights */
+        if (!tl->m_norm1_w) {
+            tl->m_norm1_w = calloc(m->cfg.n_embd, sizeof(float));
+            tl->v_norm1_w = calloc(m->cfg.n_embd, sizeof(float));
+            tl->m_norm1_b = calloc(m->cfg.n_embd, sizeof(float));
+            tl->v_norm1_b = calloc(m->cfg.n_embd, sizeof(float));
+            tl->m_norm2_w = calloc(m->cfg.n_embd, sizeof(float));
+            tl->v_norm2_w = calloc(m->cfg.n_embd, sizeof(float));
+            tl->m_norm2_b = calloc(m->cfg.n_embd, sizeof(float));
+            tl->v_norm2_b = calloc(m->cfg.n_embd, sizeof(float));
+        }
     }
 }
 
@@ -3669,22 +3680,48 @@ layer_done:
      * to produce identical final_ln. */
     for (int l = 0; l < m->cfg.n_layer; l++) {
         TransLayer *tl = &m->layers[l];
-        if (tl->grad_norm1_w) {
+        if (tl->grad_norm1_w && tl->m_norm1_w && g_use_adam) {
+            /* BUG #50 FIX: Use Adam for LayerNorm weights (was SGD+clip, caused norm_w→0) */
+            int t = g_opt_step + 1;
+            float bc1 = 1.0f - powf(g_adam_beta1, (float)t);
+            float bc2 = 1.0f - powf(g_adam_beta2, (float)t);
             for (int i = 0; i < n; i++) {
-                /* SGD with weight decay toward 1.0 (w) / 0.0 (b) + gradient clipping */
-                float g1w = tl->grad_norm1_w[i] * inv_batch + 0.01f * (tl->norm1_w[i] - 1.0f);
-                float g1b = tl->grad_norm1_b[i] * inv_batch + 0.01f * tl->norm1_b[i];
-                float g2w = tl->grad_norm2_w[i] * inv_batch + 0.01f * (tl->norm2_w[i] - 1.0f);
-                float g2b = tl->grad_norm2_b[i] * inv_batch + 0.01f * tl->norm2_b[i];
-                /* Clip gradients */
-                if (g1w > 0.1f) g1w = 0.1f; if (g1w < -0.1f) g1w = -0.1f;
-                if (g1b > 0.1f) g1b = 0.1f; if (g1b < -0.1f) g1b = -0.1f;
-                if (g2w > 0.1f) g2w = 0.1f; if (g2w < -0.1f) g2w = -0.1f;
-                if (g2b > 0.1f) g2b = 0.1f; if (g2b < -0.1f) g2b = -0.1f;
-                tl->norm1_w[i] -= lr * g1w;
-                tl->norm1_b[i] -= lr * g1b;
-                tl->norm2_w[i] -= lr * g2w;
-                tl->norm2_b[i] -= lr * g2b;
+                /* norm1_w */
+                float g1w = tl->grad_norm1_w[i] * inv_batch;
+                if (fabsf(g1w) > 1e-12f) {
+                    tl->m_norm1_w[i] = g_adam_beta1 * tl->m_norm1_w[i] + (1.0f - g_adam_beta1) * g1w;
+                    tl->v_norm1_w[i] = g_adam_beta2 * tl->v_norm1_w[i] + (1.0f - g_adam_beta2) * g1w * g1w;
+                    float mh = tl->m_norm1_w[i] / bc1;
+                    float vh = sqrtf(tl->v_norm1_w[i] / bc2) + g_adam_eps;
+                    tl->norm1_w[i] -= lr * mh / vh;
+                }
+                /* norm1_b */
+                float g1b = tl->grad_norm1_b[i] * inv_batch;
+                if (fabsf(g1b) > 1e-12f) {
+                    tl->m_norm1_b[i] = g_adam_beta1 * tl->m_norm1_b[i] + (1.0f - g_adam_beta1) * g1b;
+                    tl->v_norm1_b[i] = g_adam_beta2 * tl->v_norm1_b[i] + (1.0f - g_adam_beta2) * g1b * g1b;
+                    float mh = tl->m_norm1_b[i] / bc1;
+                    float vh = sqrtf(tl->v_norm1_b[i] / bc2) + g_adam_eps;
+                    tl->norm1_b[i] -= lr * mh / vh;
+                }
+                /* norm2_w */
+                float g2w = tl->grad_norm2_w[i] * inv_batch;
+                if (fabsf(g2w) > 1e-12f) {
+                    tl->m_norm2_w[i] = g_adam_beta1 * tl->m_norm2_w[i] + (1.0f - g_adam_beta1) * g2w;
+                    tl->v_norm2_w[i] = g_adam_beta2 * tl->v_norm2_w[i] + (1.0f - g_adam_beta2) * g2w * g2w;
+                    float mh = tl->m_norm2_w[i] / bc1;
+                    float vh = sqrtf(tl->v_norm2_w[i] / bc2) + g_adam_eps;
+                    tl->norm2_w[i] -= lr * mh / vh;
+                }
+                /* norm2_b */
+                float g2b = tl->grad_norm2_b[i] * inv_batch;
+                if (fabsf(g2b) > 1e-12f) {
+                    tl->m_norm2_b[i] = g_adam_beta1 * tl->m_norm2_b[i] + (1.0f - g_adam_beta1) * g2b;
+                    tl->v_norm2_b[i] = g_adam_beta2 * tl->v_norm2_b[i] + (1.0f - g_adam_beta2) * g2b * g2b;
+                    float mh = tl->m_norm2_b[i] / bc1;
+                    float vh = sqrtf(tl->v_norm2_b[i] / bc2) + g_adam_eps;
+                    tl->norm2_b[i] -= lr * mh / vh;
+                }
             }
         }
     }
