@@ -1198,6 +1198,99 @@ int main(int argc, char **argv) {
     /* 深度白箱诊断:解释生成质量 */
     deep_whitebox_diagnosis(&model);
 
+    /* === 逐层 hidden state 诊断: 定位 logits 坍缩根因 ===
+     * 比较两个不同 prompt ('火' vs '水') 在每层的 hidden state cosine similarity.
+     * 如果某层后 cosine→1.0, 说明该层抹掉了 prompt 信号. */
+    {
+        int n = model.cfg.n_embd;
+        int nL = model.cfg.n_layer;
+        int tok_fire = 32646;  /* 火 */
+        int tok_water = 31940;  /* 水 */
+
+        static float xa[4096], xb[4096];
+        static float la[16][4096], lb[16][4096];
+
+        /* prompt A: 火 */
+        for (int i = 0; i < n; i++) {
+            xa[i] = model.wte[tok_fire * n + i];
+            if (model.wpe) xa[i] += model.wpe[0 * n + i];
+        }
+        memcpy(la[0], xa, n * sizeof(float));
+        for (int l = 0; l < nL; l++) {
+            trans_layer_forward(xa, &model.layers[l], &model.acts[l], &model.cfg, 0);
+            memcpy(la[l+1], xa, n * sizeof(float));
+        }
+
+        /* prompt B: 水 */
+        for (int i = 0; i < n; i++) {
+            xb[i] = model.wte[tok_water * n + i];
+            if (model.wpe) xb[i] += model.wpe[0 * n + i];
+        }
+        memcpy(lb[0], xb, n * sizeof(float));
+        for (int l = 0; l < nL; l++) {
+            trans_layer_forward(xb, &model.layers[l], &model.acts[l], &model.cfg, 0);
+            memcpy(lb[l+1], xb, n * sizeof(float));
+        }
+
+        printf("\n========================================\n");
+        printf("  LAYER-BY-LAYER COLLAPSE DIAGNOSIS\n");
+        printf("  (火 vs 水 — cosine similarity per layer)\n");
+        printf("========================================\n\n");
+        printf("%-12s  %-12s  %-12s  %-12s\n", "Layer", "cosine_sim", "l2_dist", "||a||");
+        printf("%-12s  %-12s  %-12s  %-12s\n", "-----", "----------", "-------", "------");
+        for (int l = 0; l <= nL; l++) {
+            float dot = 0, na = 0, nb = 0;
+            for (int i = 0; i < n; i++) {
+                dot += la[l][i] * lb[l][i];
+                na += la[l][i] * la[l][i];
+                nb += lb[l][i] * lb[l][i];
+            }
+            float cs = dot / (sqrtf(na) * sqrtf(nb) + 1e-12f);
+            float l2 = 0;
+            for (int i = 0; i < n; i++) { float d = la[l][i]-lb[l][i]; l2 += d*d; }
+            l2 = sqrtf(l2);
+            char lname[16];
+            if (l == 0) snprintf(lname, sizeof lname, "emb");
+            else snprintf(lname, sizeof lname, "L%d", l-1);
+            printf("%-12s  %-12.6f  %-12.6f  %-12.6f\n", lname, cs, l2, sqrtf(na));
+        }
+
+        /* final LayerNorm 后 */
+        float fa[4096], fb[4096];
+        memcpy(fa, la[nL], n * sizeof(float));
+        memcpy(fb, lb[nL], n * sizeof(float));
+        norm_forward(fa, fa, model.ln_f_w, model.ln_f_b, model.cfg.norm_type, n);
+        norm_forward(fb, fb, model.ln_f_w, model.ln_f_b, model.cfg.norm_type, n);
+        float dot = 0, na = 0, nb = 0;
+        for (int i = 0; i < n; i++) {
+            dot += fa[i] * fb[i]; na += fa[i]*fa[i]; nb += fb[i]*fb[i];
+        }
+        printf("%-12s  %-12.6f  (final_ln output)\n", "final_ln",
+               dot / (sqrtf(na) * sqrtf(nb) + 1e-12f));
+        printf("\n  (1.0=identical, 0.0=orthogonal)\n\n");
+
+        /* 检查 L0 的关键权重 */
+        printf("--- L0 Weight Check ---\n");
+        TransLayer *tl0 = &model.layers[0];
+        printf("  L0 norm1_w[0:5]: ");
+        for (int i = 0; i < 5 && i < n; i++) printf("%.4f ", tl0->norm1_w[i]);
+        printf("\n");
+        printf("  L0 norm1_w mean: ");
+        float mw = 0;
+        for (int i = 0; i < n; i++) mw += tl0->norm1_w[i];
+        printf("%.4f\n", mw / n);
+        printf("  L0 norm1_b[0:5]: ");
+        for (int i = 0; i < 5 && i < n; i++) printf("%.4f ", tl0->norm1_b[i]);
+        printf("\n");
+        /* 检查 L0 attention 输出 */
+        printf("  L0 attn output (火) [0:5]: ");
+        for (int i = 0; i < 5 && i < n; i++) printf("%.4f ", la[1][i]);
+        printf("\n");
+        printf("  L0 attn output (水) [0:5]: ");
+        for (int i = 0; i < 5 && i < n; i++) printf("%.4f ", lb[1][i]);
+        printf("\n\n");
+    }
+
     /* 生成 */
     if (do_generate) {
         generate_text(&model, prompt, prompt_ids, n_prompt_ids, max_gen, temp, top_k);

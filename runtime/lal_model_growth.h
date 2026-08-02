@@ -45,11 +45,12 @@ typedef struct {
 /* Progressive growth schedule — start large enough for UTF-8 structure */
 static GrowthPhase growth_phases[] = {
     {8,  448, 1792, 7,  22, "Phase 0: Seed (8L/448d)"},
+    {6,  512, 2048, 8,  18, "Phase 0.5: 6L test (6L/512d)"},  /* 6层测试: 验证 prompt 信号是否保留 */
     {10, 512, 2048, 8,  35, "Phase 1: Sprout (10L/512d)"},
     {12, 576, 2304, 8,  50, "Phase 2: Mature (12L/576d)"},
     {14, 640, 2560, 10, 68, "Phase 3: Bloom (14L/640d)"},
 };
-#define N_GROWTH_PHASES 4
+#define N_GROWTH_PHASES 5
 
 /* ========================================================================
  * Generate weights for a specific growth phase
