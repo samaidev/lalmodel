@@ -261,7 +261,7 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
     for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
     /* BUG #48 FIX: normalize residual stream to prevent ||x|| explosion */
-    normalize_residual(x, n, 1.0f);
+    // normalize_residual(x, n, 1.0f);  // 方案M: 删除 attention 后归一化
 
     /* MLP */
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
@@ -353,7 +353,7 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
     bin_forward_pure_float(act->proj_out, act->attn_out, &tl->attn_o);
     for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
     /* BUG #48 FIX: normalize residual stream */
-    normalize_residual(x, n, 1.0f);
+    // normalize_residual(x, n, 1.0f);  // 方案M: 删除 attention 后归一化
 
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
     norm_forward(act->norm2_out, x, tl->norm2_w, tl->norm2_b, cfg->norm_type, n);
@@ -3612,20 +3612,26 @@ void model_batch_apply(Model *m, float lr, int batch_size) {
             }
 
 layer_done:
-            /* BUG #54 FIX: W_v weight decay 防止 rank-1 退化
+            /* BUG #54 FIX v8: 给所有 attention 权重加 weight decay 0.95
              * 根因: dV = w[cur] * g_out, 训练初期 w[cur]≈1/n (均匀),
              * dV 方向对所有样本相似 → W_v 梯度 = dV * norm1_out^T 是 rank-1 外积
              * → 100步后 W_v 被推向 rank-1
-             * 修复: 给 attn_q 的 V 部分 (rows 2*n 到 3*n) 加 weight decay ×0.99
-             * 保持 W_v 接近初始满秩状态 */
-            if (b == 0 && m->cfg.qkv_merged) {  /* b==0 is attn_q, QKV merged */
-                int n = m->cfg.n_embd;
+             *
+             * v7: 只给 W_v decay 0.99, rank 40→155 (不够)
+             * v8: 给所有 attention 层 (Q/K/V/O) decay 0.95, 更强地保持满秩
+             * 同时解决 W_q 不学习问题 (dQ 太小, decay 让 W_q 不退化) */
+            /* BUG #54 FIX v9: decay 0.99 + 噪声打破 rank-1
+             * v7 (decay 0.99): rank=155 (最好)
+             * v8 (decay 0.95): rank=73 (更差, decay 太强)
+             * v9: 回到 0.99 + 加 ±0.001 噪声打破 rank-1 结构 */
+            if (b < 2 && m->cfg.qkv_merged) {
                 int in = bl->in_dim;
-                /* V 部分: rows 2*n 到 3*n, 每行 in 个元素 */
-                for (int j = 2*n; j < 3*n; j++) {
+                int out_dim = bl->out_dim;
+                for (int j = 0; j < out_dim; j++) {
                     float *wf = &bl->w_float[(size_t)j * in];
                     for (int i = 0; i < in; i++) {
-                        wf[i] *= 0.99f;  /* weight decay */
+                        wf[i] *= 0.99f;  /* gentle decay */
+                        wf[i] += 0.001f * ((float)rand() / RAND_MAX * 2.0f - 1.0f);  /* noise */
                     }
                 }
             }
