@@ -3723,6 +3723,57 @@ layer_done:
                                g_opt_step, l, off_diag, diag_dev);
                     }
                 }
+
+                /* v11b: Orthogonal regularization on W_o (attn_o)
+                 * 和 W_v 同样的正则化, 防止 W_o rank-1 退化
+                 * W_o 是 b==1, 独立的 n×n 矩阵 (不是 QKV merged) */
+                if (b == 1) {
+                    float lambda_ortho = 0.02f;
+                    static float *Go = NULL;
+                    static int Go_n = 0;
+                    if (Go_n != n) {
+                        free(Go);
+                        Go = (float *)malloc((size_t)n * n * sizeof(float));
+                        Go_n = n;
+                    }
+                    int in_o = bl->in_dim;
+                    /* G = W_o^T @ W_o  (W_o shape [n, in=n]) */
+                    for (int i = 0; i < n; i++) {
+                        for (int j = i; j < n; j++) {
+                            float dot = 0;
+                            for (int k = 0; k < n; k++) {
+                                float *wf_row = &bl->w_float[(size_t)k * in_o];
+                                dot += wf_row[i] * wf_row[j];
+                            }
+                            Go[i * n + j] = dot;
+                            Go[j * n + i] = dot;
+                        }
+                    }
+                    /* G -= I */
+                    for (int i = 0; i < n; i++) Go[i * n + i] -= 1.0f;
+                    /* dW_o = 4 * lambda * W_o @ G */
+                    float scale_o = 4.0f * lambda_ortho;
+                    for (int k = 0; k < n; k++) {
+                        float *wf_row = &bl->w_float[(size_t)k * in_o];
+                        for (int i = 0; i < n; i++) {
+                            float grad = 0;
+                            for (int j = 0; j < n; j++)
+                                grad += wf_row[j] * Go[j * n + i];
+                            wf_row[i] -= scale_o * grad;
+                        }
+                    }
+                    if (g_opt_step % 50 == 49) {
+                        float off_diag = 0, diag_dev = 0;
+                        for (int i = 0; i < n; i++) {
+                            diag_dev += Go[i * n + i] * Go[i * n + i];
+                            for (int j = 0; j < n; j++) {
+                                if (i != j) off_diag += Go[i * n + j] * Go[i * n + j];
+                            }
+                        }
+                        printf("    [ortho] step %d L%d W_o off_diag=%.2f diag_dev=%.4f\n",
+                               g_opt_step, l, off_diag, diag_dev);
+                    }
+                }
             }
             /* Weight clipping + repack: per-neuron based on logic_mask.
              * CORE (float): ±2.0 — needs room for precise differentiation.
