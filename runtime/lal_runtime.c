@@ -3612,6 +3612,23 @@ void model_batch_apply(Model *m, float lr, int batch_size) {
             }
 
 layer_done:
+            /* BUG #54 FIX: W_v weight decay 防止 rank-1 退化
+             * 根因: dV = w[cur] * g_out, 训练初期 w[cur]≈1/n (均匀),
+             * dV 方向对所有样本相似 → W_v 梯度 = dV * norm1_out^T 是 rank-1 外积
+             * → 100步后 W_v 被推向 rank-1
+             * 修复: 给 attn_q 的 V 部分 (rows 2*n 到 3*n) 加 weight decay ×0.99
+             * 保持 W_v 接近初始满秩状态 */
+            if (b == 0 && m->cfg.qkv_merged) {  /* b==0 is attn_q, QKV merged */
+                int n = m->cfg.n_embd;
+                int in = bl->in_dim;
+                /* V 部分: rows 2*n 到 3*n, 每行 in 个元素 */
+                for (int j = 2*n; j < 3*n; j++) {
+                    float *wf = &bl->w_float[(size_t)j * in];
+                    for (int i = 0; i < in; i++) {
+                        wf[i] *= 0.99f;  /* weight decay */
+                    }
+                }
+            }
             /* Weight clipping + repack: per-neuron based on logic_mask.
              * CORE (float): ±2.0 — needs room for precise differentiation.
              * BINARY (sign): ±1.0 — must stay near ±1 for sign function.
