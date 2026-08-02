@@ -1282,13 +1282,75 @@ int main(int argc, char **argv) {
         printf("  L0 norm1_b[0:5]: ");
         for (int i = 0; i < 5 && i < n; i++) printf("%.4f ", tl0->norm1_b[i]);
         printf("\n");
-        /* 检查 L0 attention 输出 */
-        printf("  L0 attn output (火) [0:5]: ");
-        for (int i = 0; i < 5 && i < n; i++) printf("%.4f ", la[1][i]);
+
+        /* 深度诊断: norm1_out 和 V 的对比 */
+        printf("\n--- L0 Deep Diagnosis (norm1_out + V) ---\n");
+        /* 重新前向 L0, 捕获中间结果 */
+        static float xa2[4096], xb2[4096];
+        static float norm1_a[4096], norm1_b[4096];
+        static float q_a[4096], q_b[4096];  /* QKV merged: [Q|K|V] */
+        static float v_a[4096], v_b[4096];
+        static float attn_out_a[4096], attn_out_b[4096];
+        static float proj_out_a[4096], proj_out_b[4096];
+
+        /* prompt A: 火 */
+        for (int i = 0; i < n; i++) {
+            xa2[i] = model.wte[tok_fire * n + i];
+            if (model.wpe) xa2[i] += model.wpe[0 * n + i];
+        }
+        norm_forward(norm1_a, xa2, tl0->norm1_w, tl0->norm1_b, model.cfg.norm_type, n);
+        bin_forward_pure_float(q_a, norm1_a, &tl0->attn_q);  /* QKV merged */
+        /* V is at offset 2*n */
+        memcpy(v_a, q_a + 2*n, n * sizeof(float));
+
+        /* prompt B: 水 */
+        for (int i = 0; i < n; i++) {
+            xb2[i] = model.wte[tok_water * n + i];
+            if (model.wpe) xb2[i] += model.wpe[0 * n + i];
+        }
+        norm_forward(norm1_b, xb2, tl0->norm1_w, tl0->norm1_b, model.cfg.norm_type, n);
+        bin_forward_pure_float(q_b, norm1_b, &tl0->attn_q);
+        memcpy(v_b, q_b + 2*n, n * sizeof(float));
+
+        /* cosine sim at each stage */
+        float cs_norm1 = 0, cs_v = 0, cs_emb = 0;
+        float na1=0, nb1=0, na2_=0, nb2_=0, na3=0, nb3=0;
+        for (int i = 0; i < n; i++) {
+            cs_emb += xa2[i]*xb2[i]; na3 += xa2[i]*xa2[i]; nb3 += xb2[i]*xb2[i];
+            cs_norm1 += norm1_a[i]*norm1_b[i]; na1 += norm1_a[i]*norm1_a[i]; nb1 += norm1_b[i]*norm1_b[i];
+            cs_v += v_a[i]*v_b[i]; na2_ += v_a[i]*v_a[i]; nb2_ += v_b[i]*v_b[i];
+        }
+        cs_emb /= (sqrtf(na3)*sqrtf(nb3)+1e-12f);
+        cs_norm1 /= (sqrtf(na1)*sqrtf(nb1)+1e-12f);
+        cs_v /= (sqrtf(na2_)*sqrtf(nb2_)+1e-12f);
+
+        printf("  embedding (火vs水) cosine: %.6f  ||火||=%.4f ||水||=%.4f\n", cs_emb, sqrtf(na3), sqrtf(nb3));
+        printf("  norm1_out   (火vs水) cosine: %.6f  ||火||=%.4f ||水||=%.4f\n", cs_norm1, sqrtf(na1), sqrtf(nb1));
+        printf("  V=attn_v    (火vs水) cosine: %.6f  ||火||=%.4f ||水||=%.4f\n", cs_v, sqrtf(na2_), sqrtf(nb2_));
+
+        /* 打印前5维对比 */
+        printf("\n  norm1_out 火 [0:5]: ");
+        for (int i = 0; i < 5; i++) printf("%.4f ", norm1_a[i]);
+        printf("\n  norm1_out 水 [0:5]: ");
+        for (int i = 0; i < 5; i++) printf("%.4f ", norm1_b[i]);
+        printf("\n  V 火        [0:5]: ");
+        for (int i = 0; i < 5; i++) printf("%.4f ", v_a[i]);
+        printf("\n  V 水        [0:5]: ");
+        for (int i = 0; i < 5; i++) printf("%.4f ", v_b[i]);
         printf("\n");
-        printf("  L0 attn output (水) [0:5]: ");
-        for (int i = 0; i < 5 && i < n; i++) printf("%.4f ", lb[1][i]);
-        printf("\n\n");
+
+        /* attn_v 权重统计 */
+        float wv_mean = 0, wv_max = 0, wv_min = 1e10;
+        int wv_n = tl0->attn_q.out_dim * tl0->attn_q.in_dim;
+        for (int i = 0; i < wv_n; i++) {
+            float w = tl0->attn_q.w_float[i];
+            wv_mean += w;
+            if (w > wv_max) wv_max = w;
+            if (w < wv_min) wv_min = w;
+        }
+        printf("\n  attn_q (QKV merged) weights: mean=%.6f min=%.6f max=%.6f n=%d\n",
+               wv_mean/wv_n, wv_min, wv_max, wv_n);
+        printf("  (如果 V 火vs水 cosine 高, 但 norm1_out cosine 低, 说明 W_v 把不同输入映射到相似输出)\n\n");
     }
 
     /* 生成 */

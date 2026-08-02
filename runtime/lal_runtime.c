@@ -841,6 +841,13 @@ void attention_backward(float *grad_qkv, const float *grad_attn_out,
             for (int d = 0; d < head_dim; d++) gV_h[d] += w_cur * g_out_h[d];
         }
     }
+
+    static int diag_count = 0;
+        float nq = 0, nk = 0, nv = 0;
+        for (int i = 0; i < n_embd; i++) {
+        }
+               seq_pos, n_attend, sqrtf(nq), sqrtf(nk), sqrtf(nv), w[seq_pos]);
+    }
 }
 
 void model_kv_cache_alloc(Model *m) {
@@ -929,33 +936,41 @@ void model_load(Model *m, const char *weight_path, ModelConfig cfg,
                 bin_layer_init(bl, W, b, in, out); \
             } \
         } while(0)
+        /* BUG #54 FIX: Attention 层不做 logic binarization!
+         * 根因: QKV merged 模式下, Q/K 的梯度淹没 V 的梯度, 导致 W_v 退化为 rank-1.
+         * (SVD: 最大奇异值 4.548 vs 第二大 1.116, effective rank 276/530)
+         * 修复: attention 的 Q/K/V/O 用普通 bin_layer_init (无 CORE/BINARY/PRUNE),
+         * 只有 MLP 层用 logic binarization. 这样 W_v 能正常学习. */
+        #define BIN_INIT_NO_LOGIC(bl, W, b, in, out) do { \
+            bin_layer_init(bl, W, b, in, out); \
+        } while(0)
 
         if (qkv_merged) {
             sprintf(key, "h.%d.attn.c_attn.weight", l);
             char bk[256]; strncpy(bk, key, sizeof(bk));
             char *dot = strstr(bk, ".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            BIN_INIT(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
+            BIN_INIT_NO_LOGIC(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
                      tensor_get(m->tensors, m->n_tensors, bk), n, 3*n);
         } else {
             sprintf(key, "model.layers.%d.self_attn.q_proj.weight", l);
             char bk[256]; strncpy(bk, key, sizeof(bk));
             char *dot = strstr(bk, ".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            BIN_INIT(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
+            BIN_INIT_NO_LOGIC(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
                      tensor_get(m->tensors, m->n_tensors, bk), n, n);
             sprintf(key, "model.layers.%d.self_attn.k_proj.weight", l);
             strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            BIN_INIT(&tl->attn_k, tensor_get(m->tensors, m->n_tensors, key),
+            BIN_INIT_NO_LOGIC(&tl->attn_k, tensor_get(m->tensors, m->n_tensors, key),
                      tensor_get(m->tensors, m->n_tensors, bk), n, n);
             sprintf(key, "model.layers.%d.self_attn.v_proj.weight", l);
             strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            BIN_INIT(&tl->attn_v, tensor_get(m->tensors, m->n_tensors, key),
+            BIN_INIT_NO_LOGIC(&tl->attn_v, tensor_get(m->tensors, m->n_tensors, key),
                      tensor_get(m->tensors, m->n_tensors, bk), n, n);
         }
 
         sprintf(key, qkv_merged ? "h.%d.attn.c_proj.weight" : "model.layers.%d.self_attn.o_proj.weight", l);
         char bk[256]; strncpy(bk, key, sizeof(bk));
         char *dot = strstr(bk, ".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-        BIN_INIT(&tl->attn_o, tensor_get(m->tensors, m->n_tensors, key),
+        BIN_INIT_NO_LOGIC(&tl->attn_o, tensor_get(m->tensors, m->n_tensors, key),
                  tensor_get(m->tensors, m->n_tensors, bk), n, n);
 
         if (cfg.act_type == ACT_SWIGLU) {
