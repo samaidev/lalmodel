@@ -3767,15 +3767,15 @@ layer_done:
             float bc1 = 1.0f - powf(g_adam_beta1, (float)t);
             float bc2 = 1.0f - powf(g_adam_beta2, (float)t);
             for (int i = 0; i < n; i++) {
-                /* norm1_w */
-                float g1w = tl->grad_norm1_w[i] * inv_batch;
-                if (fabsf(g1w) > 1e-12f) {
-                    tl->m_norm1_w[i] = g_adam_beta1 * tl->m_norm1_w[i] + (1.0f - g_adam_beta1) * g1w;
-                    tl->v_norm1_w[i] = g_adam_beta2 * tl->v_norm1_w[i] + (1.0f - g_adam_beta2) * g1w * g1w;
-                    float mh = tl->m_norm1_w[i] / bc1;
-                    float vh = sqrtf(tl->v_norm1_w[i] / bc2) + g_adam_eps;
-                    tl->norm1_w[i] -= lr * mh / vh;
-                }
+                /* norm1_w — BUG #50b: 完全冻结, 固定为 1.0
+                 * 之前 decay toward 1.0 无效 (梯度太大)
+                 * 现在直接不更新 norm1_w */
+                /* 跳过 norm1_w 更新 */
+                float g1w_unused = tl->grad_norm1_w[i];  /* 读取但不使用 */
+                (void)g1w_unused;
+                /* 强制 norm1_w = 1.0 */
+                tl->norm1_w[i] = 1.0f;
+
                 /* norm1_b */
                 float g1b = tl->grad_norm1_b[i] * inv_batch;
                 if (fabsf(g1b) > 1e-12f) {
@@ -3785,15 +3785,9 @@ layer_done:
                     float vh = sqrtf(tl->v_norm1_b[i] / bc2) + g_adam_eps;
                     tl->norm1_b[i] -= lr * mh / vh;
                 }
-                /* norm2_w */
-                float g2w = tl->grad_norm2_w[i] * inv_batch;
-                if (fabsf(g2w) > 1e-12f) {
-                    tl->m_norm2_w[i] = g_adam_beta1 * tl->m_norm2_w[i] + (1.0f - g_adam_beta1) * g2w;
-                    tl->v_norm2_w[i] = g_adam_beta2 * tl->v_norm2_w[i] + (1.0f - g_adam_beta2) * g2w * g2w;
-                    float mh = tl->m_norm2_w[i] / bc1;
-                    float vh = sqrtf(tl->v_norm2_w[i] / bc2) + g_adam_eps;
-                    tl->norm2_w[i] -= lr * mh / vh;
-                }
+                /* norm2_w — BUG #50b: 完全冻结, 固定为 1.0 */
+                tl->norm2_w[i] = 1.0f;
+
                 /* norm2_b */
                 float g2b = tl->grad_norm2_b[i] * inv_batch;
                 if (fabsf(g2b) > 1e-12f) {
