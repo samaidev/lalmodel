@@ -3323,13 +3323,20 @@ void model_batch_backward(Model *m, const int *tokens, int n_tokens) {
     }
 
     /* === Accumulate gradient for position embedding (wpe) ===
-     * Same logic: only position t (last position) gets gradient. */
+     * BUG #51 FIX: Old code only updated pos = n_tokens-1 (last position),
+     * so wpe[0] was never trained → stayed at random init → added random noise
+     * to every prompt during generation, drowning out the prompt signal.
+     * Fix: accumulate gradient to ALL context positions (0..n_tokens-1),
+     * distributed equally via gh/n_tokens. */
     if (m->grad_wpe_accum) {
-        int pos = n_tokens - 1;
-        if (pos >= 0 && pos < m->cfg.n_ctx) {
-            float *gw = &m->grad_wpe_accum[(size_t)pos * n];
-            for (int i = 0; i < n; i++)
-                gw[i] += gh[i];
+        int n_pos = n_tokens;
+        if (n_pos > 0 && n_pos <= m->cfg.n_ctx) {
+            float inv_npos = 1.0f / (float)n_pos;
+            for (int pos = 0; pos < n_pos; pos++) {
+                float *gw = &m->grad_wpe_accum[(size_t)pos * n];
+                for (int i = 0; i < n; i++)
+                    gw[i] += gh[i] * inv_npos;
+            }
         }
     }
 
@@ -3634,14 +3641,27 @@ layer_done:
             float *gw = &m->grad_wte_accum[(size_t)v * n];
             float *ma = &m->m_wte[(size_t)v * n];
             float *va = &m->v_wte[(size_t)v * n];
+            /* BUG #52 FIX: Track if this token had any gradient this step.
+             * Tokens not in training data keep random init → high logit → sampled → garbage.
+             * Apply weight decay (×0.999) to unused tokens to shrink their norm. */
+            int has_grad = 0;
             for (int i = 0; i < n; i++) {
                 float g = gw[i] * inv_batch;
-                if (fabsf(g) < 1e-12f) continue;  /* skip unused tokens */
-                ma[i] = g_adam_beta1 * ma[i] + (1.0f - g_adam_beta1) * g;
-                va[i] = g_adam_beta2 * va[i] + (1.0f - g_adam_beta2) * g * g;
-                float mh = ma[i] / bc1;
-                float vh = sqrtf(va[i] / bc2) + g_adam_eps;
-                w[i] -= lr * mh / vh;
+                if (fabsf(g) >= 1e-12f) {
+                    has_grad = 1;
+                    ma[i] = g_adam_beta1 * ma[i] + (1.0f - g_adam_beta1) * g;
+                    va[i] = g_adam_beta2 * va[i] + (1.0f - g_adam_beta2) * g * g;
+                    float mh = ma[i] / bc1;
+                    float vh = sqrtf(va[i] / bc2) + g_adam_eps;
+                    w[i] -= lr * mh / vh;
+                }
+            }
+            /* BUG #52: Weight decay for tokens with no gradient (unused in training data) */
+            if (!has_grad) {
+                float decay = 0.999f;
+                for (int i = 0; i < n; i++) {
+                    w[i] *= decay;
+                }
             }
         }
     }
