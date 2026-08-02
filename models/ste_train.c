@@ -45,7 +45,8 @@ static float logic_guided_regularization(Model *m, float lr) {
     int n_embd = m->cfg.n_embd;
     int n_layer = m->cfg.n_layer;
     int mlp_dim = m->cfg.mlp_dim;
-    float alpha = 2.0f;   /* CORE 差异化权重 */
+    /* OPTIMIZATION v2: 调试 Agent 建议提高 alpha (2.0→4.0) 增强 CORE 差异化动力 */
+    float alpha = 4.0f;   /* CORE 差异化权重 (v1: 2.0, v2: 4.0) */
     float beta = 0.2f;    /* BINARY 收敛权重 */
     float total_loss = 0.0f;
     int n_guided_layers = 0;
@@ -148,7 +149,7 @@ static float logic_guided_regularization(Model *m, float lr) {
                 float diff = act_a[j] - act_b[j];
                 float adiff = fabsf(diff);
                 if (mask[j] == 0) {
-                    total_loss -= alpha * tanhf(adiff);  /* BUG #49: 饱和而非线性 */
+                    total_loss -= alpha * tanhf(adiff * 0.5f);  /* OPTIMIZATION v2: tanh(adiff*0.5) 放宽饱和点 (v1: tanh(adiff)) */
                     layer_nc++;
                 } else {
                     total_loss += beta * diff * diff;
@@ -166,13 +167,12 @@ static float logic_guided_regularization(Model *m, float lr) {
                 float *ga = &fc->grad_accum[(size_t)j * layer_in_dim];
 
                 if (mask[j] == 0) {  /* CORE */
-                    /* BUG #49: gradient of -alpha*tanh(|diff|):
-                     * d/dw [-alpha*tanh(|diff|)] = -alpha * sign(diff) * (1-tanh²(|diff|))
-                     * The (1-tanh²) factor saturates when |diff| is large,
-                     * preventing the model from endlessly increasing activation. */
+                    /* OPTIMIZATION v2: gradient of -alpha*tanh(|diff|*0.5):
+                     * d/dw [-alpha*tanh(|diff|*0.5)] = -alpha*0.5 * sign(diff) * (1-tanh²(|diff|*0.5))
+                     * The 0.5 factor and (1-tanh²) provide gentler saturation than v1. */
                     float s = diff > 0 ? 1.0f : -1.0f;
-                    float tanh_adiff = tanhf(fabsf(diff));
-                    float grad_scale = -alpha * s * (1.0f - tanh_adiff * tanh_adiff) * inv_nc * layer_lr_scale * lr;
+                    float tanh_adiff = tanhf(fabsf(diff) * 0.5f);
+                    float grad_scale = -alpha * 0.5f * s * (1.0f - tanh_adiff * tanh_adiff) * inv_nc * layer_lr_scale * lr;
                     for (int i = 0; i < layer_in_dim; i++)
                         ga[i] += grad_scale * (gate_a[i] - gate_b[i]);
                     if (fc->bias_grad_accum)

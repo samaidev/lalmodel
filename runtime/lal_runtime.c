@@ -3641,9 +3641,10 @@ layer_done:
             float *gw = &m->grad_wte_accum[(size_t)v * n];
             float *ma = &m->m_wte[(size_t)v * n];
             float *va = &m->v_wte[(size_t)v * n];
-            /* BUG #52 FIX: Track if this token had any gradient this step.
+            /* BUG #52 FIX (v2 - gentler): Track if this token had any gradient this step.
              * Tokens not in training data keep random init → high logit → sampled → garbage.
-             * Apply weight decay (×0.999) to unused tokens to shrink their norm. */
+             * Apply MILD weight decay (×0.9999) only to unused tokens with large norm.
+             * Previous v1 (×0.999) was too strong, shrunk all wte → CORE diff collapsed. */
             int has_grad = 0;
             for (int i = 0; i < n; i++) {
                 float g = gw[i] * inv_batch;
@@ -3656,11 +3657,18 @@ layer_done:
                     w[i] -= lr * mh / vh;
                 }
             }
-            /* BUG #52: Weight decay for tokens with no gradient (unused in training data) */
+            /* BUG #52 v2: Only decay unused tokens with large norm (threshold-based) */
             if (!has_grad) {
-                float decay = 0.999f;
-                for (int i = 0; i < n; i++) {
-                    w[i] *= decay;
+                /* Compute norm, only decay if above average to avoid shrinking all embeddings */
+                float norm_sq = 0.0f;
+                for (int i = 0; i < n; i++) norm_sq += w[i] * w[i];
+                float norm = sqrtf(norm_sq);
+                /* Only decay if norm > 0.5 (above typical init scale 1/sqrt(n)≈0.042) */
+                if (norm > 0.5f) {
+                    float decay = 0.9999f;  /* Much gentler than v1's 0.999 */
+                    for (int i = 0; i < n; i++) {
+                        w[i] *= decay;
+                    }
                 }
             }
         }
