@@ -1145,6 +1145,14 @@ int main(int argc, char **argv) {
     g_use_ste = 1;         /* STE 反向:梯度通过 w_float 回传 */
     g_use_real_attention = 1;
     g_use_logic_binarization = 1;
+    /* Ablation: MLP-only test (set attn scale to 0 via env var) */
+    {
+        const char *attn_scale = getenv("LAL_ATTN_SCALE");
+        if (attn_scale) {
+            g_attn_residual_scale = atof(attn_scale);
+            printf("[*] Ablation: g_attn_residual_scale = %.2f\n", g_attn_residual_scale);
+        }
+    }
 
     /* Logic mask: 按阶段递进 CORE 比例 */
     int lp = phase_idx < N_LOGIC_PHASES ? phase_idx : N_LOGIC_PHASES - 1;

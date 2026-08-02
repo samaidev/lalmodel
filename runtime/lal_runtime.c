@@ -259,7 +259,7 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
         memcpy(act->attn_out, act->v, n * sizeof(float));
     }
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
-    for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
+    for (int i = 0; i < n; i++) x[i] += rs * g_attn_residual_scale * act->proj_out[i];
     /* BUG #48 FIX: normalize residual stream to prevent ||x|| explosion */
     // normalize_residual(x, n, 1.0f);  // 方案M: 删除 attention 后归一化
 
@@ -351,7 +351,7 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
         memcpy(act->attn_out, act->v, n * sizeof(float));
 
     bin_forward_pure_float(act->proj_out, act->attn_out, &tl->attn_o);
-    for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
+    for (int i = 0; i < n; i++) x[i] += rs * g_attn_residual_scale * act->proj_out[i];
     /* BUG #48 FIX: normalize residual stream */
     // normalize_residual(x, n, 1.0f);  // 方案M: 删除 attention 后归一化
 
@@ -394,6 +394,7 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
 
 /* Global flag: use STE backward (updates w_float + repacks wbits) */
 int g_use_ste = 1;  /* LAL default: STE mode (train=infer, learn binary logic directly) */
+float g_attn_residual_scale = 1.0f;  /* Ablation: set to 0 for MLP-only test */
 int g_use_cuda = 0;            /* 1 = dispatch matmul to CUDA backend */
 int g_use_logic_binarization = 1;  /* LAL default: logic-guided layers (CORE/BINARY/PRUNE semantic structure) */
 
@@ -3116,7 +3117,7 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
 
     /* Output projection */
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
-    for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
+    for (int i = 0; i < n; i++) x[i] += rs * g_attn_residual_scale * act->proj_out[i];
     /* BUG #48 FIX: normalize residual stream */
     normalize_residual(x, n, 1.0f);
 
@@ -3605,26 +3606,40 @@ void model_batch_apply(Model *m, float lr, int batch_size) {
             }
 
 layer_done:
-            /* BUG #54 FIX v8: 给所有 attention 权重加 weight decay 0.95
-             * 根因: dV = w[cur] * g_out, 训练初期 w[cur]≈1/n (均匀),
-             * dV 方向对所有样本相似 → W_v 梯度 = dV * norm1_out^T 是 rank-1 外积
-             * → 100步后 W_v 被推向 rank-1
+            /* BUG #54 FIX 方案I: 定期 Xavier 重新初始化退化 W_v
              *
-             * v7: 只给 W_v decay 0.99, rank 40→155 (不够)
-             * v8: 给所有 attention 层 (Q/K/V/O) decay 0.95, 更强地保持满秩
-             * 同时解决 W_q 不学习问题 (dQ 太小, decay 让 W_q 不退化) */
-            /* BUG #54 FIX v9: decay 0.99 + 噪声打破 rank-1
-             * v7 (decay 0.99): rank=155 (最好)
-             * v8 (decay 0.95): rank=73 (更差, decay 太强)
-             * v9: 回到 0.99 + 加 ±0.001 噪声打破 rank-1 结构 */
-            if (b < 2 && m->cfg.qkv_merged) {
+             * 根因: 正反馈循环让 W_v 退化为 rank-1
+             * v8 step100 rank=300 (好), step200 rank=5 (退化)
+             *
+             * 方案I: 每 50 步检查 W_v 的 effective rank,
+             * 如果 rank 太低 (Frobenius/max_row 比值 < 5), 用 Xavier 重新初始化.
+             *
+             * 近似 rank: ||W||_F / ||W||_max_row
+             * 满秩时 ≈ sqrt(out), rank-1 时 ≈ 1
+             */
+            if (b == 0 && m->cfg.qkv_merged && (g_opt_step % 50 == 49)) {
+                int n = m->cfg.n_embd;
                 int in = bl->in_dim;
-                int out_dim = bl->out_dim;
-                for (int j = 0; j < out_dim; j++) {
+                /* 只检查 W_v 部分 (rows 2*n 到 3*n) */
+                float frob_sq = 0, max_row_sq = 0;
+                for (int j = 2*n; j < 3*n; j++) {
+                    float *wf = &bl->w_float[(size_t)j * in];
+                    float row_sq = 0;
+                    for (int i = 0; i < in; i++) row_sq += wf[i] * wf[i];
+                    frob_sq += row_sq;
+                    if (row_sq > max_row_sq) max_row_sq = row_sq;
+                }
+                float frob = sqrtf(frob_sq);
+                float max_row = sqrtf(max_row_sq);
+                float approx_rank = frob / (max_row + 1e-12f);
+                printf("    [plan-I] step %d W_v approx_rank=%.1f (frob=%.2f max_row=%.2f)\n",
+                       g_opt_step, approx_rank, frob, max_row);
+
+                /* v8: W_v weight decay 0.99 (best so far, rank=300 at step100) */
+                for (int j = 2*n; j < 3*n; j++) {
                     float *wf = &bl->w_float[(size_t)j * in];
                     for (int i = 0; i < in; i++) {
-                        wf[i] *= 0.99f;  /* gentle decay */
-                        wf[i] += 0.001f * ((float)rand() / RAND_MAX * 2.0f - 1.0f);  /* noise */
+                        wf[i] *= 0.99f;
                     }
                 }
             }

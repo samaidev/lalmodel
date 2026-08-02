@@ -149,6 +149,7 @@ void bin_backward_ste(float *grad_x, const float *grad_y, const float *x,
 /* Global flag: set to 1 to use STE backward in trans_layer_backward.
  * Models can set this before calling model_backward(). */
 extern int g_use_ste;
+extern float g_attn_residual_scale;  /* Ablation: set to 0 for MLP-only test */
 extern int g_use_logic_binarization;  /* norm-based auto logic mask in model_load */
 
 /* Semantic logic mask ratios (set by training script per curriculum phase) */
