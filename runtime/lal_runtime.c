@@ -261,7 +261,7 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
     for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
     /* BUG #48 FIX: normalize residual stream to prevent ||x|| explosion */
-    normalize_residual(x, n, 3.0f);
+    normalize_residual(x, n, 1.0f);
 
     /* MLP */
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
@@ -313,7 +313,7 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
         for (int i = 0; i < n; i++) x[i] += rs * (act->proj_out[i] + mlp_scale * act->mlp_out[i]);
     }
     /* BUG #48 FIX: normalize residual stream after MLP residual too */
-    normalize_residual(x, n, 3.0f);
+    normalize_residual(x, n, 1.0f);
 }
 
 /* Pure-float forward: same as trans_layer_forward but uses bin_forward_pure_float
@@ -353,7 +353,7 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
     bin_forward_pure_float(act->proj_out, act->attn_out, &tl->attn_o);
     for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
     /* BUG #48 FIX: normalize residual stream */
-    normalize_residual(x, n, 3.0f);
+    normalize_residual(x, n, 1.0f);
 
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
     norm_forward(act->norm2_out, x, tl->norm2_w, tl->norm2_b, cfg->norm_type, n);
@@ -389,7 +389,7 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
         for (int i = 0; i < n; i++) x[i] += rs * (act->proj_out[i] + mlp_scale * act->mlp_out[i]);
     }
     /* BUG #48 FIX: normalize residual stream after MLP */
-    normalize_residual(x, n, 3.0f);
+    normalize_residual(x, n, 1.0f);
 }
 
 /* Global flag: use STE backward (updates w_float + repacks wbits) */
@@ -3110,7 +3110,7 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
     for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
     /* BUG #48 FIX: normalize residual stream */
-    normalize_residual(x, n, 3.0f);
+    normalize_residual(x, n, 1.0f);
 
     /* Norm2 + MLP */
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
@@ -3150,7 +3150,7 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
     float mlp_scale = (attn_norm / mlp_norm);  /* scale MLP to match attention */
     for (int i = 0; i < n; i++) x[i] += rs * (act->proj_out[i] + mlp_scale * act->mlp_out[i]);
     /* BUG #48 FIX: normalize residual stream after MLP */
-    normalize_residual(x, n, 3.0f);
+    normalize_residual(x, n, 1.0f);
 }
 
 /* ─── Stateful Inference: Begin New Session ─────────────────────── */
