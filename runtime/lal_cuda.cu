@@ -338,3 +338,186 @@ void lal_cuda_bin_backward_pure_float_logic(float *grad_x, const float *grad_y,
 
     cudaFree(d_wf); cudaFree(d_gy); cudaFree(d_gx); cudaFree(d_mask);
 }
+
+/* ===================== v13k: Resident weight API + cuBLAS =====================
+ *
+ * Old v13j approach: cudaMalloc + cudaMemcpy + kernel + cudaFree per call.
+ *   For 512x1792 matrix: 13 GPU calls × ~50us = 650us overhead, but kernel
+ *   only ~50us. Overhead dominates 13x → GPU slower than CPU.
+ *
+ * v13k: Upload w_float/bias/mask once (upload_layer). Forward only copies
+ *   x in (2KB) and y out (7KB). With cuBLAS sgemm (T4 Tensor Core), this
+ *   should give 5-10x speedup over CPU.
+ *
+ * Weight sync: w_float updated on CPU during Adam. Call sync_layer() after
+ * model_batch_apply to push updated weights to GPU (one cudaMemcpy).
+ */
+#include <cublas_v2.h>
+
+static cublasHandle_t g_cublas = NULL;
+static int g_cublas_init = 0;
+
+static cublasHandle_t get_cublas() {
+    if (!g_cublas_init) {
+        cublasCreate(&g_cublas);
+        g_cublas_init = 1;
+    }
+    return g_cublas;
+}
+
+/* Upload w_float, bias, logic_mask to GPU. Called once after model_load. */
+extern "C"
+int lal_cuda_upload_layer(BinLayer *bl) {
+    if (!bl->w_float) return -1;
+    int in = bl->in_dim, out = bl->out_dim;
+    LayerGPU *g = (LayerGPU*)calloc(1, sizeof(LayerGPU));
+
+    CUDA_CHECK(cudaMalloc(&g->d_w, (size_t)in * out * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(g->d_w, bl->w_float, (size_t)in * out * sizeof(float),
+                          cudaMemcpyHostToDevice));
+
+    if (bl->bias) {
+        CUDA_CHECK(cudaMalloc(&g->d_bias, out * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(g->d_bias, bl->bias, out * sizeof(float),
+                              cudaMemcpyHostToDevice));
+    }
+    if (bl->logic_mask) {
+        CUDA_CHECK(cudaMalloc(&g->d_mask, out * sizeof(uint8_t)));
+        CUDA_CHECK(cudaMemcpy(g->d_mask, bl->logic_mask, out * sizeof(uint8_t),
+                              cudaMemcpyHostToDevice));
+    }
+    g->uploaded = 1;
+    bl->_gpu = g;
+    return 0;
+}
+
+/* Sync updated w_float from host to device (after Adam update). */
+extern "C"
+void lal_cuda_sync_layer(BinLayer *bl) {
+    LayerGPU *g = (LayerGPU*)bl->_gpu;
+    if (!g || !g->uploaded) return;
+    int in = bl->in_dim, out = bl->out_dim;
+    CUDA_CHECK(cudaMemcpy(g->d_w, bl->w_float,
+                          (size_t)in * out * sizeof(float),
+                          cudaMemcpyHostToDevice));
+    if (bl->bias && g->d_bias)
+        CUDA_CHECK(cudaMemcpy(g->d_bias, bl->bias, out * sizeof(float),
+                              cudaMemcpyHostToDevice));
+}
+
+/* Free device buffers. Called from bin_layer_free. */
+extern "C"
+void lal_cuda_free_layer(BinLayer *bl) {
+    LayerGPU *g = (LayerGPU*)bl->_gpu;
+    if (!g) return;
+    if (g->d_w) cudaFree(g->d_w);
+    if (g->d_bias) cudaFree(g->d_bias);
+    if (g->d_mask) cudaFree(g->d_mask);
+    free(g);
+    bl->_gpu = NULL;
+}
+
+/* v13k: Forward using resident weights + cuBLAS.
+ *   y = W @ x + bias  (W is [out, in] row-major)
+ *   cuBLAS uses column-major, so W[out,in] row-major == W^T[in,out] col-major
+ *   y = W^T @ x in col-major terms → cublasSgemm with op=T for W
+ *
+ *   For logic_mask layers: after matmul, zero out PRUNE rows via kernel.
+ *   This is cheaper than masking inside matmul. */
+__global__ void k_zero_prune(float *y, const uint8_t *mask, int out) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < out && mask[j] == 2) y[j] = 0.0f;
+}
+
+extern "C"
+void lal_cuda_fwd_resident(float *y, const float *x, const BinLayer *bl) {
+    LayerGPU *g = (LayerGPU*)bl->_gpu;
+    if (!g || !g->uploaded) {
+        /* Fallback to v13j per-call path */
+        lal_cuda_bin_forward_pure_float_logic(y, x, bl);
+        return;
+    }
+    int in = bl->in_dim, out = bl->out_dim;
+    cublasHandle_t h = get_cublas();
+
+    /* Allocate device buffers for x and y (small, could be persistent too) */
+    float *d_x, *d_y;
+    CUDA_CHECK(cudaMalloc(&d_x, in * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_y, out * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_x, x, in * sizeof(float), cudaMemcpyHostToDevice));
+
+    /* y = W @ x + bias
+     * cuBLAS col-major: y[col] = sum_row W^T[row,col] * x[row]
+     *   → cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+     *                 m=out, n=1, k=in,
+     *                 alpha=1.0, W=d_w (ld=k=in), x=d_x (ld=k=in),
+     *                 beta=0.0, y=d_y (ld=m=out))
+     * But we need bias addition. cuBLAS doesn't add bias, so do it after.
+     * Or use beta=1.0 and pre-fill d_y with bias. */
+    if (g->d_bias) {
+        CUDA_CHECK(cudaMemcpy(d_y, g->d_bias, out * sizeof(float),
+                              cudaMemcpyDeviceToDevice));
+        float alpha = 1.0f, beta = 1.0f;  /* beta=1 adds to existing bias */
+        cublasSgemv(h, CUBLAS_OP_T, in, out, &alpha, g->d_w, in, d_x, 1,
+                    &beta, d_y, 1);
+    } else {
+        float alpha = 1.0f, beta = 0.0f;
+        cublasSgemv(h, CUBLAS_OP_T, in, out, &alpha, g->d_w, in, d_x, 1,
+                    &beta, d_y, 1);
+    }
+
+    /* Zero out PRUNE rows if logic_mask present */
+    if (g->d_mask) {
+        int thr = 256, blk = (out + thr - 1) / thr;
+        k_zero_prune<<<blk, thr>>>(d_y, g->d_mask, out);
+    }
+
+    CUDA_CHECK(cudaMemcpy(y, d_y, out * sizeof(float), cudaMemcpyDeviceToHost));
+    cudaFree(d_x); cudaFree(d_y);
+}
+
+/* v13k: Backward grad_x using resident weights + cuBLAS.
+ *   grad_x = W^T @ grad_y  (W is [out, in], so W^T is [in, out])
+ *   In col-major: grad_x[in] = W[out,in] @ grad_y[out]
+ *   → cublasSgemv(handle, CUBLAS_OP_N, in, out, &alpha, d_w, in, d_gy, 1, &beta, d_gx, 1)
+ *   Wait: W row-major [out,in] == W col-major [in,out] transposed... let me think.
+ *
+ *   W stored row-major: W[j][i] = w_float[j*in + i], j=0..out-1, i=0..in-1
+ *   Col-major view: same memory, W_cm[i][j] = w_float[j*in + i] ... no.
+ *   Col-major [in,out]: element (i,j) at i + j*in. Same as row-major [out,in]!
+ *   So W row-major [out,in] == W_cm [in,out] (not transposed).
+ *
+ *   grad_x[i] = sum_j W[j][i] * grad_y[j] = sum_j W_cm[i][j] * grad_y[j]
+ *   = W_cm @ grad_y  where W_cm is [in,out], grad_y is [out]
+ *   → cublasSgemv(handle, CUBLAS_OP_N, in, out, &alpha, d_w, in, d_gy, 1, &beta, d_gx, 1) */
+extern "C"
+void lal_cuda_bwd_resident(float *grad_x, const float *grad_y, const BinLayer *bl) {
+    LayerGPU *g = (LayerGPU*)bl->_gpu;
+    if (!g || !g->uploaded) return;
+    int in = bl->in_dim, out = bl->out_dim;
+    cublasHandle_t h = get_cublas();
+
+    float *d_gy, *d_gx;
+    CUDA_CHECK(cudaMalloc(&d_gy, out * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_gx, in * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_gy, grad_y, out * sizeof(float), cudaMemcpyHostToDevice));
+
+    /* For PRUNE rows, we need to zero their grad_y before matmul.
+     * Cheaper: just do full matmul, PRUNE contribution is W[prune_row] @ grad_y
+     * which is wrong but small. Actually no — PRUNE rows have grad_y != 0
+     * from upstream, and W[prune_row] is meaningless. We must zero them.
+     * Use a masked grad_y via kernel. */
+    if (g->d_mask) {
+        /* Zero grad_y for PRUNE rows: d_gy[j] = (mask[j]==2) ? 0 : d_gy[j] */
+        int thr = 256, blk = (out + thr - 1) / thr;
+        k_zero_prune<<<blk, thr>>>(d_gy, g->d_mask, out);
+    }
+
+    float alpha = 1.0f, beta = 0.0f;
+    /* grad_x = W_cm @ grad_y, W_cm is [in, out] col-major == W row-major [out, in] */
+    cublasSgemv(h, CUBLAS_OP_N, in, out, &alpha, g->d_w, in, d_gy, 1,
+                &beta, d_gx, 1);
+
+    CUDA_CHECK(cudaMemcpy(grad_x, d_gx, in * sizeof(float), cudaMemcpyDeviceToHost));
+    cudaFree(d_gy); cudaFree(d_gx);
+}

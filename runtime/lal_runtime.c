@@ -433,11 +433,12 @@ float lr_schedule(int step, int warmup_steps, int total_steps, float base_lr) {
 void bin_forward_pure_float(float *y, const float *x, const BinLayer *bl) {
     int in = bl->in_dim, out = bl->out_dim;
 #ifdef LAL_CUDA
-    /* v13j: GPU acceleration for pure-float forward.
-     * Logic-guided layers: CORE/BINARY use w_float, PRUNE outputs 0.
-     * Non-logic layers: standard matmul. */
+    /* v13k: Use resident GPU weights (uploaded once in model_load).
+     * Falls back to v13j per-call path if not uploaded. */
     if (g_use_cuda && bl->w_float) {
-        if (bl->logic_mask) {
+        if (bl->_gpu) {
+            lal_cuda_fwd_resident(y, x, bl);
+        } else if (bl->logic_mask) {
             lal_cuda_bin_forward_pure_float_logic(y, x, bl);
         } else {
             extern void lal_cuda_matmul_f32(float*, const float*, const float*, const float*, int, int);
@@ -1045,6 +1046,28 @@ void model_load(Model *m, const char *weight_path, ModelConfig cfg,
     /* Auto-allocate KV cache if real attention is requested at load time.
      * Callers can also call model_kv_cache_alloc() later to enable it. */
     if (g_use_real_attention) model_kv_cache_alloc(m);
+
+#ifdef LAL_CUDA
+    /* v13k: Upload all layer weights to GPU (resident) for fast forward/backward.
+     * Called once after model_load. Weights stay on GPU until model_free.
+     * Updated w_float is synced to GPU after each model_batch_apply. */
+    if (g_use_cuda) {
+        extern int lal_cuda_upload_layer(BinLayer*);
+        int uploaded = 0;
+        for (int l = 0; l < cfg.n_layer; l++) {
+            TransLayer *tl = &m->layers[l];
+            BinLayer *bls[8] = {&tl->attn_q, &tl->attn_o, &tl->mlp_gate, &tl->mlp_down};
+            int n_bl = 4;
+            if (!cfg.qkv_merged) { bls[4] = &tl->attn_k; bls[5] = &tl->attn_v; n_bl = 6; }
+            if (cfg.act_type == ACT_SWIGLU) { bls[n_bl] = &tl->mlp_up; n_bl++; }
+            for (int b = 0; b < n_bl; b++) {
+                if (bls[b]->w_float && lal_cuda_upload_layer(bls[b]) == 0)
+                    uploaded++;
+            }
+        }
+        printf("[*] uploaded %d layers to GPU (resident weights)\n", uploaded);
+    }
+#endif
 }
 
 float model_forward(Model *m, const int *tokens, int n_tokens) {
@@ -1511,6 +1534,13 @@ void bin_layer_init_logic(BinLayer *bl, const float *W, const float *bias,
 }
 
 void bin_layer_free(BinLayer *bl) {
+#ifdef LAL_CUDA
+    /* v13k: free GPU resident buffers */
+    if (bl->_gpu) {
+        extern void lal_cuda_free_layer(BinLayer*);
+        lal_cuda_free_layer(bl);
+    }
+#endif
     free(bl->wbits); free(bl->wbits_T); free(bl->zbits); free(bl->alpha); free(bl->bias);
     free(bl->w_float); free(bl->w_core); free(bl->logic_mask);
     free(bl->m_adam); free(bl->v_adam); free(bl->grad_accum); free(bl->bias_grad_accum);
@@ -4022,6 +4052,24 @@ layer_done:
                 bin_layer_repack(bls[b]);
         }
     }
+
+#ifdef LAL_CUDA
+    /* v13k: Sync updated w_float to GPU for next forward pass.
+     * Called after all layers' weights are updated by Adam. */
+    if (g_use_cuda) {
+        extern void lal_cuda_sync_layer(BinLayer*);
+        for (int l = 0; l < m->cfg.n_layer; l++) {
+            TransLayer *tl = &m->layers[l];
+            BinLayer *bls[8] = {&tl->attn_q, &tl->attn_o, &tl->mlp_gate, &tl->mlp_down};
+            int n_bl = 4;
+            if (!m->cfg.qkv_merged) { bls[4] = &tl->attn_k; bls[5] = &tl->attn_v; n_bl = 6; }
+            if (m->cfg.act_type == ACT_SWIGLU) { bls[n_bl] = &tl->mlp_up; n_bl++; }
+            for (int b = 0; b < n_bl; b++) {
+                if (bls[b]->_gpu) lal_cuda_sync_layer(bls[b]);
+            }
+        }
+    }
+#endif
 
     /* Increment Adam step once per batch */
     if (g_use_adam) g_opt_step++;

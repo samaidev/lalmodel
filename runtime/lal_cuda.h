@@ -49,6 +49,23 @@ void lal_cuda_matmul_f32_backward(float *grad_W, float *grad_x,
                                   const float *grad_y, const float *x,
                                   const float *W, int in, int out, float lr);
 
+/* v13k: Resident weight API — upload weights once, reuse across forward calls.
+ * Eliminates per-call cudaMalloc/Memcpy/Free overhead (was 13x kernel time). */
+typedef struct {
+    float   *d_w;       /* [out * in] weights, resident */
+    float   *d_bias;    /* [out] bias, resident */
+    uint8_t *d_mask;    /* [out] logic_mask, resident (NULL if no mask) */
+    int      uploaded;  /* 1 after upload, 0 after free */
+} LayerGPU;
+
+int  lal_cuda_upload_layer(BinLayer *bl);   /* alloc + copy weights to GPU */
+void lal_cuda_sync_layer(BinLayer *bl);     /* push updated w_float to GPU */
+void lal_cuda_free_layer(BinLayer *bl);     /* free device buffers */
+
+/* Forward/backward using resident weights + cuBLAS. Only x/grad_y in, y/grad_x out. */
+void lal_cuda_fwd_resident(float *y, const float *x, const BinLayer *bl);
+void lal_cuda_bwd_resident(float *grad_x, const float *grad_y, const BinLayer *bl);
+
 #ifdef __cplusplus
 }
 #endif

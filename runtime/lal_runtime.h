@@ -84,6 +84,12 @@ typedef struct {
     int       n_core;     /* Count of CORE outputs */
     int       n_prune;    /* Count of PRUNE outputs */
     int       in_dim, out_dim, n_words, n_words_T;
+
+    /* v13k: GPU resident weights (NULL when CUDA off or upload failed).
+     * Allocated once in model_load via lal_cuda_upload_layer(), freed in
+     * bin_layer_free via lal_cuda_free_layer(). Updated on host (w_float)
+     * during STE, then synced to GPU before next forward. */
+    void *_gpu;          /* opaque pointer to LayerGPU struct (defined in lal_cuda.h) */
 } BinLayer;
 
 void bin_layer_init(BinLayer *bl, const float *W, const float *bias,
