@@ -261,7 +261,7 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
     for (int i = 0; i < n; i++) x[i] += rs * g_attn_residual_scale * act->proj_out[i];
     /* BUG #48 FIX: normalize residual stream to prevent ||x|| explosion */
-    // normalize_residual(x, n, 1.0f);  // 方案M: 删除 attention 后归一化
+    normalize_residual(x, n, 1.0f);  /* v13: 恢复 attention 后归一化 (撤销方案M) */
 
     /* MLP */
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
@@ -353,7 +353,7 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
     bin_forward_pure_float(act->proj_out, act->attn_out, &tl->attn_o);
     for (int i = 0; i < n; i++) x[i] += rs * g_attn_residual_scale * act->proj_out[i];
     /* BUG #48 FIX: normalize residual stream */
-    // normalize_residual(x, n, 1.0f);  // 方案M: 删除 attention 后归一化
+    normalize_residual(x, n, 1.0f);  /* v13: 恢复 attention 后归一化 (撤销方案M) */
 
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
     norm_forward(act->norm2_out, x, tl->norm2_w, tl->norm2_b, cfg->norm_type, n);
@@ -943,28 +943,28 @@ void model_load(Model *m, const char *weight_path, ModelConfig cfg,
             sprintf(key, "h.%d.attn.c_attn.weight", l);
             char bk[256]; strncpy(bk, key, sizeof(bk));
             char *dot = strstr(bk, ".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            BIN_INIT_NO_LOGIC(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
+            BIN_INIT(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
                      tensor_get(m->tensors, m->n_tensors, bk), n, 3*n);
         } else {
             sprintf(key, "model.layers.%d.self_attn.q_proj.weight", l);
             char bk[256]; strncpy(bk, key, sizeof(bk));
             char *dot = strstr(bk, ".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            BIN_INIT_NO_LOGIC(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
+            BIN_INIT(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
                      tensor_get(m->tensors, m->n_tensors, bk), n, n);
             sprintf(key, "model.layers.%d.self_attn.k_proj.weight", l);
             strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            BIN_INIT_NO_LOGIC(&tl->attn_k, tensor_get(m->tensors, m->n_tensors, key),
+            BIN_INIT(&tl->attn_k, tensor_get(m->tensors, m->n_tensors, key),
                      tensor_get(m->tensors, m->n_tensors, bk), n, n);
             sprintf(key, "model.layers.%d.self_attn.v_proj.weight", l);
             strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            BIN_INIT_NO_LOGIC(&tl->attn_v, tensor_get(m->tensors, m->n_tensors, key),
+            BIN_INIT(&tl->attn_v, tensor_get(m->tensors, m->n_tensors, key),
                      tensor_get(m->tensors, m->n_tensors, bk), n, n);
         }
 
         sprintf(key, qkv_merged ? "h.%d.attn.c_proj.weight" : "model.layers.%d.self_attn.o_proj.weight", l);
         char bk[256]; strncpy(bk, key, sizeof(bk));
         char *dot = strstr(bk, ".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-        BIN_INIT_NO_LOGIC(&tl->attn_o, tensor_get(m->tensors, m->n_tensors, key),
+        BIN_INIT(&tl->attn_o, tensor_get(m->tensors, m->n_tensors, key),
                  tensor_get(m->tensors, m->n_tensors, bk), n, n);
 
         if (cfg.act_type == ACT_SWIGLU) {
@@ -3119,7 +3119,7 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
     for (int i = 0; i < n; i++) x[i] += rs * g_attn_residual_scale * act->proj_out[i];
     /* BUG #48 FIX: normalize residual stream */
-    // normalize_residual(x, n, 1.0f);  // 方案M: 删除 attention 后归一化 (sliding window 版)
+    normalize_residual(x, n, 1.0f);  /* v13: 恢复 attention 后归一化 (撤销方案M) */
 
     /* Norm2 + MLP */
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
