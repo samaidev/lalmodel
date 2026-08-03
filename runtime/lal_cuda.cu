@@ -761,8 +761,9 @@ void lal_cuda_layer_forward_batch(
     TransLayer *tl,       /* layer weights (all resident on GPU via _gpu) */
     ModelConfig *cfg,
     int batch,
-    cudaStream_t stream
+    void *stream_void
 ) {
+    cudaStream_t stream = (cudaStream_t)stream_void;
     int n = cfg->n_embd;
     int mlp_dim = cfg->mlp_dim;
     int m = mlp_dim;
@@ -942,7 +943,7 @@ void lal_cuda_compute_gate_inputs_batch(
     for (int l = 0; l < n_layer; l++) {
         float *norm2_out = &out_gate_inputs[(size_t)l * batch * n];
         lal_cuda_layer_forward_batch(d_x, norm2_out, &m->layers[l], &m->cfg,
-                                      batch, s_stream);
+                                      batch, (void*)s_stream);
     }
 
     /* Sync — wait for all layers to complete */

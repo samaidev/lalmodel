@@ -76,20 +76,18 @@ void lal_cuda_fwd_batch(float *y, const float *x, const BinLayer *bl, int batch)
  * inputs. Only transfers: norm2 D2H (for gate_input cache). Everything else
  * stays on GPU. cuBLAS calls queued on stream (no host sync between calls).
  * d_x is modified in-place (residual stream). */
-struct ModelConfig;
-struct TransLayer;
+/* ModelConfig and TransLayer are already defined in lal_runtime.h (included above) */
 void lal_cuda_layer_forward_batch(
     float *d_x,           /* [batch, n_embd] device — residual stream */
     float *h_norm2_out,   /* [batch, n_embd] host — norm2 for gate_input */
-    struct TransLayer *tl, struct ModelConfig *cfg,
+    TransLayer *tl, ModelConfig *cfg,
     int batch, void *stream);
 
 /* v13m: High-level — compute gate_inputs for all layers, all batch, fully on GPU.
  * Uploads embeddings, runs fused layer forward, returns norm2 per layer.
  * This is the main entry point for logic_reg batch forward. */
-struct Model;
 void lal_cuda_compute_gate_inputs_batch(
-    struct Model *m, const float *embs, int batch,
+    Model *m, const float *embs, int batch,
     float *out_gate_inputs, int n_embd);
 
 #ifdef __cplusplus
