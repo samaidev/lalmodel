@@ -289,11 +289,17 @@ void lal_cuda_bin_forward_pure_float_logic(float *y, const float *x,
     CUDA_CHECK(cudaMalloc(&d_mask, out * sizeof(uint8_t)));
     CUDA_CHECK(cudaMemcpy(d_x, x, in * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_wf, bl->w_float, (size_t)in * out * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_b, bl->bias, out * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_mask, bl->logic_mask, out * sizeof(uint8_t), cudaMemcpyHostToDevice));
+    if (bl->bias)
+        CUDA_CHECK(cudaMemcpy(d_b, bl->bias, out * sizeof(float), cudaMemcpyHostToDevice));
+    else
+        cudaMemset(d_b, 0, out * sizeof(float));
+    if (bl->logic_mask)
+        CUDA_CHECK(cudaMemcpy(d_mask, bl->logic_mask, out * sizeof(uint8_t), cudaMemcpyHostToDevice));
+    else
+        cudaMemset(d_mask, 0, out * sizeof(uint8_t));
 
     int thr = 256, blk = (out + thr - 1) / thr;
-    k_logic_pure_fwd<<<blk, thr>>>(d_x, d_wf, d_b, bl->logic_mask, in, out, d_y);
+    k_logic_pure_fwd<<<blk, thr>>>(d_x, d_wf, d_b, d_mask, in, out, d_y);
     CUDA_CHECK(cudaMemcpy(y, d_y, out * sizeof(float), cudaMemcpyDeviceToHost));
 
     cudaFree(d_x); cudaFree(d_wf); cudaFree(d_b); cudaFree(d_y); cudaFree(d_mask);
@@ -327,7 +333,7 @@ void lal_cuda_bin_backward_pure_float_logic(float *grad_x, const float *grad_y,
     CUDA_CHECK(cudaMemcpy(d_mask, bl->logic_mask, out * sizeof(uint8_t), cudaMemcpyHostToDevice));
 
     int thr = 256, blk = (in + thr - 1) / thr;
-    k_logic_grad_x<<<blk, thr>>>(d_wf, d_gy, bl->logic_mask, in, out, d_gx);
+    k_logic_grad_x<<<blk, thr>>>(d_wf, d_gy, d_mask, in, out, d_gx);
     CUDA_CHECK(cudaMemcpy(grad_x, d_gx, in * sizeof(float), cudaMemcpyDeviceToHost));
 
     cudaFree(d_wf); cudaFree(d_gy); cudaFree(d_gx); cudaFree(d_mask);
