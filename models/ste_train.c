@@ -1125,8 +1125,8 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
                 int mp = n_tok < max_pos ? n_tok : max_pos;
                 if (mp < 10) continue;
 
-                /* Multi-position prediction: 4 positions per sample */
-                int n_preds = 4;
+                /* Multi-position prediction: 2 positions per sample (v13i: was 4, reduced for max_pos=256) */
+                int n_preds = 2;
                 int stride = (mp - 6) / n_preds;
                 if (stride < 1) stride = 1;
 
@@ -1519,7 +1519,7 @@ int main(int argc, char **argv) {
     /* STE 训练 */
     if (n_steps > 0) {
         int total_steps = total_schedule_steps > 0 ? total_schedule_steps : n_steps;
-        ste_train(&model, &dl, n_steps, base_lr, 50, batch_size, 64, 10, logic_lr, start_step, total_steps, logic_only);
+        ste_train(&model, &dl, n_steps, base_lr, 50, batch_size, 256, 10, logic_lr, start_step, total_steps, logic_only);
     }
 
     /* 保存训练后权重 */
