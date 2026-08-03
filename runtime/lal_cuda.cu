@@ -525,3 +525,107 @@ void lal_cuda_bwd_resident(float *grad_x, const float *grad_y, const BinLayer *b
     CUDA_CHECK(cudaMemcpy(grad_x, d_gx, in * sizeof(float), cudaMemcpyDeviceToHost));
     /* v13k: don't free — persistent buffers */
 }
+
+/* Helper kernel: fill d_y[b*out..b*out+out] = bias[0..out] for each b */
+__global__ void k_fill_bias(float *y, const float *bias, int batch, int out) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * out) return;
+    int j = idx % out;
+    y[idx] = bias[j];
+}
+
+/* Helper kernel: zero PRUNE rows across all batches */
+__global__ void k_zero_prune_batch(float *y, const uint8_t *mask, int batch, int out) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * out) return;
+    int j = idx % out;
+    if (mask[j] == 2) y[idx] = 0.0f;
+}
+
+/* ===================== v13l: Batch forward (multiple inputs at once) =====================
+ *
+ * v13k problem: logic_reg does 1120 cuBLAS calls (7 pairs × 2 concepts ×
+ * 10 layers × 8 matmuls). Each call has ~12ms launch overhead = 13.4s total.
+ *
+ * v13l solution: batch all 14 concepts into one [batch, n_embd] matrix,
+ * do one cublasSgemm per layer instead of 14 cublasSgemv. This reduces
+ * 1120 calls to 80 (10 layers × 8 matmuls), each slightly larger but
+ * total launch overhead drops 14x.
+ *
+ * Y[batch, out] = X[batch, in] @ W[out, in]^T + bias[out]
+ *   W is row-major [out, in], same as before.
+ *   cuBLAS col-major: Y_cm[out, batch] = W_cm[in, out]^T @ X_cm[in, batch]
+ *     = W_row[out, in] @ X_cm[in, batch]  (since W_row == W_cm not transposed)
+ *   → cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+ *                 m=out, n=batch, k=in,
+ *                 alpha, d_w (ld=in), d_x (ld=in),
+ *                 beta, d_y (ld=out))
+ *   With bias: pre-fill d_y with bias broadcasted, beta=1.
+ */
+extern "C"
+void lal_cuda_fwd_batch(float *y,          /* [batch * out] output */
+                        const float *x,    /* [batch * in] input, row-major */
+                        const BinLayer *bl,
+                        int batch) {
+    LayerGPU *g = (LayerGPU*)bl->_gpu;
+    if (!g || !g->uploaded) {
+        /* Fallback: loop over batch using resident forward */
+        int in = bl->in_dim, out = bl->out_dim;
+        for (int b = 0; b < batch; b++) {
+            lal_cuda_fwd_resident(y + b * out, x + b * in, bl);
+        }
+        return;
+    }
+    int in = bl->in_dim, out = bl->out_dim;
+    cublasHandle_t h = get_cublas();
+
+    /* Persistent batch buffers (grow as needed) */
+    static float *d_xb = NULL, *d_yb = NULL;
+    static int d_cap_b = 0;
+    int need = batch * (in > out ? in : out);
+    if (need > d_cap_b) {
+        if (d_xb) { cudaFree(d_xb); cudaFree(d_yb); }
+        cudaMalloc(&d_xb, need * sizeof(float));
+        cudaMalloc(&d_yb, need * sizeof(float));
+        d_cap_b = need;
+    }
+
+    CUDA_CHECK(cudaMemcpy(d_xb, x, (size_t)batch * in * sizeof(float),
+                          cudaMemcpyHostToDevice));
+
+    /* Pre-fill d_yb with bias broadcasted (each row = bias) */
+    if (g->d_bias) {
+        /* d_yb[b*out + j] = bias[j] for all b.
+         * cuBLAS doesn't broadcast, so use a kernel. */
+        int total = batch * out;
+        int thr = 256, blk = (total + thr - 1) / thr;
+        k_fill_bias<<<blk, thr>>>(d_yb, g->d_bias, batch, out);
+        float alpha = 1.0f, beta = 1.0f;
+        /* Y[out, batch] = W[in, out]^T_noop @ X[in, batch]
+         * Actually: Y[b][j] = sum_i W[j][i] * X[b][i] + bias[j]
+         * cuBLAS col-major: Y_cm[j, b] = sum_i W_cm[i, j] * X_cm[i, b]
+         * W row-major [out, in]: W[j][i] at j*in+i. Col-major [in, out]: W_cm[i,j] at i+j*in = j*in+i. Same!
+         * So W_cm == W_row (not transposed). Y_cm = W_cm @ X_cm.
+         * cublasSgemm(m=out, n=batch, k=in, op=N, op=N, d_w, ld=in, d_xb, ld=in, d_yb, ld=out) */
+        cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
+                    out, batch, in,
+                    &alpha, g->d_w, in, d_xb, in,
+                    &beta, d_yb, out);
+    } else {
+        float alpha = 1.0f, beta = 0.0f;
+        cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
+                    out, batch, in,
+                    &alpha, g->d_w, in, d_xb, in,
+                    &beta, d_yb, out);
+    }
+
+    /* Zero PRUNE rows (all batches) */
+    if (g->d_mask) {
+        int total = batch * out;
+        int thr = 256, blk = (total + thr - 1) / thr;
+        k_zero_prune_batch<<<blk, thr>>>(d_yb, g->d_mask, batch, out);
+    }
+
+    CUDA_CHECK(cudaMemcpy(y, d_yb, (size_t)batch * out * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+}

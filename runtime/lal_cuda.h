@@ -66,6 +66,11 @@ void lal_cuda_free_layer(BinLayer *bl);     /* free device buffers */
 void lal_cuda_fwd_resident(float *y, const float *x, const BinLayer *bl);
 void lal_cuda_bwd_resident(float *grad_x, const float *grad_y, const BinLayer *bl);
 
+/* v13l: Batch forward — multiple inputs in one cuBLAS call.
+ * Replaces 14× cublasSgemv with 1× cublasSgemm for logic_reg.
+ * y[batch, out] = X[batch, in] @ W[out, in]^T + bias[out] */
+void lal_cuda_fwd_batch(float *y, const float *x, const BinLayer *bl, int batch);
+
 #ifdef __cplusplus
 }
 #endif

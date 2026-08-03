@@ -811,3 +811,255 @@ final_ln      0.346266      (final_ln output)
   [WB] boundary=98/100  core_diff=0.0509  bin_diff=0.0173  ratio=2.94  prune_act=0.0000
   [WB] structure=16/20 (80%)  opp_sim=0.021
   [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=5477.6255 attn=653.8239
+  step   380/400 (global=480)  loss=9.9086  avg=9.5414  lr=0.000005  B=8  14132ms
+  [WB] boundary=98/100  core_diff=0.0503  bin_diff=0.0172  ratio=2.93  prune_act=0.0000
+  [WB] structure=16/20 (80%)  opp_sim=0.021
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=5479.5542 attn=653.2181
+  step   390/400 (global=490)  loss=10.0468  avg=9.5421  lr=0.000001  B=8  14215ms
+  [WB] boundary=98/100  core_diff=0.0501  bin_diff=0.0172  ratio=2.92  prune_act=0.0000
+  [WB] structure=16/20 (80%)  opp_sim=0.021
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+    [plan-I] step 499 W_v approx_rank=22.4 (frob=22.36 max_row=1.00)
+    [ortho] step 499 L0 W_v off_diag=1.32 diag_dev=0.3288
+    [ortho] step 499 L0 W_o off_diag=0.72 diag_dev=0.0827
+    [plan-I] step 499 W_v approx_rank=22.4 (frob=22.33 max_row=1.00)
+    [ortho] step 499 L1 W_v off_diag=1.44 diag_dev=0.3930
+    [ortho] step 499 L1 W_o off_diag=0.72 diag_dev=0.0828
+    [plan-I] step 499 W_v approx_rank=22.4 (frob=22.34 max_row=1.00)
+    [ortho] step 499 L2 W_v off_diag=1.41 diag_dev=0.3705
+    [ortho] step 499 L2 W_o off_diag=0.72 diag_dev=0.0828
+    [plan-I] step 499 W_v approx_rank=22.4 (frob=22.35 max_row=1.00)
+    [ortho] step 499 L3 W_v off_diag=1.37 diag_dev=0.3486
+    [ortho] step 499 L3 W_o off_diag=0.72 diag_dev=0.0829
+    [plan-I] step 499 W_v approx_rank=22.4 (frob=22.35 max_row=1.00)
+    [ortho] step 499 L4 W_v off_diag=1.38 diag_dev=0.3560
+    [ortho] step 499 L4 W_o off_diag=0.72 diag_dev=0.0824
+    [plan-I] step 499 W_v approx_rank=22.4 (frob=22.37 max_row=1.00)
+    [ortho] step 499 L5 W_v off_diag=1.30 diag_dev=0.3159
+    [ortho] step 499 L5 W_o off_diag=0.72 diag_dev=0.0828
+    [plan-I] step 499 W_v approx_rank=22.4 (frob=22.33 max_row=1.00)
+    [ortho] step 499 L6 W_v off_diag=1.45 diag_dev=0.3921
+    [ortho] step 499 L6 W_o off_diag=0.72 diag_dev=0.0824
+    [plan-I] step 499 W_v approx_rank=22.4 (frob=22.34 max_row=1.00)
+    [ortho] step 499 L7 W_v off_diag=1.41 diag_dev=0.3720
+    [ortho] step 499 L7 W_o off_diag=0.72 diag_dev=0.0827
+    [plan-I] step 499 W_v approx_rank=22.4 (frob=22.36 max_row=1.00)
+    [ortho] step 499 L8 W_v off_diag=1.31 diag_dev=0.3208
+    [ortho] step 499 L8 W_o off_diag=0.72 diag_dev=0.0825
+    [plan-I] step 499 W_v approx_rank=22.4 (frob=22.37 max_row=1.00)
+    [ortho] step 499 L9 W_v off_diag=1.29 diag_dev=0.3091
+    [ortho] step 499 L9 W_o off_diag=0.72 diag_dev=0.0826
+  step   399/400 (global=499)  loss=9.2429  avg=9.5614  lr=0.000000  B=8  14304ms
+
+[*] STE training done in 5721.4s (14303.5 ms/step)
+[*] Best recent loss: 9.0287
+
+[*] Saving trained weights to model_v13i.ste...
+[*] Saved 214410264 bytes
+=== Post-Training Whitebox Analysis (surface) ===
+
+=== LAL Whitebox Probe (step checkpoint) ===
+Model: 10L, 512 embd, 2048 mlp
+
+--- Embedding Concept Boundary ---
+
+        热  冷  大  小  上  下  亮  暗  重  轻  快  慢  湿  干
+  热  +1.00 -0.04 -0.02 -0.03 -0.02 -0.01 +0.03 +0.01 +0.01 -0.03 -0.03 +0.01 +0.00 -0.02
+  冷  -0.04 +1.00 -0.02 -0.04 +0.05 +0.01 -0.03 +0.07 -0.03 +0.14 +0.06 +0.09 +0.03 +0.05
+  大  -0.02 -0.02 +1.00 -0.01 -0.03 +0.06 +0.02 -0.01 -0.04 -0.03 +0.01 -0.01 -0.09 +0.13
+  小  -0.03 -0.04 -0.01 +1.00 +0.05 -0.01 -0.04 +0.10 +0.05 -0.03 -0.01 +0.01 +0.01 +0.04
+  上  -0.02 +0.05 -0.03 +0.05 +1.00 -0.01 -0.10 -0.05 -0.02 +0.10 -0.00 -0.04 -0.04 +0.00
+  下  -0.01 +0.01 +0.06 -0.01 -0.01 +1.00 -0.02 -0.02 +0.01 -0.03 -0.05 -0.07 -0.04 +0.03
+  亮  +0.03 -0.03 +0.02 -0.04 -0.10 -0.02 +1.00 +0.00 -0.00 +0.00 +0.01 +0.05 -0.00 +0.01
+  暗  +0.01 +0.07 -0.01 +0.10 -0.05 -0.02 +0.00 +1.00 -0.07 -0.02 -0.05 +0.05 +0.02 +0.08
+  重  +0.01 -0.03 -0.04 +0.05 -0.02 +0.01 -0.00 -0.07 +1.00 -0.04 -0.01 -0.02 +0.05 +0.01
+  轻  -0.03 +0.14 -0.03 -0.03 +0.10 -0.03 +0.00 -0.02 -0.04 +1.00 -0.03 -0.03 +0.05 +0.11
+  快  -0.03 +0.06 +0.01 -0.01 -0.00 -0.05 +0.01 -0.05 -0.01 -0.03 +1.00 +0.03 +0.02 +0.08
+  慢  +0.01 +0.09 -0.01 +0.01 -0.04 -0.07 +0.05 +0.05 -0.02 -0.03 +0.03 +1.00 -0.08 -0.03
+  湿  +0.00 +0.03 -0.09 +0.01 -0.04 -0.04 -0.00 +0.02 +0.05 +0.05 +0.02 -0.08 +1.00 +0.21
+  干  -0.02 +0.05 +0.13 +0.04 +0.00 +0.03 +0.01 +0.08 +0.01 +0.11 +0.08 -0.03 +0.21 +1.00
+
+  Opposite pairs (boundary clarity):
+    热 vs 冷: -0.0426 CLEAR
+    大 vs 小: -0.0077 CLEAR
+    上 vs 下: -0.0086 CLEAR
+    亮 vs 暗: +0.0036 CLEAR
+    重 vs 轻: -0.0373 CLEAR
+    快 vs 慢: +0.0265 CLEAR
+    湿 vs 干: +0.2124 CLEAR
+
+  Boundary score: 98/100 (STRONG)
+
+--- CORE Activation (simulated, layer 0) ---
+
+  热 vs 冷: CORE diff=0.0221 act=28.2138 OK | BIN diff=0.0084 | PRUNE act=0.0000
+  大 vs 小: CORE diff=0.0538 act=28.1967 OK | BIN diff=0.0231 | PRUNE act=0.0000
+  上 vs 下: CORE diff=0.0201 act=28.1626 OK | BIN diff=0.0089 | PRUNE act=0.0000
+  亮 vs 暗: CORE diff=0.0245 act=28.1637 OK | BIN diff=0.0106 | PRUNE act=0.0000
+  重 vs 轻: CORE diff=0.1213 act=28.2404 OK | BIN diff=0.0273 | PRUNE act=0.0000
+  快 vs 慢: CORE diff=0.0545 act=28.1983 OK | BIN diff=0.0194 | PRUNE act=0.0000
+  湿 vs 干: CORE diff=0.0555 act=28.2020 OK | BIN diff=0.0231 | PRUNE act=0.0000
+
+--- Weight Structure ---
+
+  L0 mlp: CORE=1.9559 BIN=0.6873 PRUNE=0.0000 OK | attn: CORE=0.7496 BIN=0.7273 PRUNE=0.3127 OK
+  L1 mlp: CORE=2.0112 BIN=0.7261 PRUNE=0.0000 OK | attn: CORE=0.7790 BIN=0.7339 PRUNE=0.3742 OK
+  ... (layers 2-8) ...
+  L9 mlp: CORE=2.3401 BIN=0.8865 PRUNE=0.0000 OK | attn: CORE=0.7254 BIN=0.7148 PRUNE=0.3006 OK
+
+  Structure: 80% OK (16/20)
+
+--- Embedding Concept Boundary ---
+
+        热  冷  大  小  上  下  亮  暗  重  轻  快  慢  湿  干
+  热  +1.00 -0.04 -0.02 -0.03 -0.02 -0.01 +0.03 +0.01 +0.01 -0.03 -0.03 +0.01 +0.00 -0.02
+  冷  -0.04 +1.00 -0.02 -0.04 +0.05 +0.01 -0.03 +0.07 -0.03 +0.14 +0.06 +0.09 +0.03 +0.05
+  大  -0.02 -0.02 +1.00 -0.01 -0.03 +0.06 +0.02 -0.01 -0.04 -0.03 +0.01 -0.01 -0.09 +0.13
+  小  -0.03 -0.04 -0.01 +1.00 +0.05 -0.01 -0.04 +0.10 +0.05 -0.03 -0.01 +0.01 +0.01 +0.04
+  上  -0.02 +0.05 -0.03 +0.05 +1.00 -0.01 -0.10 -0.05 -0.02 +0.10 -0.00 -0.04 -0.04 +0.00
+  下  -0.01 +0.01 +0.06 -0.01 -0.01 +1.00 -0.02 -0.02 +0.01 -0.03 -0.05 -0.07 -0.04 +0.03
+  亮  +0.03 -0.03 +0.02 -0.04 -0.10 -0.02 +1.00 +0.00 -0.00 +0.00 +0.01 +0.05 -0.00 +0.01
+  暗  +0.01 +0.07 -0.01 +0.10 -0.05 -0.02 +0.00 +1.00 -0.07 -0.02 -0.05 +0.05 +0.02 +0.08
+  重  +0.01 -0.03 -0.04 +0.05 -0.02 +0.01 -0.00 -0.07 +1.00 -0.04 -0.01 -0.02 +0.05 +0.01
+  轻  -0.03 +0.14 -0.03 -0.03 +0.10 -0.03 +0.00 -0.02 -0.04 +1.00 -0.03 -0.03 +0.05 +0.11
+  快  -0.03 +0.06 +0.01 -0.01 -0.00 -0.05 +0.01 -0.05 -0.01 -0.03 +1.00 +0.03 +0.02 +0.08
+  慢  +0.01 +0.09 -0.01 +0.01 -0.04 -0.07 +0.05 +0.05 -0.02 -0.03 +0.03 +1.00 -0.08 -0.03
+  湿  +0.00 +0.03 -0.09 +0.01 -0.04 -0.04 -0.00 +0.02 +0.05 +0.05 +0.02 -0.08 +1.00 +0.21
+  干  -0.02 +0.05 +0.13 +0.04 +0.00 +0.03 +0.01 +0.08 +0.01 +0.11 +0.08 -0.03 +0.21 +1.00
+
+  Opposite pairs (boundary clarity):
+    热 vs 冷: -0.0426 CLEAR
+    大 vs 小: -0.0077 CLEAR
+    上 vs 下: -0.0086 CLEAR
+    亮 vs 暗: +0.0036 CLEAR
+    重 vs 轻: -0.0373 CLEAR
+    快 vs 慢: +0.0265 CLEAR
+    湿 vs 干: +0.2124 CLEAR
+
+  Boundary score: 98/100 (STRONG)
+
+--- Concept Similarity (mid-layer weights) ---
+
+  Embedding similarity:
+        热  冷  大  小  上  下  亮  暗  重  轻  快  慢  湿  干
+  热  +1.00 -0.04 -0.02 -0.03 -0.02 -0.01 +0.03 +0.01 +0.01 -0.03 -0.03 +0.01 +0.00 -0.02
+  冷  -0.04 +1.00 -0.02 -0.04 +0.05 +0.01 -0.03 +0.07 -0.03 +0.14 +0.06 +0.09 +0.03 +0.05
+  大  -0.02 -0.02 +1.00 -0.01 -0.03 +0.06 +0.02 -0.01 -0.04 -0.03 +0.01 -0.01 -0.09 +0.13
+  小  -0.03 -0.04 -0.01 +1.00 +0.05 -0.01 -0.04 +0.10 +0.05 -0.03 -0.01 +0.01 +0.01 +0.04
+  上  -0.02 +0.05 -0.03 +0.05 +1.00 -0.01 -0.10 -0.05 -0.02 +0.10 -0.00 -0.04 -0.04 +0.00
+  下  -0.01 +0.01 +0.06 -0.01 -0.01 +1.00 -0.02 -0.02 +0.01 -0.03 -0.05 -0.07 -0.04 +0.03
+  亮  +0.03 -0.03 +0.02 -0.04 -0.10 -0.02 +1.00 +0.00 -0.00 +0.00 +0.01 +0.05 -0.00 +0.01
+  暗  +0.01 +0.07 -0.01 +0.10 -0.05 -0.02 +0.00 +1.00 -0.07 -0.02 -0.05 +0.05 +0.02 +0.08
+  重  +0.01 -0.03 -0.04 +0.05 -0.02 +0.01 -0.00 -0.07 +1.00 -0.04 -0.01 -0.02 +0.05 +0.01
+  轻  -0.03 +0.14 -0.03 -0.03 +0.10 -0.03 +0.00 -0.02 -0.04 +1.00 -0.03 -0.03 +0.05 +0.11
+  快  -0.03 +0.06 +0.01 -0.01 -0.00 -0.05 +0.01 -0.05 -0.01 -0.03 +1.00 +0.03 +0.02 +0.08
+  慢  +0.01 +0.09 -0.01 +0.01 -0.04 -0.07 +0.05 +0.05 -0.02 -0.03 +0.03 +1.00 -0.08 -0.03
+  湿  +0.00 +0.03 -0.09 +0.01 -0.04 -0.04 -0.00 +0.02 +0.05 +0.05 +0.02 -0.08 +1.00 +0.21
+  干  -0.02 +0.05 +0.13 +0.04 +0.00 +0.03 +0.01 +0.08 +0.01 +0.11 +0.08 -0.03 +0.21 +1.00
+
+
+========================================
+  DEEP WHITEBOX DIAGNOSIS
+  (explaining WHY generation is garbage)
+========================================
+
+--- 1. Embedding Space Differentiation ---
+
+  Embedding norms:
+    热=0.542 冷=0.548 大=0.545 小=0.550 上=0.554 下=0.563 亮=0.534 暗=0.554 火=0.558 水=0.539 
+
+  Avg cosine similarity:
+    Opposite pairs (should be LOW):  -0.0057
+    Unrelated pairs (should be ~0):  0.0015
+    Gap (unrelated - opposite):       0.0072  [OK]
+
+--- 2. CORE Activation Magnitude ---
+
+  Layer 0 mlp activation (for '热'):
+    CORE  : max=173.0783 avg=28.2138  (n=409)
+    BINARY: max=93.2651 avg=9.3162  (n=1435)
+    CORE diff (热 vs 冷): 0.0221 (0.1% of avg)
+    [FAIL] CORE diff too small — cannot drive distinct logits
+
+--- 3. Weight Norm Layering (CORE > BINARY > PRUNE?) ---
+
+  L0: CORE=1.9559 BIN=0.6873 PRUNE=0.0000  [OK layered]
+  L1: CORE=2.0112 BIN=0.7261 PRUNE=0.0000  [OK layered]
+  L2: CORE=2.1883 BIN=0.8379 PRUNE=0.0000  [OK layered]
+  L3: CORE=2.4147 BIN=0.9751 PRUNE=0.0000  [OK layered]
+  L4: CORE=2.2716 BIN=0.9334 PRUNE=0.0000  [OK layered]
+  L5: CORE=2.3479 BIN=0.9148 PRUNE=0.0000  [OK layered]
+  L6: CORE=2.2518 BIN=0.8761 PRUNE=0.0000  [OK layered]
+  L7: CORE=2.3169 BIN=0.8774 PRUNE=0.0000  [OK layered]
+  L8: CORE=2.3672 BIN=0.8726 PRUNE=0.0000  [OK layered]
+  L9: CORE=2.3401 BIN=0.8865 PRUNE=0.0000  [OK layered]
+
+--- 4. Logits Distribution (mode collapse check) ---
+
+  Prompt '热' → top-5 next-token logits:
+    token 231 '�' logit=11.7518
+    token 133 '�' logit=3.9560
+    token 31859 '▁' logit=3.0764
+    token 24156 '1▁=▁8' logit=2.5690
+    token 32152 'r' logit=2.3706
+
+  Logit range: 14.3760 (max=11.7518 min=-2.6242)
+  Softmax entropy: 4.3223 bits (uniform would be 15.00)
+  [WEAK] entropy 4.32 bits — low diversity, generation will be repetitive
+
+========================================
+  DIAGNOSIS SUMMARY
+========================================
+  If generation is garbage, likely causes:
+  1. Embeddings not spread (Section 1) → tokens sampled near-randomly
+  2. CORE activation too weak (Section 2) → model can't distinguish inputs
+  3. Weight norms not layered (Section 3) → logic mask is cosmetic
+  4. Logits collapsed/flat (Section 4) → repetitive or random output
+  Fix: train more steps, or increase logic_guided_regularization lr
+========================================
+
+
+========================================
+  LAYER-BY-LAYER COLLAPSE DIAGNOSIS
+  (火 vs 水 — cosine similarity per layer)
+========================================
+
+Layer         cosine_sim    l2_dist       ||a||       
+-----         ----------    -------       ------      
+emb           0.988202      0.764659      4.989233    
+L0            0.999915      0.039082      3.000000    
+L1            0.999998      0.005494      2.999998    
+L2            0.999999      0.000805      3.000000    
+L3            1.000000      0.000119      3.000000    
+L4            1.000000      0.000017      3.000000    
+L5            1.000000      0.000003      3.000001    
+L6            1.000000      0.000001      3.000000    
+L7            1.000000      0.000001      3.000000    
+L8            1.000000      0.000001      3.000000    
+L9            1.000000      0.000001      3.000000    
+final_ln      1.000000      (final_ln output)
+
+  (1.0=identical, 0.0=orthogonal)
+
+--- L0 Weight Check ---
+  L0 norm1_w[0:5]: 1.0000 1.0000 1.0000 1.0000 1.0000 
+  L0 norm1_w mean: 1.0000
+  L0 norm1_b[0:5]: 0.1280 -0.3102 -0.2776 0.2908 -0.2857 
+
+--- L0 Deep Diagnosis (norm1_out + V) ---
+  embedding (火vs水) cosine: 0.988202  ||火||=4.9892 ||水||=4.9586
+  norm1_out   (火vs水) cosine: 0.992382  ||火||=29.1732 ||水||=29.1650
+  V=attn_v    (火vs水) cosine: 0.999729  ||火||=146.8489 ||水||=146.7431
+
+  norm1_out 火 [0:5]: -0.4972 -1.1089 -1.2429 1.7277 -1.1886 
+  norm1_out 水 [0:5]: -0.4610 -1.0330 -1.1882 1.8101 -1.2023 
+  V 火        [0:5]: -2.1653 -1.2910 0.0000 0.7104 -1.9865 
+  V 水        [0:5]: -2.0954 -1.3143 0.0000 0.7432 -2.0094 
+
+  attn_q (QKV merged) weights: mean=-0.000064 min=-0.167520 max=0.158846 n=786432
+  (如果 V 火vs水 cosine 高, 但 norm1_out cosine 低, 说明 W_v 把不同输入映射到相似输出)
+
+
+[*] Done
