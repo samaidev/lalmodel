@@ -1114,6 +1114,8 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
 
         float batch_loss = 0;
         int n_valid = 0;
+        struct timespec t_ce_start, t_logic_start, t_apply_start, t_ce_end;
+        clock_gettime(CLOCK_MONOTONIC, &t_ce_start);
 
         if (!logic_only) {
             /* v13g: logic-only mode 跳过 CE 训练, 只做概念对正则化 */
@@ -1142,6 +1144,7 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
                 }
             }
         } /* end if (!logic_only) */
+        clock_gettime(CLOCK_MONOTONIC, &t_logic_start);
 
         if (n_valid > 0 || logic_only) {
             /* 在 apply 之前加语义引导梯度,与训练梯度一起更新 */
@@ -1157,6 +1160,14 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
             if (step % 10 == 0) {
                 printf("  [LOGIC] mlp=%.4f attn=%.4f\n", logic_loss, attn_loss);
             }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t_apply_start);
+
+        /* v13k: timing breakdown — find GPU bottleneck */
+        if (step % 10 == 0) {
+            double ce_ms = (t_logic_start.tv_sec-t_ce_start.tv_sec)*1000 + (t_logic_start.tv_nsec-t_ce_start.tv_nsec)/1e6;
+            double logic_ms = (t_apply_start.tv_sec-t_logic_start.tv_sec)*1000 + (t_apply_start.tv_nsec-t_logic_start.tv_nsec)/1e6;
+            printf("  [TIME] CE=%.0fms logic_reg=%.0fms\n", ce_ms, logic_ms);
         }
 
         float avg_loss = n_valid > 0 ? batch_loss / n_valid : 0;
