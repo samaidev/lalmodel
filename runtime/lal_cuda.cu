@@ -931,12 +931,21 @@ void lal_cuda_compute_gate_inputs_batch(
         d_x_cap = need;
     }
 
-    /* Upload embeddings + wpe to GPU */
+    /* Upload embeddings to GPU */
     cudaMemcpyAsync(d_x, embs, (size_t)batch * n * sizeof(float),
                     cudaMemcpyHostToDevice, s_stream);
     if (m->wpe) {
-        /* Add wpe[0] to each row — use a kernel */
-        k_add_wpe<<<(need + 255) / 256, 256, 0, s_stream>>>(d_x, m->wpe, batch, n);
+        /* Upload wpe[0..n-1] to device, then add to each row */
+        static float *d_wpe = NULL;
+        static int d_wpe_n = 0;
+        if (n > d_wpe_n) {
+            if (d_wpe) cudaFree(d_wpe);
+            cudaMalloc(&d_wpe, n * sizeof(float));
+            d_wpe_n = n;
+        }
+        cudaMemcpyAsync(d_wpe, m->wpe, n * sizeof(float),
+                        cudaMemcpyHostToDevice, s_stream);
+        k_add_wpe<<<(need + 255) / 256, 256, 0, s_stream>>>(d_x, d_wpe, batch, n);
     }
 
     /* Run all layers fused on GPU */
