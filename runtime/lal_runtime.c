@@ -294,21 +294,23 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_fwd(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    /* v13 FIX: Cap MLP output norm to prevent residual domination.
+    /* v13d FIX: Cap MLP output norm to prevent residual domination.
      * v12 bug: mlp_scale = attn_norm/mlp_norm suppressed MLP to match attn (~0.001)
      * v13 first attempt: full MLP signal → MLP dominated residual → cosine collapse
      * v13 final: cap ||mlp_out|| to 0.5 — enough to carry CORE diff signal,
      * but not enough to dominate input direction (||emb|| ≈ 0.9).
-     * This preserves input direction through residual stream. */
+     * v13e FAILED: cap=1.0 + target=5.0 → logit entropy collapsed to 2.5 bits
+     * (LayerNorm washes out magnitude, direction cosine 0.99 → logits identical
+     *  → high-freq tokens win → mode collapse). Reverted to v13d settings. */
     {
         float mlp_norm_sq = 0;
         for (int i = 0; i < n; i++) mlp_norm_sq += act->mlp_out[i] * act->mlp_out[i];
         float mlp_norm = sqrtf(mlp_norm_sq) + 1e-8f;
-        float mlp_cap = 0.5f;  /* v13d final: cap MLP contribution norm. v13b=v13c=0.3-0.5 same result */
+        float mlp_cap = 0.5f;  /* v13d final */
         float mlp_scale = (mlp_norm > mlp_cap) ? (mlp_cap / mlp_norm) : 1.0f;
         for (int i = 0; i < n; i++) x[i] += rs * mlp_scale * act->mlp_out[i];
     }
-    /* v13 FIX: 软化归一化 — target 1.0 → 3.0, 保留 3 倍信号空间 */
+    /* v13d: normalize target=3.0 (v13e tried 5.0, caused logit entropy collapse) */
     normalize_residual(x, n, 3.0f);
 }
 
@@ -3129,12 +3131,12 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_fwd(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    /* v13 FIX: Cap MLP output norm (同 trans_layer_forward) */
+    /* v13d: MLP cap=0.5, normalize target=3.0 (v13e reverted) */
     {
         float mlp_norm_sq = 0;
         for (int i = 0; i < n; i++) mlp_norm_sq += act->mlp_out[i] * act->mlp_out[i];
         float mlp_norm = sqrtf(mlp_norm_sq) + 1e-8f;
-        float mlp_cap = 0.5f;  /* v13d final: matches trans_layer_forward */
+        float mlp_cap = 0.5f;
         float mlp_scale = (mlp_norm > mlp_cap) ? (mlp_cap / mlp_norm) : 1.0f;
         for (int i = 0; i < n; i++) x[i] += rs * mlp_scale * act->mlp_out[i];
     }
