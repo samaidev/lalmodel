@@ -440,24 +440,25 @@ void lal_cuda_fwd_resident(float *y, const float *x, const BinLayer *bl) {
     int in = bl->in_dim, out = bl->out_dim;
     cublasHandle_t h = get_cublas();
 
-    /* Allocate device buffers for x and y (small, could be persistent too) */
-    float *d_x, *d_y;
-    CUDA_CHECK(cudaMalloc(&d_x, in * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_y, out * sizeof(float)));
+    /* v13k: persistent x/y buffers to avoid per-call cudaMalloc/Free.
+     * Max dim is n_embd=512 or mlp_dim=1792, so allocate once for max size. */
+    static float *d_x = NULL, *d_y = NULL;
+    static int d_cap = 0;
+    int need = in > out ? in : out;
+    if (need > d_cap) {
+        if (d_x) { cudaFree(d_x); cudaFree(d_y); }
+        cudaMalloc(&d_x, need * sizeof(float));
+        cudaMalloc(&d_y, need * sizeof(float));
+        d_cap = need;
+    }
+
     CUDA_CHECK(cudaMemcpy(d_x, x, in * sizeof(float), cudaMemcpyHostToDevice));
 
-    /* y = W @ x + bias
-     * cuBLAS col-major: y[col] = sum_row W^T[row,col] * x[row]
-     *   → cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-     *                 m=out, n=1, k=in,
-     *                 alpha=1.0, W=d_w (ld=k=in), x=d_x (ld=k=in),
-     *                 beta=0.0, y=d_y (ld=m=out))
-     * But we need bias addition. cuBLAS doesn't add bias, so do it after.
-     * Or use beta=1.0 and pre-fill d_y with bias. */
+    /* y = W @ x + bias, beta=1 adds bias pre-filled */
     if (g->d_bias) {
         CUDA_CHECK(cudaMemcpy(d_y, g->d_bias, out * sizeof(float),
                               cudaMemcpyDeviceToDevice));
-        float alpha = 1.0f, beta = 1.0f;  /* beta=1 adds to existing bias */
+        float alpha = 1.0f, beta = 1.0f;
         cublasSgemv(h, CUBLAS_OP_T, in, out, &alpha, g->d_w, in, d_x, 1,
                     &beta, d_y, 1);
     } else {
@@ -473,7 +474,7 @@ void lal_cuda_fwd_resident(float *y, const float *x, const BinLayer *bl) {
     }
 
     CUDA_CHECK(cudaMemcpy(y, d_y, out * sizeof(float), cudaMemcpyDeviceToHost));
-    cudaFree(d_x); cudaFree(d_y);
+    /* v13k: don't free d_x/d_y — they're persistent static buffers */
 }
 
 /* v13k: Backward grad_x using resident weights + cuBLAS.
@@ -497,18 +498,21 @@ void lal_cuda_bwd_resident(float *grad_x, const float *grad_y, const BinLayer *b
     int in = bl->in_dim, out = bl->out_dim;
     cublasHandle_t h = get_cublas();
 
-    float *d_gy, *d_gx;
-    CUDA_CHECK(cudaMalloc(&d_gy, out * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_gx, in * sizeof(float)));
+    /* v13k: reuse forward's persistent buffers (d_x as d_gy, d_y as d_gx) */
+    static float *d_gy = NULL, *d_gx = NULL;
+    static int d_cap_bwd = 0;
+    int need = in > out ? in : out;
+    if (need > d_cap_bwd) {
+        if (d_gy) { cudaFree(d_gy); cudaFree(d_gx); }
+        cudaMalloc(&d_gy, need * sizeof(float));
+        cudaMalloc(&d_gx, need * sizeof(float));
+        d_cap_bwd = need;
+    }
+
     CUDA_CHECK(cudaMemcpy(d_gy, grad_y, out * sizeof(float), cudaMemcpyHostToDevice));
 
-    /* For PRUNE rows, we need to zero their grad_y before matmul.
-     * Cheaper: just do full matmul, PRUNE contribution is W[prune_row] @ grad_y
-     * which is wrong but small. Actually no — PRUNE rows have grad_y != 0
-     * from upstream, and W[prune_row] is meaningless. We must zero them.
-     * Use a masked grad_y via kernel. */
+    /* For PRUNE rows, zero their grad_y before matmul. */
     if (g->d_mask) {
-        /* Zero grad_y for PRUNE rows: d_gy[j] = (mask[j]==2) ? 0 : d_gy[j] */
         int thr = 256, blk = (out + thr - 1) / thr;
         k_zero_prune<<<blk, thr>>>(d_gy, g->d_mask, out);
     }
@@ -519,5 +523,5 @@ void lal_cuda_bwd_resident(float *grad_x, const float *grad_y, const BinLayer *b
                 &beta, d_gx, 1);
 
     CUDA_CHECK(cudaMemcpy(grad_x, d_gx, in * sizeof(float), cudaMemcpyDeviceToHost));
-    cudaFree(d_gy); cudaFree(d_gx);
+    /* v13k: don't free — persistent buffers */
 }
