@@ -1481,6 +1481,7 @@ int main(int argc, char **argv) {
     g_use_ste = 1;         /* STE 反向:梯度通过 w_float 回传 */
     g_use_real_attention = 1;
     g_use_logic_binarization = 1;
+    g_use_cuda = 1;  /* v13i: enable CUDA for attn_q (no logic_mask layers) */
     /* Ablation: MLP-only test (set attn scale to 0 via env var) */
     {
         const char *attn_scale = getenv("LAL_ATTN_SCALE");
