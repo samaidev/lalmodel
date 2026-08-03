@@ -629,3 +629,330 @@ void lal_cuda_fwd_batch(float *y,          /* [batch * out] output */
     CUDA_CHECK(cudaMemcpy(y, d_yb, (size_t)batch * out * sizeof(float),
                           cudaMemcpyDeviceToHost));
 }
+
+/* ===================== v13m: GPU-resident intermediates + fused layer =====================
+ *
+ * v13l problem: each cuBLAS call did H2D(input) + sgemm + D2H(output).
+ * 6 transfers per layer × 10 layers × 2 (A+B) = 120 transfers, each ~50us
+ * sync overhead = 6ms... but actual 13s due to full pipeline stalls.
+ *
+ * v13m solution: keep ALL intermediates on GPU. Only transfer:
+ *   - Once: embeddings H2D (batch * n_embd)
+ *   - Per layer: norm2 D2H (batch * n_embd) for gate_input cache
+ *   - Once: final x D2H
+ *
+ * GPU kernels replace CPU operations:
+ *   k_batch_layernorm, k_residual_clip, k_gelu, k_extract_v, k_silu_swiglu
+ *
+ * cuBLAS calls use device pointers directly → no sync between calls.
+ * Use CUDA stream to queue cuBLAS + kernels asynchronously.
+ */
+
+/* GPU kernel: batched LayerNorm
+ *   y[b][i] = (x[b][i] - mean_b) / sqrt(var_b + eps) * w[i] + bias[i]
+ *   One block per batch row, 256 threads do reduction for mean/var. */
+__global__ void k_batch_layernorm(float *y, const float *x,
+                                    const float *w, const float *bias,
+                                    int batch, int n) {
+    int b = blockIdx.x;
+    if (b >= batch) return;
+    const float *xb = x + (size_t)b * n;
+    float *yb = y + (size_t)b * n;
+
+    /* Thread-local sum, then warp reduce */
+    __shared__ float s_mean, s_var;
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        local_sum += xb[i];
+    /* Block reduce */
+    __shared__ float sdata[256];
+    sdata[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        s_mean = sdata[0] / n;
+        sdata[0] = 0.0f;  /* reuse for var */
+    }
+    __syncthreads();
+
+    /* Variance */
+    float local_var = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float d = xb[i] - s_mean;
+        local_var += d * d;
+    }
+    sdata[threadIdx.x] = local_var;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        s_var = sdata[0] / n;
+    __syncthreads();
+
+    float inv_std = rsqrtf(s_var + 1e-5f);
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        yb[i] = (xb[i] - s_mean) * inv_std * w[i] + (bias ? bias[i] : 0.0f);
+}
+
+/* GPU kernel: x += rs * delta, then clip to [-clip, clip] */
+__global__ void k_residual_clip(float *x, const float *delta,
+                                 float rs, float clip, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    float v = x[idx] + rs * delta[idx];
+    if (v > clip) v = clip;
+    if (v < -clip) v = -clip;
+    x[idx] = v;
+}
+
+/* GPU kernel: GELU activation (GPT-2 style: 0.5x(1+tanh(sqrt(2/pi)(x+0.044715x^3)))) */
+__global__ void k_gelu(float *x, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    float v = x[idx];
+    float c = 0.7978845608f * (v + 0.044715f * v * v * v);
+    x[idx] = 0.5f * v * (1.0f + tanhf(c));
+}
+
+/* GPU kernel: extract V from QKV merged buffer
+ *   v[b][i] = qkv[b][2*n + i]  (V is 3rd third of [Q|K|V]) */
+__global__ void k_extract_v(float *v, const float *qkv, int batch, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * n;
+    if (idx >= total) return;
+    int b = idx / n;
+    int i = idx % n;
+    v[idx] = qkv[(size_t)b * 3 * n + 2 * n + i];
+}
+
+/* GPU kernel: copy (for V-copy attention, no QK mixing) */
+__global__ void k_batch_copy(float *dst, const float *src, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    dst[idx] = src[idx];
+}
+
+/* v13m: Fused batch layer forward — ALL intermediates stay on GPU.
+ *
+ * Does one full transformer layer forward for [batch] inputs:
+ *   norm1 = LN(x)
+ *   qkv = W_q @ norm1
+ *   v = qkv[2n:]  (V-copy, no real attention)
+ *   proj = W_o @ v
+ *   x += rs * proj, clip
+ *   norm2 = LN(x)
+ *   hidden = gelu(W_gate @ norm2)
+ *   mlp_out = W_down @ hidden
+ *   x += rs * mlp_out, clip
+ *
+ * Only d_x (residual) is modified in-place. norm2 copied to CPU for gate_input.
+ * All cuBLAS calls use device pointers → queued on stream, no host sync. */
+extern "C"
+void lal_cuda_layer_forward_batch(
+    float *d_x,           /* [batch, n] — residual stream (device, modified in-place) */
+    float *h_norm2_out,   /* [batch, n] — CPU output: norm2 for gate_input cache */
+    TransLayer *tl,       /* layer weights (all resident on GPU via _gpu) */
+    ModelConfig *cfg,
+    int batch,
+    cudaStream_t stream
+) {
+    int n = cfg->n_embd;
+    int mlp_dim = cfg->mlp_dim;
+    int m = mlp_dim;
+    float rs = cfg->residual_scale;
+
+    /* Persistent device scratch buffers (grown on demand) */
+    static float *d_n1 = NULL, *d_n2 = NULL, *d_qkv = NULL;
+    static float *d_ao = NULL, *d_proj = NULL, *d_hid = NULL, *d_mlp = NULL;
+    /* v13m: norm weights on GPU (small, uploaded per layer via async memcpy) */
+    static float *d_nw1 = NULL, *d_nb1 = NULL, *d_nw2 = NULL, *d_nb2 = NULL;
+    static int d_cap_m = 0;
+    int max_dim = n > m ? n : m;
+    int need = batch * (3 * n > max_dim ? 3 * n : max_dim);
+    if (need > d_cap_m) {
+        if (d_n1) { cudaFree(d_n1); cudaFree(d_n2); cudaFree(d_qkv);
+                    cudaFree(d_ao); cudaFree(d_proj); cudaFree(d_hid); cudaFree(d_mlp);
+                    cudaFree(d_nw1); cudaFree(d_nb1); cudaFree(d_nw2); cudaFree(d_nb2); }
+        cudaMalloc(&d_n1, batch * n * sizeof(float));
+        cudaMalloc(&d_n2, batch * n * sizeof(float));
+        cudaMalloc(&d_qkv, batch * 3 * n * sizeof(float));
+        cudaMalloc(&d_ao, batch * n * sizeof(float));
+        cudaMalloc(&d_proj, batch * n * sizeof(float));
+        cudaMalloc(&d_hid, batch * m * sizeof(float));
+        cudaMalloc(&d_mlp, batch * n * sizeof(float));
+        cudaMalloc(&d_nw1, n * sizeof(float));
+        cudaMalloc(&d_nb1, n * sizeof(float));
+        cudaMalloc(&d_nw2, n * sizeof(float));
+        cudaMalloc(&d_nb2, n * sizeof(float));
+        d_cap_m = need;
+    }
+
+    /* Upload norm weights to GPU (async, small: 4 × 2KB = 8KB) */
+    if (tl->norm1_w) cudaMemcpyAsync(d_nw1, tl->norm1_w, n * sizeof(float),
+                                      cudaMemcpyHostToDevice, stream);
+    if (tl->norm1_b) cudaMemcpyAsync(d_nb1, tl->norm1_b, n * sizeof(float),
+                                      cudaMemcpyHostToDevice, stream);
+    if (tl->norm2_w) cudaMemcpyAsync(d_nw2, tl->norm2_w, n * sizeof(float),
+                                      cudaMemcpyHostToDevice, stream);
+    if (tl->norm2_b) cudaMemcpyAsync(d_nb2, tl->norm2_b, n * sizeof(float),
+                                      cudaMemcpyHostToDevice, stream);
+
+    cublasHandle_t h = get_cublas();
+    cublasSetStream(h, stream);
+
+    int thr = 256;
+    float alpha = 1.0f, beta = 0.0f;
+
+    /* 1. norm1 = LayerNorm(x) — GPU kernel, uses device-resident norm weights */
+    k_batch_layernorm<<<batch, thr, 0, stream>>>(d_n1, d_x, d_nw1,
+                                                    d_nb1, batch, n);
+
+    /* 2. qkv = W_q @ norm1 (QKV merged, out=3n) — cuBLAS on device pointers */
+    LayerGPU *gq = (LayerGPU*)tl->attn_q._gpu;
+    if (gq && gq->uploaded) {
+        if (gq->d_bias) {
+            /* Pre-fill d_qkv with bias broadcast, beta=1 */
+            k_fill_bias<<<(batch * 3 * n + thr - 1) / thr, thr, 0, stream>>>(
+                d_qkv, gq->d_bias, batch, 3 * n);
+            beta = 1.0f;
+        }
+        cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
+                    3 * n, batch, n, &alpha, gq->d_w, n, d_n1, n,
+                    &beta, d_qkv, 3 * n);
+        beta = 0.0f;
+    }
+
+    /* 3. v = qkv[2n:] — GPU kernel */
+    k_extract_v<<<(batch * n + thr - 1) / thr, thr, 0, stream>>>(
+        d_ao, d_qkv, batch, n);
+
+    /* Zero PRUNE rows for attn_o */
+    LayerGPU *go = (LayerGPU*)tl->attn_o._gpu;
+    if (go && go->uploaded) {
+        if (go->d_bias) {
+            k_fill_bias<<<(batch * n + thr - 1) / thr, thr, 0, stream>>>(
+                d_proj, go->d_bias, batch, n);
+            beta = 1.0f;
+        }
+        cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
+                    n, batch, n, &alpha, go->d_w, n, d_ao, n,
+                    &beta, d_proj, n);
+        if (go->d_mask)
+            k_zero_prune_batch<<<(batch * n + thr - 1) / thr, thr, 0, stream>>>(
+                d_proj, go->d_mask, batch, n);
+        beta = 0.0f;
+    }
+
+    /* 4. x += rs * proj, clip — GPU kernel */
+    k_residual_clip<<<(batch * n + thr - 1) / thr, thr, 0, stream>>>(
+        d_x, d_proj, rs, 10.0f, batch * n);
+
+    /* 5. norm2 = LayerNorm(x) — GPU kernel */
+    k_batch_layernorm<<<batch, thr, 0, stream>>>(d_n2, d_x, d_nw2,
+                                                    d_nb2, batch, n);
+
+    /* Copy norm2 to CPU (gate_input for gradient computation) */
+    cudaMemcpyAsync(h_norm2_out, d_n2, batch * n * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+
+    /* 6. hidden = gelu(W_gate @ norm2) */
+    LayerGPU *gg = (LayerGPU*)tl->mlp_gate._gpu;
+    if (gg && gg->uploaded) {
+        if (gg->d_bias) {
+            k_fill_bias<<<(batch * m + thr - 1) / thr, thr, 0, stream>>>(
+                d_hid, gg->d_bias, batch, m);
+            beta = 1.0f;
+        }
+        cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
+                    m, batch, n, &alpha, gg->d_w, n, d_n2, n,
+                    &beta, d_hid, m);
+        if (gg->d_mask)
+            k_zero_prune_batch<<<(batch * m + thr - 1) / thr, thr, 0, stream>>>(
+                d_hid, gg->d_mask, batch, m);
+        beta = 0.0f;
+    }
+    k_gelu<<<(batch * m + thr - 1) / thr, thr, 0, stream>>>(d_hid, batch * m);
+
+    /* 7. mlp_out = W_down @ hidden */
+    LayerGPU *gd = (LayerGPU*)tl->mlp_down._gpu;
+    if (gd && gd->uploaded) {
+        if (gd->d_bias) {
+            k_fill_bias<<<(batch * n + thr - 1) / thr, thr, 0, stream>>>(
+                d_mlp, gd->d_bias, batch, n);
+            beta = 1.0f;
+        }
+        cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
+                    n, batch, m, &alpha, gd->d_w, m, d_hid, m,
+                    &beta, d_mlp, n);
+        /* Note: mlp_down typically doesn't have logic_mask, skip PRUNE zero */
+        beta = 0.0f;
+    }
+
+    /* 8. x += rs * mlp_out, clip — GPU kernel */
+    k_residual_clip<<<(batch * n + thr - 1) / thr, thr, 0, stream>>>(
+        d_x, d_mlp, rs, 10.0f, batch * n);
+}
+
+/* v13m: High-level batch gate_inputs computation.
+ * Uploads embeddings, runs all layers fused on GPU, returns gate_inputs.
+ * Manages stream + device buffer internally. */
+
+/* Forward declaration — defined below */
+__global__ void k_add_wpe(float *x, const float *wpe, int batch, int n);
+
+extern "C"
+void lal_cuda_compute_gate_inputs_batch(
+    Model *m,              /* model with layers loaded */
+    const float *embs,     /* [batch * n_embd] host embeddings */
+    int batch,
+    float *out_gate_inputs, /* [batch * n_layer * n_embd] host output */
+    int n_embd
+) {
+    int n_layer = m->cfg.n_layer;
+    int n = n_embd;
+
+    /* Persistent stream + residual buffer */
+    static cudaStream_t s_stream = NULL;
+    static float *d_x = NULL;
+    static int d_x_cap = 0;
+    if (!s_stream) cudaStreamCreate(&s_stream);
+    int need = batch * n;
+    if (need > d_x_cap) {
+        if (d_x) cudaFree(d_x);
+        cudaMalloc(&d_x, need * sizeof(float));
+        d_x_cap = need;
+    }
+
+    /* Upload embeddings + wpe to GPU */
+    cudaMemcpyAsync(d_x, embs, (size_t)batch * n * sizeof(float),
+                    cudaMemcpyHostToDevice, s_stream);
+    if (m->wpe) {
+        /* Add wpe[0] to each row — use a kernel */
+        k_add_wpe<<<(need + 255) / 256, 256, 0, s_stream>>>(d_x, m->wpe, batch, n);
+    }
+
+    /* Run all layers fused on GPU */
+    for (int l = 0; l < n_layer; l++) {
+        float *norm2_out = &out_gate_inputs[(size_t)l * batch * n];
+        lal_cuda_layer_forward_batch(d_x, norm2_out, &m->layers[l], &m->cfg,
+                                      batch, s_stream);
+    }
+
+    /* Sync — wait for all layers to complete */
+    cudaStreamSynchronize(s_stream);
+}
+
+/* Helper: add wpe[0..n-1] to each row of x[batch, n] */
+__global__ void k_add_wpe(float *x, const float *wpe, int batch, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * n) return;
+    int i = idx % n;
+    x[idx] += wpe[i];
+}

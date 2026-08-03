@@ -110,28 +110,33 @@ static float logic_guided_regularization(Model *m, float lr) {
         get_concept_embedding(m, cp->bytes_b, &emb_cache_b[(size_t)p * n_embd], n_embd);
     }
 
-    /* v13l: Batch forward — process all 14 concepts in one pass.
-     * Replaces 14× compute_all_gate_inputs (1120 cuBLAS calls) with
-     * 1× compute_all_gate_inputs_batch (80 batched cuBLAS calls).
-     * 14x reduction in launch overhead. */
+    /* v13m: GPU fused batch forward -- ALL intermediates stay on GPU.
+     * Replaces v13l's per-matmul H2D/D2H with single upload + per-layer D2H(norm2).
+     * Output layout: [layer, batch, n_embd] (layer-major for coalesced GPU write). */
     int batch = (int)N_PROBE_PAIRS;
-    /* gate_cache_all: [batch * n_layer * n_embd] — all concepts, all layers */
-    static float *gate_cache_all = NULL;
-    static int gca_n = 0, gca_layers = 0;
-    if (gca_n != n_embd || gca_layers != n_layer) {
-        free(gate_cache_all);
-        gate_cache_all = malloc((size_t)batch * n_layer * n_embd * sizeof(float));
-        gca_n = n_embd; gca_layers = n_layer;
+
+#ifdef LAL_CUDA
+    if (g_use_cuda) {
+        /* GPU path: lal_cuda_compute_gate_inputs_batch does everything on GPU.
+         * Output: gate_cache_a/b [n_layer * batch * n_embd] */
+        lal_cuda_compute_gate_inputs_batch(m, emb_cache_a, batch, gate_cache_a, n_embd);
+        lal_cuda_compute_gate_inputs_batch(m, emb_cache_b, batch, gate_cache_b, n_embd);
+    } else
+#endif
+    {
+        /* CPU fallback: v13l batch forward */
+        static float *gate_cache_all = NULL;
+        static int gca_n = 0, gca_layers = 0;
+        if (gca_n != n_embd || gca_layers != n_layer) {
+            free(gate_cache_all);
+            gate_cache_all = malloc((size_t)batch * n_layer * n_embd * sizeof(float));
+            gca_n = n_embd; gca_layers = n_layer;
+        }
+        compute_all_gate_inputs_batch(m, emb_cache_a, batch, gate_cache_all, n_embd);
+        memcpy(gate_cache_a, gate_cache_all, (size_t)batch * n_layer * n_embd * sizeof(float));
+        compute_all_gate_inputs_batch(m, emb_cache_b, batch, gate_cache_all, n_embd);
+        memcpy(gate_cache_b, gate_cache_all, (size_t)batch * n_layer * n_embd * sizeof(float));
     }
-
-    /* Batch forward for concept A's (7 embeddings) and B's (7 embeddings) */
-    compute_all_gate_inputs_batch(m, emb_cache_a, batch, gate_cache_all, n_embd);
-    /* Copy A's results to gate_cache_a */
-    memcpy(gate_cache_a, gate_cache_all, (size_t)batch * n_layer * n_embd * sizeof(float));
-
-    compute_all_gate_inputs_batch(m, emb_cache_b, batch, gate_cache_all, n_embd);
-    /* Copy B's results to gate_cache_b */
-    memcpy(gate_cache_b, gate_cache_all, (size_t)batch * n_layer * n_embd * sizeof(float));
 
     /* 对每个 pair 用缓存的 gate_input 算激活和梯度 */
     float *act_a = malloc(mlp_dim * sizeof(float));
@@ -160,8 +165,8 @@ static float logic_guided_regularization(Model *m, float lr) {
 
             int layer_in_dim = fc->in_dim;
             /* v13l: gate_cache is now [batch * n_layer * n_embd] */
-            float *gate_a = &gate_cache_a[((size_t)p * n_layer + l) * n_embd];
-            float *gate_b = &gate_cache_b[((size_t)p * n_layer + l) * n_embd];
+            float *gate_a = &gate_cache_a[((size_t)l * batch + p) * n_embd];
+            float *gate_b = &gate_cache_b[((size_t)l * batch + p) * n_embd];
 
             simulate_activation(m, gate_a, l, act_a, mlp_dim);
             simulate_activation(m, gate_b, l, act_b, mlp_dim);
