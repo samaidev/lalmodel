@@ -1,0 +1,60 @@
+=== SVD-style Diagnosis: v13b (scale=0.1) ===
+
+Header: n_layer=6, n_embd=512, mlp_dim=2048, vocab=32768
+Phase 0.5: 6L/512d, scale_to_norm=0.1
+
+    [plan-I] step 199 W_v approx_rank=22.6 (frob=22.51 max_row=1.00)
+    [ortho] step 199 L0 W_v off_diag=0.59 diag_dev=0.0837
+    [ortho] step 199 L0 W_o off_diag=0.00 diag_dev=0.0000
+    [plan-I] step 199 W_v approx_rank=22.6 (frob=22.51 max_row=1.00)
+    [ortho] step 199 L1 W_v off_diag=0.59 diag_dev=0.0827
+    [ortho] step 199 L1 W_o off_diag=0.00 diag_dev=0.0000
+    [plan-I] step 199 W_v approx_rank=22.6 (frob=22.51 max_row=1.00)
+    [ortho] step 199 L2 W_v off_diag=0.59 diag_dev=0.0796
+    [ortho] step 199 L2 W_o off_diag=0.00 diag_dev=0.0000
+    [plan-I] step 199 W_v approx_rank=22.6 (frob=22.51 max_row=1.00)
+    [ortho] step 199 L3 W_v off_diag=0.59 diag_dev=0.0829
+    [ortho] step 199 L3 W_o off_diag=0.00 diag_dev=0.0000
+    [plan-I] step 199 W_v approx_rank=22.6 (frob=22.51 max_row=1.00)
+    [ortho] step 199 L4 W_v off_diag=0.59 diag_dev=0.0814
+    [ortho] step 199 L4 W_o off_diag=0.00 diag_dev=0.0000
+    [plan-I] step 199 W_v approx_rank=22.6 (frob=22.51 max_row=1.00)
+    [ortho] step 199 L5 W_v off_diag=0.60 diag_dev=0.0821
+    [ortho] step 199 L5 W_o off_diag=0.00 diag_dev=0.0000
+
+=== Layer Collapse Diagnosis (火 vs 水) ===
+
+[*] Generated Phase 0.5: 6L test (6L/512d) weights: 6 layers, 512 embd, ~18M params
+[*] Model loaded: 6 layers, 512 embd, k_cache=YES
+Model: 6L, 512 embd, 2048 mlp
+  L0 mlp: CORE=0.4753 BIN=0.3625 PRUNE=0.0485 OK | attn: CORE=0.0000 BIN=0.0000 PRUNE=0.0000 X
+  L1 mlp: CORE=0.4768 BIN=0.3630 PRUNE=0.0484 OK | attn: CORE=0.0000 BIN=0.0000 PRUNE=0.0000 X
+  L5 mlp: CORE=0.4710 BIN=0.3651 PRUNE=0.0485 OK | attn: CORE=0.0000 BIN=0.0000 PRUNE=0.0000 X
+  Avg cosine similarity:
+  L0: CORE=0.4753 BIN=0.3625 PRUNE=0.0485  [OK layered]
+  L1: CORE=0.4768 BIN=0.3630 PRUNE=0.0484  [OK layered]
+  L2: CORE=0.4763 BIN=0.3632 PRUNE=0.0485  [OK layered]
+  L3: CORE=0.4752 BIN=0.3629 PRUNE=0.0485  [OK layered]
+  L4: CORE=0.4754 BIN=0.3628 PRUNE=0.0483  [OK layered]
+  L5: CORE=0.4710 BIN=0.3651 PRUNE=0.0485  [OK layered]
+  (火 vs 水 — cosine similarity per layer)
+Layer         cosine_sim    l2_dist       ||a||       
+emb           0.816249      0.787399      1.282832    
+L0            0.842352      0.561513      1.000000    
+L1            0.870400      0.509116      1.000000    
+L2            0.895196      0.457829      1.000000    
+L3            0.916471      0.408728      1.000000    
+L4            0.933606      0.364401      1.000000    
+L5            0.948373      0.321332      1.000000    
+final_ln      0.953137      (final_ln output)
+--- L0 Weight Check ---
+  L0 norm1_w[0:5]: 1.0000 1.0000 1.0000 1.0000 1.0000 
+  L0 norm1_w mean: 1.0000
+  L0 norm1_b[0:5]: -0.0610 -0.0603 -0.0466 -0.0507 -0.0380 
+--- L0 Deep Diagnosis (norm1_out + V) ---
+  embedding (火vs水) cosine: 0.816249  ||火||=1.2828 ||水||=1.3132
+  norm1_out   (火vs水) cosine: 0.820985  ||火||=22.9055 ||水||=22.9272
+  V=attn_v    (火vs水) cosine: 0.822129  ||火||=22.8264 ||水||=22.8515
+  norm1_out 火 [0:5]: 0.0046 -0.3692 1.7312 -0.8457 0.8672 
+  norm1_out 水 [0:5]: -0.6103 -0.1034 1.5114 -0.6888 1.0001 
+  (如果 V 火vs水 cosine 高, 但 norm1_out cosine 低, 说明 W_v 把不同输入映射到相似输出)

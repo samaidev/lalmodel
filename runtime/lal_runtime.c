@@ -259,9 +259,17 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
         memcpy(act->attn_out, act->v, n * sizeof(float));
     }
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
-    for (int i = 0; i < n; i++) x[i] += rs * g_attn_residual_scale * act->proj_out[i];
-    /* BUG #48 FIX: normalize residual stream to prevent ||x|| explosion */
-    // normalize_residual(x, n, 1.0f);  // 方案M: 删除 attention 后归一化
+    /* v13b: scale attention output to small perturbation (0.3 norm).
+     * Without this, ||proj_out||~27 dominates ||x||~1.8, collapsing all
+     * inputs to the same direction after 1 layer. */
+    {
+        float pn = 0;
+        for (int i = 0; i < n; i++) pn += act->proj_out[i] * act->proj_out[i];
+        act->attn_scale = 0.1f / (sqrtf(pn) + 1e-8f);
+        for (int i = 0; i < n; i++) act->proj_out[i] *= act->attn_scale;
+    }
+    for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
+    normalize_residual(x, n, 1.0f);
 
     /* MLP */
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
@@ -294,25 +302,14 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_fwd(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    /* BUG #46/#47 FIX: MLP output normalization (matches sliding window path).
-     * Without this, training uses raw MLP output but inference normalizes
-     * MLP to match attention magnitude → train/infer mismatch.
-     * Also prevents ||x|| explosion: MLP weights grow larger than attention
-     * (CORE has 3x lr multiplier), so raw MLP output dominates the residual,
-     * causing ||x|| to grow from ~1 (L0) to ~210 (L7) over layers.
-     * The clip_array(x, 10) can't prevent this because individual elements
-     * may be <10 but the vector norm still grows. */
+    /* v13b: scale MLP output to small perturbation (0.3 norm) */
     {
-        float mlp_norm = 0;
-        for (int i = 0; i < n; i++) mlp_norm += act->mlp_out[i] * act->mlp_out[i];
-        mlp_norm = sqrtf(mlp_norm) + 1e-8f;
-        float attn_norm = 0;
-        for (int i = 0; i < n; i++) attn_norm += act->proj_out[i] * act->proj_out[i];
-        attn_norm = sqrtf(attn_norm) + 1e-8f;
-        float mlp_scale = attn_norm / mlp_norm;
-        for (int i = 0; i < n; i++) x[i] += rs * (act->proj_out[i] + mlp_scale * act->mlp_out[i]);
+        float mn = 0;
+        for (int i = 0; i < n; i++) mn += act->mlp_out[i] * act->mlp_out[i];
+        act->mlp_scale = 0.1f / (sqrtf(mn) + 1e-8f);
+        for (int i = 0; i < n; i++) act->mlp_out[i] *= act->mlp_scale;
     }
-    /* BUG #48 FIX: normalize residual stream after MLP residual too */
+    for (int i = 0; i < n; i++) x[i] += rs * act->mlp_out[i];
     normalize_residual(x, n, 1.0f);
 }
 
@@ -351,9 +348,15 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
         memcpy(act->attn_out, act->v, n * sizeof(float));
 
     bin_forward_pure_float(act->proj_out, act->attn_out, &tl->attn_o);
-    for (int i = 0; i < n; i++) x[i] += rs * g_attn_residual_scale * act->proj_out[i];
-    /* BUG #48 FIX: normalize residual stream */
-    // normalize_residual(x, n, 1.0f);  // 方案M: 删除 attention 后归一化
+    /* v13b: scale attention output to small perturbation */
+    {
+        float pn = 0;
+        for (int i = 0; i < n; i++) pn += act->proj_out[i] * act->proj_out[i];
+        act->attn_scale = 0.1f / (sqrtf(pn) + 1e-8f);
+        for (int i = 0; i < n; i++) act->proj_out[i] *= act->attn_scale;
+    }
+    for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
+    normalize_residual(x, n, 1.0f);
 
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
     norm_forward(act->norm2_out, x, tl->norm2_w, tl->norm2_b, cfg->norm_type, n);
@@ -377,18 +380,14 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_forward_pure_float(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    /* BUG #46/#47 FIX: MLP normalization (same as trans_layer_forward) */
+    /* v13b: scale MLP output to small perturbation */
     {
-        float mlp_norm = 0;
-        for (int i = 0; i < n; i++) mlp_norm += act->mlp_out[i] * act->mlp_out[i];
-        mlp_norm = sqrtf(mlp_norm) + 1e-8f;
-        float attn_norm = 0;
-        for (int i = 0; i < n; i++) attn_norm += act->proj_out[i] * act->proj_out[i];
-        attn_norm = sqrtf(attn_norm) + 1e-8f;
-        float mlp_scale = attn_norm / mlp_norm;
-        for (int i = 0; i < n; i++) x[i] += rs * (act->proj_out[i] + mlp_scale * act->mlp_out[i]);
+        float mn = 0;
+        for (int i = 0; i < n; i++) mn += act->mlp_out[i] * act->mlp_out[i];
+        act->mlp_scale = 0.1f / (sqrtf(mn) + 1e-8f);
+        for (int i = 0; i < n; i++) act->mlp_out[i] *= act->mlp_scale;
     }
-    /* BUG #48 FIX: normalize residual stream after MLP */
+    for (int i = 0; i < n; i++) x[i] += rs * act->mlp_out[i];
     normalize_residual(x, n, 1.0f);
 }
 
@@ -568,8 +567,8 @@ void trans_layer_backward(float *grad_x, TransLayer *tl, TransAct *act,
     #define BIN_BW(gx, gy, x, bl, lr) \
         (g_use_ste ? bin_backward_ste(gx, gy, x, bl, lr) : bin_backward(gx, gy, x, bl, lr))
 
-    /* MLP backward */
-    for (int i = 0; i < n; i++) g_mlp[i] = grad_x[i] * rs;
+    /* MLP backward — v13b: include scale_to_norm factor */
+    for (int i = 0; i < n; i++) g_mlp[i] = grad_x[i] * rs * act->mlp_scale;
     BIN_BW(g_hidden, g_mlp, act->mlp_hidden, &tl->mlp_down, lr);
     if (cfg->act_type == ACT_SWIGLU) {
         /* BUG #45 FIX: correct SwiGLU backward.
@@ -604,8 +603,8 @@ void trans_layer_backward(float *grad_x, TransLayer *tl, TransAct *act,
                   tl->grad_norm2_w, tl->grad_norm2_b);
     for (int i = 0; i < n; i++) grad_x[i] += g_pre[i] * rs;
 
-    /* Attention backward */
-    for (int i = 0; i < n; i++) g_proj[i] = grad_x[i] * rs;
+    /* Attention backward — v13b: include scale_to_norm factor */
+    for (int i = 0; i < n; i++) g_proj[i] = grad_x[i] * rs * act->attn_scale;
     BIN_BW(g_attn, g_proj, act->attn_out, &tl->attn_o, lr);
     if (g_use_real_attention && tl->_kv_k && tl->_kv_v) {
         /* Real attention: dQ/dK/dV at the current position. act->q is the
@@ -2471,6 +2470,26 @@ void normalize_residual(float *x, int n, float target_norm) {
     }
 }
 
+/* v13b: Scale a sublayer output to a small target norm before adding to
+ * the residual stream. This makes attn/mlp outputs small perturbations
+ * rather than dominant signals, preventing representation collapse.
+ *
+ * Without this, ||proj_out|| ~ 27 (since norm1_out has ||.||~24 from
+ * LayerNorm over 512 dims), while ||x|| ~ 1.8 (embedding). The sublayer
+ * output completely overwrites the residual direction, causing all inputs
+ * to converge to the same representation after 1-2 layers.
+ *
+ * With target_norm=0.3, the sublayer contributes a 0.3-magnitude
+ * perturbation on top of the ~1.0-norm residual, preserving input
+ * diversity while still allowing the model to transform representations. */
+void scale_to_norm(float *v, int n, float target_norm) {
+    float norm_sq = 0;
+    for (int i = 0; i < n; i++) norm_sq += v[i] * v[i];
+    float norm = sqrtf(norm_sq) + 1e-8f;
+    float scale = target_norm / norm;
+    for (int i = 0; i < n; i++) v[i] *= scale;
+}
+
 /* ========================================================================
  * Full-vocab softmax cross-entropy (replaces sampled softmax for training)
  *
@@ -3117,9 +3136,15 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
 
     /* Output projection */
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
-    for (int i = 0; i < n; i++) x[i] += rs * g_attn_residual_scale * act->proj_out[i];
-    /* BUG #48 FIX: normalize residual stream */
-    // normalize_residual(x, n, 1.0f);  // 方案M: 删除 attention 后归一化 (sliding window 版)
+    /* v13b: scale attention output to small perturbation */
+    {
+        float pn = 0;
+        for (int i = 0; i < n; i++) pn += act->proj_out[i] * act->proj_out[i];
+        act->attn_scale = 0.1f / (sqrtf(pn) + 1e-8f);
+        for (int i = 0; i < n; i++) act->proj_out[i] *= act->attn_scale;
+    }
+    for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
+    normalize_residual(x, n, 1.0f);
 
     /* Norm2 + MLP */
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
@@ -3145,20 +3170,14 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_fwd(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    /* MLP output normalization: prevent MLP from dominating attention.
-     * Without this, CORE's core_gain=5 + lr_multiplier=3 causes MLP
-     * weights (norm ~490) to grow 5x larger than attention (~90),
-     * drowning out attention's prompt-specific signal. Normalize MLP
-     * output to match attention's output magnitude before residual. */
-    float mlp_norm = 0;
-    for (int i = 0; i < n; i++) mlp_norm += act->mlp_out[i] * act->mlp_out[i];
-    mlp_norm = sqrtf(mlp_norm) + 1e-8f;
-    float attn_norm = 0;
-    for (int i = 0; i < n; i++) attn_norm += act->proj_out[i] * act->proj_out[i];
-    attn_norm = sqrtf(attn_norm) + 1e-8f;
-    float mlp_scale = (attn_norm / mlp_norm);  /* scale MLP to match attention */
-    for (int i = 0; i < n; i++) x[i] += rs * (act->proj_out[i] + mlp_scale * act->mlp_out[i]);
-    /* BUG #48 FIX: normalize residual stream after MLP */
+    /* v13b: scale MLP output to small perturbation */
+    {
+        float mn = 0;
+        for (int i = 0; i < n; i++) mn += act->mlp_out[i] * act->mlp_out[i];
+        act->mlp_scale = 0.1f / (sqrtf(mn) + 1e-8f);
+        for (int i = 0; i < n; i++) act->mlp_out[i] *= act->mlp_scale;
+    }
+    for (int i = 0; i < n; i++) x[i] += rs * act->mlp_out[i];
     normalize_residual(x, n, 1.0f);
 }
 

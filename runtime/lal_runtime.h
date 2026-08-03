@@ -265,6 +265,7 @@ void gen_random_gpw2(const char *path, ModelConfig cfg);
 /* Utility */
 void clip_array(float *x, int n, float clip_val);
 void normalize_residual(float *x, int n, float target_norm);  /* BUG #48 */
+void scale_to_norm(float *v, int n, float target_norm);  /* v13b: prevent collapse */
 /* Cross-entropy loss + gradient (full softmax over entire vocab) */
 float cross_entropy_full(const float *hidden, const float *wte,
                          int target, int vocab_size, int n_embd,
@@ -325,6 +326,9 @@ typedef struct {
     float *swiglu_gate;   /* gate = W_gate · norm2 (pre-SiLU) */
     float *swiglu_up;     /* up = W_up · norm2 */
     int   seq_pos;        /* position of the cached forward pass (for attention bwd) */
+    /* v13b: scale factors for sublayer output normalization */
+    float attn_scale;     /* scale applied to proj_out (0.3/||proj_out||) */
+    float mlp_scale;      /* scale applied to mlp_out (0.3/||mlp_out||) */
 } TransAct;
 
 /* Initialize a transformer layer from tensors (model-agnostic) */
