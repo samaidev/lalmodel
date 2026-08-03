@@ -246,8 +246,6 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
     if (cfg->attn_type == ATTN_ROPE)
         apply_rope(act->q, act->k, seq_pos, cfg->n_head, n / cfg->n_head, n);
 
-    /* Simplified attention: V copy (full attention in future) */
-    memcpy(act->attn_out, act->v, n * sizeof(float));
     /* Attention: real causal multi-head (KV cache) if flag is on and cache
      * is allocated, else legacy V-copy (degenerate, no token mixing).
      * [FIX 致命2] The V-copy was a placeholder — see attention_forward(). */
@@ -259,9 +257,11 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
         memcpy(act->attn_out, act->v, n * sizeof(float));
     }
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
+    /* v13 FIX: 不再做 attn_norm/mlp_norm 等比缩放 (那是 v12 致命 bug).
+     * Attention 残差直接进入,信号量级小就小,让 backprop 通过 CE loss 慢慢长.
+     * 也不再单独 normalize attention 后的 residual — 只在 MLP 后 normalize 一次.
+     * 这样 attention 的小信号不会被 normalize_residual(x,n,1.0) 立刻冲掉. */
     for (int i = 0; i < n; i++) x[i] += rs * g_attn_residual_scale * act->proj_out[i];
-    /* BUG #48 FIX: normalize residual stream to prevent ||x|| explosion */
-    normalize_residual(x, n, 1.0f);  /* v13: 恢复 attention 后归一化 (撤销方案M) */
 
     /* MLP */
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
@@ -294,26 +294,22 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_fwd(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    /* BUG #46/#47 FIX: MLP output normalization (matches sliding window path).
-     * Without this, training uses raw MLP output but inference normalizes
-     * MLP to match attention magnitude → train/infer mismatch.
-     * Also prevents ||x|| explosion: MLP weights grow larger than attention
-     * (CORE has 3x lr multiplier), so raw MLP output dominates the residual,
-     * causing ||x|| to grow from ~1 (L0) to ~210 (L7) over layers.
-     * The clip_array(x, 10) can't prevent this because individual elements
-     * may be <10 but the vector norm still grows. */
+    /* v13 FIX: Cap MLP output norm to prevent residual domination.
+     * v12 bug: mlp_scale = attn_norm/mlp_norm suppressed MLP to match attn (~0.001)
+     * v13 first attempt: full MLP signal → MLP dominated residual → cosine collapse
+     * v13 final: cap ||mlp_out|| to 0.5 — enough to carry CORE diff signal,
+     * but not enough to dominate input direction (||emb|| ≈ 0.9).
+     * This preserves input direction through residual stream. */
     {
-        float mlp_norm = 0;
-        for (int i = 0; i < n; i++) mlp_norm += act->mlp_out[i] * act->mlp_out[i];
-        mlp_norm = sqrtf(mlp_norm) + 1e-8f;
-        float attn_norm = 0;
-        for (int i = 0; i < n; i++) attn_norm += act->proj_out[i] * act->proj_out[i];
-        attn_norm = sqrtf(attn_norm) + 1e-8f;
-        float mlp_scale = attn_norm / mlp_norm;
-        for (int i = 0; i < n; i++) x[i] += rs * (act->proj_out[i] + mlp_scale * act->mlp_out[i]);
+        float mlp_norm_sq = 0;
+        for (int i = 0; i < n; i++) mlp_norm_sq += act->mlp_out[i] * act->mlp_out[i];
+        float mlp_norm = sqrtf(mlp_norm_sq) + 1e-8f;
+        float mlp_cap = 0.5f;  /* v13d final: cap MLP contribution norm. v13b=v13c=0.3-0.5 same result */
+        float mlp_scale = (mlp_norm > mlp_cap) ? (mlp_cap / mlp_norm) : 1.0f;
+        for (int i = 0; i < n; i++) x[i] += rs * mlp_scale * act->mlp_out[i];
     }
-    /* BUG #48 FIX: normalize residual stream after MLP residual too */
-    normalize_residual(x, n, 1.0f);
+    /* v13 FIX: 软化归一化 — target 1.0 → 3.0, 保留 3 倍信号空间 */
+    normalize_residual(x, n, 3.0f);
 }
 
 /* Pure-float forward: same as trans_layer_forward but uses bin_forward_pure_float
@@ -351,9 +347,8 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
         memcpy(act->attn_out, act->v, n * sizeof(float));
 
     bin_forward_pure_float(act->proj_out, act->attn_out, &tl->attn_o);
+    /* v13 FIX: 同 trans_layer_forward — 不再做 attn/mlp 等比缩放, 也不在 attention 后单独归一化 */
     for (int i = 0; i < n; i++) x[i] += rs * g_attn_residual_scale * act->proj_out[i];
-    /* BUG #48 FIX: normalize residual stream */
-    normalize_residual(x, n, 1.0f);  /* v13: 恢复 attention 后归一化 (撤销方案M) */
 
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
     norm_forward(act->norm2_out, x, tl->norm2_w, tl->norm2_b, cfg->norm_type, n);
@@ -377,19 +372,9 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_forward_pure_float(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    /* BUG #46/#47 FIX: MLP normalization (same as trans_layer_forward) */
-    {
-        float mlp_norm = 0;
-        for (int i = 0; i < n; i++) mlp_norm += act->mlp_out[i] * act->mlp_out[i];
-        mlp_norm = sqrtf(mlp_norm) + 1e-8f;
-        float attn_norm = 0;
-        for (int i = 0; i < n; i++) attn_norm += act->proj_out[i] * act->proj_out[i];
-        attn_norm = sqrtf(attn_norm) + 1e-8f;
-        float mlp_scale = attn_norm / mlp_norm;
-        for (int i = 0; i < n; i++) x[i] += rs * (act->proj_out[i] + mlp_scale * act->mlp_out[i]);
-    }
-    /* BUG #48 FIX: normalize residual stream after MLP */
-    normalize_residual(x, n, 1.0f);
+    /* v13 FIX: MLP 信号全量进入, target=3.0 软化归一化 */
+    for (int i = 0; i < n; i++) x[i] += rs * act->mlp_out[i];
+    normalize_residual(x, n, 3.0f);
 }
 
 /* Global flag: use STE backward (updates w_float + repacks wbits) */
@@ -3117,9 +3102,8 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
 
     /* Output projection */
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
+    /* v13 FIX: 不再 normalize attention 后的 residual */
     for (int i = 0; i < n; i++) x[i] += rs * g_attn_residual_scale * act->proj_out[i];
-    /* BUG #48 FIX: normalize residual stream */
-    normalize_residual(x, n, 1.0f);  /* v13: 恢复 attention 后归一化 (撤销方案M) */
 
     /* Norm2 + MLP */
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
@@ -3145,21 +3129,16 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_fwd(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    /* MLP output normalization: prevent MLP from dominating attention.
-     * Without this, CORE's core_gain=5 + lr_multiplier=3 causes MLP
-     * weights (norm ~490) to grow 5x larger than attention (~90),
-     * drowning out attention's prompt-specific signal. Normalize MLP
-     * output to match attention's output magnitude before residual. */
-    float mlp_norm = 0;
-    for (int i = 0; i < n; i++) mlp_norm += act->mlp_out[i] * act->mlp_out[i];
-    mlp_norm = sqrtf(mlp_norm) + 1e-8f;
-    float attn_norm = 0;
-    for (int i = 0; i < n; i++) attn_norm += act->proj_out[i] * act->proj_out[i];
-    attn_norm = sqrtf(attn_norm) + 1e-8f;
-    float mlp_scale = (attn_norm / mlp_norm);  /* scale MLP to match attention */
-    for (int i = 0; i < n; i++) x[i] += rs * (act->proj_out[i] + mlp_scale * act->mlp_out[i]);
-    /* BUG #48 FIX: normalize residual stream after MLP */
-    normalize_residual(x, n, 1.0f);
+    /* v13 FIX: Cap MLP output norm (同 trans_layer_forward) */
+    {
+        float mlp_norm_sq = 0;
+        for (int i = 0; i < n; i++) mlp_norm_sq += act->mlp_out[i] * act->mlp_out[i];
+        float mlp_norm = sqrtf(mlp_norm_sq) + 1e-8f;
+        float mlp_cap = 0.5f;  /* v13d final: matches trans_layer_forward */
+        float mlp_scale = (mlp_norm > mlp_cap) ? (mlp_cap / mlp_norm) : 1.0f;
+        for (int i = 0; i < n; i++) x[i] += rs * mlp_scale * act->mlp_out[i];
+    }
+    normalize_residual(x, n, 3.0f);
 }
 
 /* ─── Stateful Inference: Begin New Session ─────────────────────── */

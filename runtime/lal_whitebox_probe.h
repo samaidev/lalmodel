@@ -309,10 +309,17 @@ static void compute_gate_input(Model *m, const float *initial_emb,
  * the LN2 output (gate_input) at each layer. Result: n_layer forwards
  * instead of n_layer*(n_layer+1)/2. For n_layer=8: 8 instead of 36 (4.5x).
  *
- * out_gate_inputs: [n_layer * n_embd] — gate_input for each layer.
+ * out_gate_inputs: [n_layer * n_embd] — gate_input (norm2_out) for each layer.
+ *
+ * v13 EXTENSION: out_norm1_inputs (optional, may be NULL).
+ *   [n_layer * n_embd] — norm1_out (input to attn_q) for each layer.
+ *   Used by attention regularization to differentiate concept pairs at
+ *   the attention output (attn_o). Without this, attention gets no
+ *   logic-guided gradient and stays at random init (v12 root cause #3).
  * ======================================================================== */
 static void compute_all_gate_inputs(Model *m, const float *initial_emb,
-                                     float *out_gate_inputs, int n_embd) {
+                                     float *out_gate_inputs, int n_embd,
+                                     float *out_norm1_inputs /* NULL ok */) {
     int n_layer = m->cfg.n_layer;
     int mlp_dim = m->cfg.mlp_dim;
     int n = n_embd;
@@ -357,6 +364,10 @@ static void compute_all_gate_inputs(Model *m, const float *initial_emb,
 
         norm_forward(norm1, x, tl->norm1_w, tl->norm1_b, m->cfg.norm_type, n);
 
+        /* v13: cache norm1_out for attention regularization */
+        if (out_norm1_inputs)
+            memcpy(&out_norm1_inputs[(size_t)l * n], norm1, n * sizeof(float));
+
         if (m->cfg.qkv_merged) {
             bin_forward_pure_float(qkv_buf, norm1, &tl->attn_q);
         } else {
@@ -370,8 +381,9 @@ static void compute_all_gate_inputs(Model *m, const float *initial_emb,
 
         norm_forward(norm2, x, tl->norm2_w, tl->norm2_b, m->cfg.norm_type, n);
 
-        /* Capture gate_input for this layer */
-        memcpy(&out_gate_inputs[(size_t)l * n], norm2, n * sizeof(float));
+        /* Capture gate_input for this layer (v13: NULL ok, skip write) */
+        if (out_gate_inputs)
+            memcpy(&out_gate_inputs[(size_t)l * n], norm2, n * sizeof(float));
 
         /* MLP to feed next layer */
         if (m->cfg.act_type == ACT_SWIGLU) {
