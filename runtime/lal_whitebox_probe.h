@@ -319,7 +319,8 @@ static void compute_gate_input(Model *m, const float *initial_emb,
  * ======================================================================== */
 static void compute_all_gate_inputs(Model *m, const float *initial_emb,
                                      float *out_gate_inputs, int n_embd,
-                                     float *out_norm1_inputs /* NULL ok */) {
+                                     float *out_norm1_inputs, /* NULL ok */
+                                     float *out_final_hidden   /* NULL ok, v13g: for logit diversity loss */) {
     int n_layer = m->cfg.n_layer;
     int mlp_dim = m->cfg.mlp_dim;
     int n = n_embd;
@@ -397,6 +398,13 @@ static void compute_all_gate_inputs(Model *m, const float *initial_emb,
         bin_forward_pure_float(mlp_out, hidden, &tl->mlp_down);
         for (int i = 0; i < n; i++) x[i] += rs * mlp_out[i];
         clip_array(x, n, 10.0f);
+    }
+
+    /* v13g: apply final LayerNorm and return final hidden state.
+     * Used by logit_diversity_loss to compute logits = wte @ final_hidden
+     * and penalize collapse to punctuation tokens. */
+    if (out_final_hidden) {
+        norm_forward(out_final_hidden, x, m->ln_f_w, m->ln_f_b, m->cfg.norm_type, n);
     }
 }
 

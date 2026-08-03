@@ -117,13 +117,23 @@ static float logic_guided_regularization(Model *m, float lr) {
     float *act_a = malloc(mlp_dim * sizeof(float));
     float *act_b = malloc(mlp_dim * sizeof(float));
 
+    /* v13g: final_hidden buffers for logit diversity loss */
+    static float *final_a = NULL, *final_b = NULL;
+    static int fh_n = 0;
+    if (fh_n != n_embd) {
+        free(final_a); free(final_b);
+        final_a = malloc(n_embd * sizeof(float));
+        final_b = malloc(n_embd * sizeof(float));
+        fh_n = n_embd;
+    }
+
     for (int p = 0; p < (int)N_PROBE_PAIRS; p++) {
-        /* 一次 forward 拿到 concept a/b 的所有层 gate_input
-         * v13: 新增 out_norm1_inputs 参数 (NULL = 不缓存 norm1) */
+        /* 一次 forward 拿到 concept a/b 的所有层 gate_input + final hidden
+         * v13g: 传 final_a/final_b 给 logit diversity loss */
         compute_all_gate_inputs(m, &emb_cache_a[(size_t)p * n_embd],
-                                gate_cache_a, n_embd, /*out_norm1_inputs*/NULL);
+                                gate_cache_a, n_embd, /*norm1*/NULL, final_a);
         compute_all_gate_inputs(m, &emb_cache_b[(size_t)p * n_embd],
-                                gate_cache_b, n_embd, /*out_norm1_inputs*/NULL);
+                                gate_cache_b, n_embd, /*norm1*/NULL, final_b);
 
         /* 对每层用缓存的 gate_input 算激活和梯度 */
         for (int l = 0; l < n_layer; l++) {
@@ -198,6 +208,49 @@ static float logic_guided_regularization(Model *m, float lr) {
                         ga[i] += grad_scale * (gate_a[i] - gate_b[i]);
                     if (fc->bias_grad_accum)
                         fc->bias_grad_accum[j] += grad_scale;
+                }
+            }
+        }
+
+        /* v13g: Logit diversity loss — 惩罚首 token 坍缩到标点.
+         * v13d 问题: 所有输入的首 token logits 都坍缩到 ',' (id=31865, logit=4.67)
+         * 和 '。' (id=31861, logit=4.05), 远高于其他 token. 生成总是以标点开头.
+         *
+         * 方案: 用 final_a/final_b (已缓存) 算高频标点 token 的 logit,
+         * 如果 logit > threshold (2.0), 加 loss = penalty_weight * (logit - 2.0).
+         * 梯度: d(loss)/d(wte[v]) = penalty_weight * final_hidden, 加到 grad_wte_accum.
+         * 这让 wte[v] 的权重行被推离 final_hidden 方向, 降低该 token 的 logit. */
+        {
+            static const int penalty_tokens[] = {31865, 31861, 31906, 31919, 31920};
+            static const int n_penalty = sizeof(penalty_tokens) / sizeof(penalty_tokens[0]);
+            const float logit_threshold = 2.0f;
+            const float penalty_weight = 0.3f * lr;  /* 与 logic_lr 同步缩放 */
+            int vocab = m->cfg.vocab_size;
+
+            for (int t = 0; t < n_penalty; t++) {
+                int v = penalty_tokens[t];
+                if (v < 0 || v >= vocab) continue;
+                /* logit = wte[v] · final_hidden */
+                float la = 0, lb = 0;
+                for (int i = 0; i < n_embd; i++) {
+                    la += m->wte[(size_t)v * n_embd + i] * final_a[i];
+                    lb += m->wte[(size_t)v * n_embd + i] * final_b[i];
+                }
+                /* 惩罚 a */
+                if (la > logit_threshold) {
+                    total_loss += penalty_weight * (la - logit_threshold);
+                    if (m->grad_wte_accum) {
+                        for (int i = 0; i < n_embd; i++)
+                            m->grad_wte_accum[(size_t)v * n_embd + i] += penalty_weight * final_a[i];
+                    }
+                }
+                /* 惩罚 b */
+                if (lb > logit_threshold) {
+                    total_loss += penalty_weight * (lb - logit_threshold);
+                    if (m->grad_wte_accum) {
+                        for (int i = 0; i < n_embd; i++)
+                            m->grad_wte_accum[(size_t)v * n_embd + i] += penalty_weight * final_b[i];
+                    }
                 }
             }
         }
@@ -325,10 +378,10 @@ static float attn_logic_regularization(Model *m, float lr) {
         /* 一次 forward 拿到所有层 norm1_out, 同时也拿到 V (QKV 的 V 切片) */
         compute_all_gate_inputs(m, &emb_cache_a[(size_t)p * n_embd],
                                 /*out_gate_inputs*/NULL, n_embd,
-                                /*out_norm1_inputs*/norm1_cache_a);
+                                /*out_norm1_inputs*/norm1_cache_a, /*final*/NULL);
         compute_all_gate_inputs(m, &emb_cache_b[(size_t)p * n_embd],
                                 /*out_gate_inputs*/NULL, n_embd,
-                                /*out_norm1_inputs*/norm1_cache_b);
+                                /*out_norm1_inputs*/norm1_cache_b, /*final*/NULL);
 
         /* 对每层, 用 norm1 重新算 V (QKV merged 的 V 切片) 和 proj_out */
         for (int l = 0; l < n_layer; l++) {
@@ -1032,12 +1085,14 @@ static int sample_argmax(const float *logits, int vocab_size) {
  */
 static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
                        int warmup, int batch_size, int max_pos, int eval_interval,
-                       float logic_lr, int start_step, int total_schedule_steps) {
-    printf("\n=== LAL STE Training (B=%d, max_pos=%d, steps=%d, start_step=%d, total_sched=%d, logic_lr=%.4f) ===\n",
-           batch_size, max_pos, n_steps, start_step, total_schedule_steps, logic_lr);
+                       float logic_lr, int start_step, int total_schedule_steps,
+                       int logic_only) {  /* v13g: logic_only mode for curriculum stage 1 */
+    printf("\n=== LAL STE Training (B=%d, max_pos=%d, steps=%d, start_step=%d, total_sched=%d, logic_lr=%.4f, logic_only=%d) ===\n",
+           batch_size, max_pos, n_steps, start_step, total_schedule_steps, logic_lr, logic_only);
     printf("[*] STE: forward=sign(w), backward=w_float gradient\n");
     printf("[*] Whitebox probe every %d steps\n", eval_interval);
-    printf("[*] Semantic regularization every step\n\n");
+    printf("[*] Semantic regularization every step\n");
+    if (logic_only) printf("[*] LOGIC-ONLY MODE: skipping CE loss, only concept-pair regularization (curriculum stage 1)\n\n");
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -1060,39 +1115,44 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
         float batch_loss = 0;
         int n_valid = 0;
 
-        for (int b = 0; b < batch_size; b++) {
-            int idx = rand() % dl->n_samples;
-            int n_tok = dataloader_get(dl, idx, batch_tokens[b], 512);
-            if (n_tok < 20) continue;
+        if (!logic_only) {
+            /* v13g: logic-only mode 跳过 CE 训练, 只做概念对正则化 */
+            for (int b = 0; b < batch_size; b++) {
+                int idx = rand() % dl->n_samples;
+                int n_tok = dataloader_get(dl, idx, batch_tokens[b], 512);
+                if (n_tok < 20) continue;
 
-            int mp = n_tok < max_pos ? n_tok : max_pos;
-            if (mp < 10) continue;
+                int mp = n_tok < max_pos ? n_tok : max_pos;
+                if (mp < 10) continue;
 
-            /* Multi-position prediction: 4 positions per sample */
-            int n_preds = 4;
-            int stride = (mp - 6) / n_preds;
-            if (stride < 1) stride = 1;
+                /* Multi-position prediction: 4 positions per sample */
+                int n_preds = 4;
+                int stride = (mp - 6) / n_preds;
+                if (stride < 1) stride = 1;
 
-            for (int p = 0; p < n_preds; p++) {
-                int pred_pos = 5 + p * stride;
-                if (pred_pos >= mp - 1) break;
-                float loss = model_batch_forward(m, batch_tokens[b], pred_pos + 1);
-                if (!isnan(loss) && !isinf(loss)) {
-                    model_batch_backward(m, batch_tokens[b], pred_pos + 1);
-                    batch_loss += loss;
-                    n_valid++;
+                for (int p = 0; p < n_preds; p++) {
+                    int pred_pos = 5 + p * stride;
+                    if (pred_pos >= mp - 1) break;
+                    float loss = model_batch_forward(m, batch_tokens[b], pred_pos + 1);
+                    if (!isnan(loss) && !isinf(loss)) {
+                        model_batch_backward(m, batch_tokens[b], pred_pos + 1);
+                        batch_loss += loss;
+                        n_valid++;
+                    }
                 }
             }
-        }
+        } /* end if (!logic_only) */
 
-        if (n_valid > 0) {
+        if (n_valid > 0 || logic_only) {
             /* 在 apply 之前加语义引导梯度,与训练梯度一起更新 */
             float logic_loss = logic_guided_regularization(m, logic_lr);
             /* v13: 同时给 attention 加 CORE/BINARY/PRUNE 引导.
              * v12 attention 没有引导信号,导致 attn 权重留在 random init.
              * 用更温和的 lr (logic_lr * 0.5) 防 attention 爆炸. */
             float attn_loss = attn_logic_regularization(m, logic_lr * 0.5f);
-            model_batch_apply(m, lr, n_valid);
+            /* v13g: logic-only 模式下 n_valid=0, 用 batch_size=1 做 apply */
+            int apply_batch = logic_only ? 1 : n_valid;
+            model_batch_apply(m, lr, apply_batch);
             /* g_opt_step is incremented inside model_batch_apply — don't double-increment */
             if (step % 10 == 0) {
                 printf("  [LOGIC] mlp=%.4f attn=%.4f\n", logic_loss, attn_loss);
@@ -1326,6 +1386,7 @@ int main(int argc, char **argv) {
     int max_gen = 100;
     float temp = 0.4f;
     int top_k = 8;
+    int logic_only = 0;  /* v13g: --logic-only, 课程学习 stage 1 只训概念对不训 CE */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--steps") && i+1 < argc) n_steps = atoi(argv[++i]);
@@ -1354,6 +1415,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--save") && i+1 < argc) save_path = argv[++i];
         else if (!strcmp(argv[i], "--resume") && i+1 < argc) resume_path = argv[++i];
         else if (!strcmp(argv[i], "--diagnose-only")) { n_steps = 0; }
+        else if (!strcmp(argv[i], "--logic-only")) { logic_only = 1; }  /* v13g */
         else if (!strcmp(argv[i], "--help")) {
             printf("Usage: ste_train [options]\n"
                    "  --steps N         Training steps (default 200)\n"
@@ -1457,7 +1519,7 @@ int main(int argc, char **argv) {
     /* STE 训练 */
     if (n_steps > 0) {
         int total_steps = total_schedule_steps > 0 ? total_schedule_steps : n_steps;
-        ste_train(&model, &dl, n_steps, base_lr, 50, batch_size, 64, 10, logic_lr, start_step, total_steps);
+        ste_train(&model, &dl, n_steps, base_lr, 50, batch_size, 64, 10, logic_lr, start_step, total_steps, logic_only);
     }
 
     /* 保存训练后权重 */
