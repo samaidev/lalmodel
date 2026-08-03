@@ -1147,12 +1147,17 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
         clock_gettime(CLOCK_MONOTONIC, &t_logic_start);
 
         if (n_valid > 0 || logic_only) {
-            /* 在 apply 之前加语义引导梯度,与训练梯度一起更新 */
-            float logic_loss = logic_guided_regularization(m, logic_lr);
-            /* v13: 同时给 attention 加 CORE/BINARY/PRUNE 引导.
-             * v12 attention 没有引导信号,导致 attn 权重留在 random init.
-             * 用更温和的 lr (logic_lr * 0.5) 防 attention 爆炸. */
-            float attn_loss = attn_logic_regularization(m, logic_lr * 0.5f);
+            /* v13k: 只在每 5 步做 logic_reg, 减少 80% 的 logic_reg 计算量
+             * logic_reg 是 GPU 瓶颈 (13.5s/step), 每 5 步做一次可降到 ~2.7s
+             * logic_lr 乘 5 补偿频率降低 */
+            int do_logic = (step % 5 == 0) || logic_only;
+            float effective_logic_lr = do_logic ? logic_lr * 5.0f : 0.0f;
+            float effective_attn_lr = do_logic ? logic_lr * 2.5f : 0.0f;
+            float logic_loss = 0, attn_loss = 0;
+            if (do_logic) {
+                logic_loss = logic_guided_regularization(m, effective_logic_lr);
+                attn_loss = attn_logic_regularization(m, effective_attn_lr);
+            }
             /* v13g: logic-only 模式下 n_valid=0, 用 batch_size=1 做 apply */
             int apply_batch = logic_only ? 1 : n_valid;
             model_batch_apply(m, lr, apply_batch);
