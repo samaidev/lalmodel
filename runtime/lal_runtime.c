@@ -432,6 +432,20 @@ float lr_schedule(int step, int warmup_steps, int total_steps, float base_lr) {
  * PRUNE outputs 0 (skipped). */
 void bin_forward_pure_float(float *y, const float *x, const BinLayer *bl) {
     int in = bl->in_dim, out = bl->out_dim;
+#ifdef LAL_CUDA
+    /* v13j: GPU acceleration for pure-float forward.
+     * Logic-guided layers: CORE/BINARY use w_float, PRUNE outputs 0.
+     * Non-logic layers: standard matmul. */
+    if (g_use_cuda && bl->w_float) {
+        if (bl->logic_mask) {
+            lal_cuda_bin_forward_pure_float_logic(y, x, bl);
+        } else {
+            extern void lal_cuda_matmul_f32(float*, const float*, const float*, const float*, int, int);
+            lal_cuda_matmul_f32(y, x, bl->w_float, bl->bias, in, out);
+        }
+        return;
+    }
+#endif
     if (bl->logic_mask) {
         int core_idx = 0;
         for (int j = 0; j < out; j++) {
