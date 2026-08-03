@@ -433,19 +433,9 @@ float lr_schedule(int step, int warmup_steps, int total_steps, float base_lr) {
 void bin_forward_pure_float(float *y, const float *x, const BinLayer *bl) {
     int in = bl->in_dim, out = bl->out_dim;
 #ifdef LAL_CUDA
-    /* v13k: Use resident GPU weights (uploaded once in model_load).
-     * Falls back to v13j per-call path if not uploaded. */
-    if (g_use_cuda && bl->w_float) {
-        if (bl->_gpu) {
-            lal_cuda_fwd_resident(y, x, bl);
-        } else if (bl->logic_mask) {
-            lal_cuda_bin_forward_pure_float_logic(y, x, bl);
-        } else {
-            extern void lal_cuda_matmul_f32(float*, const float*, const float*, const float*, int, int);
-            lal_cuda_matmul_f32(y, x, bl->w_float, bl->bias, in, out);
-        }
-        return;
-    }
+    /* v13m: GPU forward disabled for CE path (fwd_resident has cuBLAS sizing bug).
+     * logic_reg uses fused lal_cuda_layer_forward_batch instead.
+     * CE falls through to CPU. */
 #endif
     if (bl->logic_mask) {
         int core_idx = 0;
