@@ -1316,11 +1316,6 @@ float lal_cuda_full_forward(
         /* qkv = W_q @ norm1 (QKV merged) */
         LayerGPU *gq = (LayerGPU*)tl->attn_q._gpu;
         if (gq && gq->uploaded) {
-            if (gq->d_bias)
-                cudaMemcpyAsync(d_qkv, gq->d_bias, 3*n*4, cudaMemcpyDeviceToDevice, s);
-            else
-                cudaMemsetAsync(d_qkv, 0, 3*n*4, s);
-            beta = gq->d_bias ? 1.0f : 0.0f;
             k_matvec<<<(3*n+255)/256, 256, 0, s>>>(d_qkv, gq->d_w, d_n1, gq->d_bias, n, 3*n);
         }
         
@@ -1331,11 +1326,6 @@ float lal_cuda_full_forward(
         /* proj = W_o @ attn_out */
         LayerGPU *go = (LayerGPU*)tl->attn_o._gpu;
         if (go && go->uploaded) {
-            if (go->d_bias)
-                cudaMemcpyAsync(d_proj, go->d_bias, n*4, cudaMemcpyDeviceToDevice, s);
-            else
-                cudaMemsetAsync(d_proj, 0, n*4, s);
-            beta = go->d_bias ? 1.0f : 0.0f;
             k_matvec<<<(n+255)/256, 256, 0, s>>>(d_proj, go->d_w, d_ao, go->d_bias, n, n);
             if (go->d_mask)
                 k_zero_prune<<<(n+255)/256, 256, 0, s>>>(d_proj, go->d_mask, n);
@@ -1353,11 +1343,6 @@ float lal_cuda_full_forward(
         /* hidden = gelu(W_gate @ norm2) */
         LayerGPU *gg = (LayerGPU*)tl->mlp_gate._gpu;
         if (gg && gg->uploaded) {
-            if (gg->d_bias)
-                cudaMemcpyAsync(d_hid, gg->d_bias, mlp_dim*4, cudaMemcpyDeviceToDevice, s);
-            else
-                cudaMemsetAsync(d_hid, 0, mlp_dim*4, s);
-            beta = gg->d_bias ? 1.0f : 0.0f;
             k_matvec<<<(mlp_dim+255)/256, 256, 0, s>>>(d_hid, gg->d_w, d_n2, gg->d_bias, n, mlp_dim);
             if (gg->d_mask)
                 k_zero_prune<<<(mlp_dim+255)/256, 256, 0, s>>>(d_hid, gg->d_mask, mlp_dim);
@@ -1368,11 +1353,6 @@ float lal_cuda_full_forward(
         /* mlp_out = W_down @ hidden */
         LayerGPU *gd = (LayerGPU*)tl->mlp_down._gpu;
         if (gd && gd->uploaded) {
-            if (gd->d_bias)
-                cudaMemcpyAsync(d_mlp, gd->d_bias, n*4, cudaMemcpyDeviceToDevice, s);
-            else
-                cudaMemsetAsync(d_mlp, 0, n*4, s);
-            beta = gd->d_bias ? 1.0f : 0.0f;
             k_matvec<<<(n+255)/256, 256, 0, s>>>(d_mlp, gd->d_w, d_hid, gd->d_bias, mlp_dim, n);
         }
         
