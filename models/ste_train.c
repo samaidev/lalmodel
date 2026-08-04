@@ -24,6 +24,7 @@ static void decode_token(int id);
 static int prompt_tokenize(const char *text, int *tokens, int max_len);
 
 #include "../runtime/lal_runtime.h"
+#include "../runtime/lal_cuda.h"  /* v13p: GPU forward declarations */
 #define LAL_DATA_LOADER_IMPLEMENTATION
 #include "../runtime/lal_data_loader.h"
 #include "../runtime/lal_model_growth.h"
