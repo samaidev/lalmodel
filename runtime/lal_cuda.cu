@@ -1712,8 +1712,16 @@ void lal_cuda_full_backward(
 /* GPU kernel: simulate_activation for all pairs at once.
  * act[pair, j] = bias[j] + sum_i W[j*in+i] * gate[pair, i]
  * W is [out, in] row-major, gate is [batch, in], act is [batch, out].
- * This is a batched matvec: act = gate @ W^T
+ * This is a batched matvec: act = gelu(gate @ W^T + bias)
+ * BUG FIX: previously stored raw pre-activation (no gelu), mismatching CPU
+ * simulate_activation which applies gelu. This caused CUDA loss to be on a
+ * totally different scale from CPU, contributing to gradient explosion.
  * Each thread computes one (pair, j) element. */
+__device__ float d_gelu(float v) {
+    float c = 0.7978845608f * (v + 0.044715f * v * v * v);
+    return 0.5f * v * (1.0f + tanhf(c));
+}
+
 __global__ void k_sim_act_batch(float *act, const float *W, const float *bias,
                                   const float *gate, int in_dim, int out_dim,
                                   int batch, const uint8_t *mask) {
@@ -1729,7 +1737,8 @@ __global__ void k_sim_act_batch(float *act, const float *W, const float *bias,
     const float *g = gate + (size_t)pair * in_dim;
     for (int i = 0; i < in_dim; i++)
         s += wr[i] * g[i];
-    act[pair * out_dim + j] = s;
+    /* Apply gelu to match CPU simulate_activation */
+    act[pair * out_dim + j] = d_gelu(s);
 }
 
 /* GPU kernel: compute logic_reg loss + gradient accumulation.
@@ -1758,9 +1767,14 @@ __global__ void k_logic_grad_accum(
     if (j >= out_dim) return;
     if (mask && mask[j] == 2) return;  /* PRUNE: skip */
 
-    /* Aggregate loss + gradient across all pairs */
-    float total_grad_a = 0.0f;  /* accumulated grad for gate_a direction */
-    float total_grad_b = 0.0f;  /* accumulated grad for gate_b direction */
+    /* BUG FIX: Previously summed all pairs' gradients into total_grad_a/b,
+     * then applied the SAME total to each pair's gate input. This amplified
+     * the gradient by batch_size (7x). Now use per-pair gradients.
+     *
+     * Also fixed: CORE gate_b gradient was missing (-diff_grad - mag_grad_a)
+     * term, mismatching CPU logic_guided_regularization. */
+    float grad_a[16], grad_b[16];  /* batch=7, 16 is safe */
+    float total_bias = 0.0f;
 
     for (int p = 0; p < batch; p++) {
         float aa = act_a[p * out_dim + j];
@@ -1774,28 +1788,31 @@ __global__ void k_logic_grad_accum(
             float diff_grad = -alpha * 0.5f * s * (1.0f - tanh_adiff * tanh_adiff);
             float mag_grad_a = gamma * (aa > 0 ? 1.0f : -1.0f);
             float mag_grad_b = gamma * (ab > 0 ? 1.0f : -1.0f);
-            total_grad_a += (diff_grad + mag_grad_a) * inv_nc * layer_lr_scale * lr;
-            total_grad_b += mag_grad_b * inv_nc * layer_lr_scale * lr;
+            float scale = inv_nc * layer_lr_scale * lr;
+            /* Match CPU: ga[i] += grad_scale*(gate_a-gate_b) + mag_grad_b*scale*gate_b
+             *   grad_a = (diff_grad + mag_grad_a) * scale
+             *   grad_b = -(diff_grad + mag_grad_a) * scale + mag_grad_b * scale */
+            grad_a[p] = (diff_grad + mag_grad_a) * scale;
+            grad_b[p] = (-diff_grad - mag_grad_a + mag_grad_b) * scale;
         } else {  /* BINARY */
-            float grad_scale = beta * 2.0f * diff * inv_nb * layer_lr_scale * lr;
-            total_grad_a += grad_scale;
-            total_grad_b -= grad_scale;
+            float gs = beta * 2.0f * diff * inv_nb * layer_lr_scale * lr;
+            grad_a[p] = gs;
+            grad_b[p] = -gs;
         }
+        total_bias += grad_a[p] + grad_b[p];
     }
 
-    /* Accumulate: grad_accum[j*in + i] += total_grad_a * gate_a[p*in+i]
-     *                                + total_grad_b * gate_b[p*in+i]
-     * But gate_a/b differ per pair. Need to loop over pairs again. */
+    /* Accumulate per-pair gradients into grad_accum */
     float *ga = grad_accum + (size_t)j * in_dim;
     for (int p = 0; p < batch; p++) {
         const float *g_a = gate_a + (size_t)p * in_dim;
         const float *g_b = gate_b + (size_t)p * in_dim;
         for (int i = 0; i < in_dim; i++)
-            ga[i] += total_grad_a * g_a[i] + total_grad_b * g_b[i];
+            ga[i] += grad_a[p] * g_a[i] + grad_b[p] * g_b[i];
     }
 
     if (bias_grad_accum)
-        bias_grad_accum[j] += total_grad_a + total_grad_b;
+        bias_grad_accum[j] += total_bias;
 }
 
 /* v13r: GPU logic_guided_regularization.

@@ -106,6 +106,42 @@ static float logic_guided_regularization(Model *m, float lr) {
     }
 
     /* 预计算所有 emb (14 次,不是 112 次) */
+    for (int p = 0; p < (int)N_PROBE_PAIRS; p++) {
+        ConceptPair *cp = &probe_pairs[p];
+        get_concept_embedding(m, cp->bytes_a, &emb_cache_a[(size_t)p * n_embd], n_embd);
+        get_concept_embedding(m, cp->bytes_b, &emb_cache_b[(size_t)p * n_embd], n_embd);
+    }
+
+    /* BUG FIX: gate_cache 必须填充实际的 gate_input (LN2 输出)。
+     * 之前 gate_cache_a/b 只分配未填充,CUDA 和 CPU 路径都读到未初始化内存,
+     * 导致 simulate_activation 产生垃圾激活值,逻辑损失爆炸到 1e25。
+     * 使用 compute_all_gate_inputs 一次 forward 捕获所有层 gate_input (O(n) not O(n²))。 */
+    {
+        static float *tmp_gate = NULL;
+        static int tg_sz = 0;
+        int need_sz = n_layer * n_embd;
+        if (tg_sz != need_sz) {
+            free(tmp_gate);
+            tmp_gate = malloc((size_t)need_sz * sizeof(float));
+            tg_sz = need_sz;
+        }
+        int batch = (int)N_PROBE_PAIRS;
+        for (int p = 0; p < batch; p++) {
+            compute_all_gate_inputs(m, &emb_cache_a[(size_t)p * n_embd],
+                                    tmp_gate, n_embd, NULL, NULL);
+            for (int l = 0; l < n_layer; l++) {
+                memcpy(&gate_cache_a[((size_t)l * batch + p) * n_embd],
+                       &tmp_gate[(size_t)l * n_embd], n_embd * sizeof(float));
+            }
+            compute_all_gate_inputs(m, &emb_cache_b[(size_t)p * n_embd],
+                                    tmp_gate, n_embd, NULL, NULL);
+            for (int l = 0; l < n_layer; l++) {
+                memcpy(&gate_cache_b[((size_t)l * batch + p) * n_embd],
+                       &tmp_gate[(size_t)l * n_embd], n_embd * sizeof(float));
+            }
+        }
+    }
+
     /* v13r: GPU logic_reg — simulate_activation + grad_accum on GPU */
 #ifdef LAL_CUDA
     if (g_use_cuda) {
