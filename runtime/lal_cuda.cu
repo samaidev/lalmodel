@@ -1358,6 +1358,8 @@ __global__ void k_matvec(float *y, const float *W, const float *x,
 }
 
 extern "C"
+static float *d_lnfw=NULL,*d_lnfb=NULL,*d_pre_final_ln=NULL;
+
 float lal_cuda_full_forward(
     Model *m,
     const int *tokens,     /* host, [seq_len] */
@@ -1387,7 +1389,7 @@ float lal_cuda_full_forward(
     static float *d_mlp = NULL;     /* [n] mlp out */
     /* d_logits and d_wte are file-scope static (shared with backward) */
     static float *d_wpe = NULL;     /* [n_ctx * n] wpe on device */
-    static float *d_nw1=NULL,*d_nb1=NULL,*d_nw2=NULL,*d_nb2=NULL,*d_lnfw=NULL,*d_lnfb=NULL;
+    /* d_lnfw/d_lnfb/d_pre_final_ln are file-scope static (shared with backward) */
     static int d_cap = 0;
     
     int need = n > mlp_dim ? n : mlp_dim;
@@ -1406,7 +1408,6 @@ float lal_cuda_full_forward(
         cudaMalloc(&d_logits, vocab * sizeof(float));
         cudaMalloc(&d_nw1, n*4); cudaMalloc(&d_nb1, n*4);
         cudaMalloc(&d_nw2, n*4); cudaMalloc(&d_nb2, n*4);
-        cudaMalloc(&d_lnfw, n*4); cudaMalloc(&d_lnfb, n*4);
         /* Upload wte + wpe once */
         cudaMalloc(&d_wte, (size_t)vocab * n * sizeof(float));
         cudaMemcpy(d_wte, m->wte, (size_t)vocab * n * sizeof(float), cudaMemcpyHostToDevice);
@@ -1575,7 +1576,6 @@ void lal_cuda_full_backward(
      * For now skip wte gradient (it's updated by logic_reg separately). */
     
     /* 3. Proper final LayerNorm backward */
-    extern float *d_pre_final_ln;
     k_layernorm_backward<<<1, thr, 2*thr*sizeof(float), s>>>(
         d_grad_x, d_grad_x, d_pre_final_ln, d_lnfw, n);
     
@@ -1608,7 +1608,7 @@ void lal_cuda_full_backward(
         LayerGPU *gd = (LayerGPU*)tl->mlp_down._gpu;
         if (gd && gd->uploaded && tl->mlp_down.grad_accum) {
             /* Scale d_grad_x by rs for grad_mlp */
-            k_scale<<<(n+thr-1)/thr, thr, 0, s>>>(d_grad_x, rs);  /* grad_mlp = grad_x * rs */
+            k_scale<<<(n+thr-1)/thr, thr, 0, s>>>(d_grad_x, rs, n);  /* grad_mlp = grad_x * rs */
             k_grad_W_bias<<<(n+thr-1)/thr, thr, 0, s>>>(
                 tl->mlp_down.d_grad_accum, tl->mlp_down.d_bias_grad_accum,
                 d_grad_x, a->d_hid, mlp_dim, n);
