@@ -457,6 +457,7 @@ void lal_cuda_fwd_resident(float *y, const float *x, const BinLayer *bl) {
         if (d_x) { cudaFree(d_x); cudaFree(d_y); }
         cudaMalloc(&d_x, need * sizeof(float));
         cudaMalloc(&d_y, need * sizeof(float));
+        if (!d_nw1) { cudaMalloc(&d_nw1, n*4); cudaMalloc(&d_nb1, n*4); cudaMalloc(&d_nw2, n*4); cudaMalloc(&d_nb2, n*4); cudaMalloc(&d_lnfw, n*4); cudaMalloc(&d_lnfb, n*4); }
         d_cap = need;
     }
     /* Clear d_y to 0 first (in case bias is NULL, beta=0 still works) */
@@ -1359,6 +1360,7 @@ __global__ void k_matvec(float *y, const float *W, const float *x,
 
 extern "C"
 static float *d_lnfw=NULL,*d_lnfb=NULL,*d_pre_final_ln=NULL;
+static float *d_nw1=NULL,*d_nb1=NULL,*d_nw2=NULL,*d_nb2=NULL;
 
 float lal_cuda_full_forward(
     Model *m,
@@ -1406,8 +1408,6 @@ float lal_cuda_full_forward(
         cudaMalloc(&d_hid, mlp_dim * sizeof(float));
         cudaMalloc(&d_mlp, n * sizeof(float));
         cudaMalloc(&d_logits, vocab * sizeof(float));
-        cudaMalloc(&d_nw1, n*4); cudaMalloc(&d_nb1, n*4);
-        cudaMalloc(&d_nw2, n*4); cudaMalloc(&d_nb2, n*4);
         /* Upload wte + wpe once */
         cudaMalloc(&d_wte, (size_t)vocab * n * sizeof(float));
         cudaMemcpy(d_wte, m->wte, (size_t)vocab * n * sizeof(float), cudaMemcpyHostToDevice);
