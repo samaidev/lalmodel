@@ -436,10 +436,9 @@ void bin_forward_pure_float(float *y, const float *x, const BinLayer *bl) {
     /* v13o: Re-enabled GPU CE path. Fixed fwd_resident to use sgemm
      * instead of sgemv (sgemv had out-of-bounds for QKV merged out=3n).
      * 2x buffer cap for safety. */
-    if (g_use_cuda && bl->w_float && bl->_gpu) {
-        lal_cuda_fwd_resident(y, x, bl);
-        return;
-    }
+    /* v13q: fwd_resident disabled (sgemv OOB for QKV merged).
+     * logic_reg uses lal_cuda_compute_gate_inputs_batch (fused, no OOB).
+     * CE uses lal_cuda_full_forward. This CPU path is fallback only. */
 #endif
     if (bl->logic_mask) {
         int core_idx = 0;
