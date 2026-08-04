@@ -1216,6 +1216,7 @@ __global__ void k_matvec(float *y, const float *W, const float *x,
     y[j] = s;
 }
 
+extern "C"
 float lal_cuda_full_forward(
     Model *m,
     const int *tokens,     /* host, [seq_len] */
