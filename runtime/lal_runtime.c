@@ -259,17 +259,17 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
         memcpy(act->attn_out, act->v, n * sizeof(float));
     }
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
-    /* v13b: scale attention output to small perturbation (0.3 norm).
-     * Without this, ||proj_out||~27 dominates ||x||~1.8, collapsing all
-     * inputs to the same direction after 1 layer. */
+    /* v13d: scale attention output to moderate perturbation (0.3 norm).
+     * v13b used 0.1 (too conservative, only 0.5% direction change per layer).
+     * v13d uses 0.3 (4.2% direction change, allowing meaningful transformations).
+     * normalize_residual removed: pre-LN architecture handles normalization. */
     {
         float pn = 0;
         for (int i = 0; i < n; i++) pn += act->proj_out[i] * act->proj_out[i];
-        act->attn_scale = 0.1f / (sqrtf(pn) + 1e-8f);
+        act->attn_scale = 0.3f / (sqrtf(pn) + 1e-8f);
         for (int i = 0; i < n; i++) act->proj_out[i] *= act->attn_scale;
     }
     for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
-    normalize_residual(x, n, 1.0f);
 
     /* MLP */
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
@@ -302,15 +302,14 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_fwd(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    /* v13b: scale MLP output to small perturbation (0.3 norm) */
+    /* v13d: scale MLP output to moderate perturbation (0.3 norm) */
     {
         float mn = 0;
         for (int i = 0; i < n; i++) mn += act->mlp_out[i] * act->mlp_out[i];
-        act->mlp_scale = 0.1f / (sqrtf(mn) + 1e-8f);
+        act->mlp_scale = 0.3f / (sqrtf(mn) + 1e-8f);
         for (int i = 0; i < n; i++) act->mlp_out[i] *= act->mlp_scale;
     }
     for (int i = 0; i < n; i++) x[i] += rs * act->mlp_out[i];
-    normalize_residual(x, n, 1.0f);
 }
 
 /* Pure-float forward: same as trans_layer_forward but uses bin_forward_pure_float
@@ -348,15 +347,14 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
         memcpy(act->attn_out, act->v, n * sizeof(float));
 
     bin_forward_pure_float(act->proj_out, act->attn_out, &tl->attn_o);
-    /* v13b: scale attention output to small perturbation */
+    /* v13d: scale attention output to 0.3 norm, no normalize_residual */
     {
         float pn = 0;
         for (int i = 0; i < n; i++) pn += act->proj_out[i] * act->proj_out[i];
-        act->attn_scale = 0.1f / (sqrtf(pn) + 1e-8f);
+        act->attn_scale = 0.3f / (sqrtf(pn) + 1e-8f);
         for (int i = 0; i < n; i++) act->proj_out[i] *= act->attn_scale;
     }
     for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
-    normalize_residual(x, n, 1.0f);
 
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
     norm_forward(act->norm2_out, x, tl->norm2_w, tl->norm2_b, cfg->norm_type, n);
@@ -380,15 +378,14 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_forward_pure_float(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    /* v13b: scale MLP output to small perturbation */
+    /* v13d: scale MLP output to 0.3 norm, no normalize_residual */
     {
         float mn = 0;
         for (int i = 0; i < n; i++) mn += act->mlp_out[i] * act->mlp_out[i];
-        act->mlp_scale = 0.1f / (sqrtf(mn) + 1e-8f);
+        act->mlp_scale = 0.3f / (sqrtf(mn) + 1e-8f);
         for (int i = 0; i < n; i++) act->mlp_out[i] *= act->mlp_scale;
     }
     for (int i = 0; i < n; i++) x[i] += rs * act->mlp_out[i];
-    normalize_residual(x, n, 1.0f);
 }
 
 /* Global flag: use STE backward (updates w_float + repacks wbits) */
@@ -3136,15 +3133,14 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
 
     /* Output projection */
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
-    /* v13b: scale attention output to small perturbation */
+    /* v13d: scale attention output to 0.3 norm, no normalize_residual */
     {
         float pn = 0;
         for (int i = 0; i < n; i++) pn += act->proj_out[i] * act->proj_out[i];
-        act->attn_scale = 0.1f / (sqrtf(pn) + 1e-8f);
+        act->attn_scale = 0.3f / (sqrtf(pn) + 1e-8f);
         for (int i = 0; i < n; i++) act->proj_out[i] *= act->attn_scale;
     }
     for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
-    normalize_residual(x, n, 1.0f);
 
     /* Norm2 + MLP */
     memcpy(act->x_pre_norm2, x, n * sizeof(float));
@@ -3170,15 +3166,14 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_fwd(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    /* v13b: scale MLP output to small perturbation */
+    /* v13d: scale MLP output to 0.3 norm, no normalize_residual */
     {
         float mn = 0;
         for (int i = 0; i < n; i++) mn += act->mlp_out[i] * act->mlp_out[i];
-        act->mlp_scale = 0.1f / (sqrtf(mn) + 1e-8f);
+        act->mlp_scale = 0.3f / (sqrtf(mn) + 1e-8f);
         for (int i = 0; i < n; i++) act->mlp_out[i] *= act->mlp_scale;
     }
     for (int i = 0; i < n; i++) x[i] += rs * act->mlp_out[i];
-    normalize_residual(x, n, 1.0f);
 }
 
 /* ─── Stateful Inference: Begin New Session ─────────────────────── */
@@ -3975,15 +3970,25 @@ layer_done:
             int t = g_opt_step + 1;
             float bc1 = 1.0f - powf(g_adam_beta1, (float)t);
             float bc2 = 1.0f - powf(g_adam_beta2, (float)t);
+            float lr_norm = lr;  /* v13c: full LR for LayerNorm weights — Adam handles scaling */
             for (int i = 0; i < n; i++) {
-                /* norm1_w — BUG #50b: 完全冻结, 固定为 1.0
-                 * 之前 decay toward 1.0 无效 (梯度太大)
-                 * 现在直接不更新 norm1_w */
-                /* 跳过 norm1_w 更新 */
-                float g1w_unused = tl->grad_norm1_w[i];  /* 读取但不使用 */
-                (void)g1w_unused;
-                /* 强制 norm1_w = 1.0 */
-                tl->norm1_w[i] = 1.0f;
+                /* norm1_w — v13c: enable Adam training with reduced LR + clipping
+                 * Previous BUG #50: SGD with large gradients caused norm_w→0.
+                 * Fix: Adam naturally normalizes gradient scale; 0.1x LR adds safety margin. */
+                float g1w = tl->grad_norm1_w[i] * inv_batch;
+                if (fabsf(g1w) > 1e-12f) {
+                    tl->m_norm1_w[i] = g_adam_beta1 * tl->m_norm1_w[i] + (1.0f - g_adam_beta1) * g1w;
+                    tl->v_norm1_w[i] = g_adam_beta2 * tl->v_norm1_w[i] + (1.0f - g_adam_beta2) * g1w * g1w;
+                    float mh = tl->m_norm1_w[i] / bc1;
+                    float vh = sqrtf(tl->v_norm1_w[i] / bc2) + g_adam_eps;
+                    tl->norm1_w[i] -= lr_norm * mh / vh;
+                    /* v13g: revert to [0.5, 2.0] clip — v13f [0.95, 1.05] killed
+                     * core_diff (2.36→1.90). LN weight growth is BENEFICIAL:
+                     * it amplifies important feature dimensions, aiding concept
+                     * differentiation despite slightly higher cosine similarity. */
+                    if (tl->norm1_w[i] < 0.5f) tl->norm1_w[i] = 0.5f;
+                    if (tl->norm1_w[i] > 2.0f) tl->norm1_w[i] = 2.0f;
+                }
 
                 /* norm1_b */
                 float g1b = tl->grad_norm1_b[i] * inv_batch;
@@ -3992,10 +3997,20 @@ layer_done:
                     tl->v_norm1_b[i] = g_adam_beta2 * tl->v_norm1_b[i] + (1.0f - g_adam_beta2) * g1b * g1b;
                     float mh = tl->m_norm1_b[i] / bc1;
                     float vh = sqrtf(tl->v_norm1_b[i] / bc2) + g_adam_eps;
-                    tl->norm1_b[i] -= lr * mh / vh;
+                    tl->norm1_b[i] -= lr_norm * mh / vh;
                 }
-                /* norm2_w — BUG #50b: 完全冻结, 固定为 1.0 */
-                tl->norm2_w[i] = 1.0f;
+                /* norm2_w — v13c: enable Adam training with reduced LR + clipping */
+                float g2w = tl->grad_norm2_w[i] * inv_batch;
+                if (fabsf(g2w) > 1e-12f) {
+                    tl->m_norm2_w[i] = g_adam_beta1 * tl->m_norm2_w[i] + (1.0f - g_adam_beta1) * g2w;
+                    tl->v_norm2_w[i] = g_adam_beta2 * tl->v_norm2_w[i] + (1.0f - g_adam_beta2) * g2w * g2w;
+                    float mh = tl->m_norm2_w[i] / bc1;
+                    float vh = sqrtf(tl->v_norm2_w[i] / bc2) + g_adam_eps;
+                    tl->norm2_w[i] -= lr_norm * mh / vh;
+                    /* v13g: revert to [0.5, 2.0] clip */
+                    if (tl->norm2_w[i] < 0.5f) tl->norm2_w[i] = 0.5f;
+                    if (tl->norm2_w[i] > 2.0f) tl->norm2_w[i] = 2.0f;
+                }
 
                 /* norm2_b */
                 float g2b = tl->grad_norm2_b[i] * inv_batch;
@@ -4004,7 +4019,7 @@ layer_done:
                     tl->v_norm2_b[i] = g_adam_beta2 * tl->v_norm2_b[i] + (1.0f - g_adam_beta2) * g2b * g2b;
                     float mh = tl->m_norm2_b[i] / bc1;
                     float vh = sqrtf(tl->v_norm2_b[i] / bc2) + g_adam_eps;
-                    tl->norm2_b[i] -= lr * mh / vh;
+                    tl->norm2_b[i] -= lr_norm * mh / vh;
                 }
             }
         }
@@ -4026,6 +4041,9 @@ layer_done:
             float mhb = m->m_ln_f_b[i] / bc1, vhb = sqrtf(m->v_ln_f_b[i] / bc2) + g_adam_eps;
             m->ln_f_w[i] -= lr * mhw / vhw;
             m->ln_f_b[i] -= lr * mhb / vhb;
+            /* v13g: revert to [0.5, 2.0] clip */
+            if (m->ln_f_w[i] < 0.5f) m->ln_f_w[i] = 0.5f;
+            if (m->ln_f_w[i] > 2.0f) m->ln_f_w[i] = 2.0f;
         }
     }
 

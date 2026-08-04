@@ -270,7 +270,7 @@ static void compute_gate_input(Model *m, const float *initial_emb,
 
         /* Output projection + residual */
         bin_forward_pure_float(proj_out, attn_out, &tl->attn_o);
-        scale_to_norm(proj_out, n, 0.1f);
+        scale_to_norm(proj_out, n, 0.3f);
         for (int i = 0; i < n; i++) x[i] += rs * proj_out[i];
         clip_array(x, n, 10.0f);
 
@@ -292,7 +292,7 @@ static void compute_gate_input(Model *m, const float *initial_emb,
             for (int i = 0; i < mlp_dim; i++) hidden[i] = gelu(hidden[i]);
         }
         bin_forward_pure_float(mlp_out, hidden, &tl->mlp_down);
-        scale_to_norm(mlp_out, n, 0.1f);
+        scale_to_norm(mlp_out, n, 0.3f);
         for (int i = 0; i < n; i++) x[i] += rs * mlp_out[i];
         clip_array(x, n, 10.0f);
     }
@@ -367,7 +367,7 @@ static void compute_all_gate_inputs(Model *m, const float *initial_emb,
         memcpy(attn_out, v, n * sizeof(float));
 
         bin_forward_pure_float(proj_out, attn_out, &tl->attn_o);
-        scale_to_norm(proj_out, n, 0.1f);
+        scale_to_norm(proj_out, n, 0.3f);
         for (int i = 0; i < n; i++) x[i] += rs * proj_out[i];
         clip_array(x, n, 10.0f);
 
@@ -386,7 +386,7 @@ static void compute_all_gate_inputs(Model *m, const float *initial_emb,
             for (int i = 0; i < mlp_dim; i++) hidden[i] = gelu(hidden[i]);
         }
         bin_forward_pure_float(mlp_out, hidden, &tl->mlp_down);
-        scale_to_norm(mlp_out, n, 0.1f);
+        scale_to_norm(mlp_out, n, 0.3f);
         for (int i = 0; i < n; i++) x[i] += rs * mlp_out[i];
         clip_array(x, n, 10.0f);
     }
