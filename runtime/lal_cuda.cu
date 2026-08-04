@@ -388,6 +388,11 @@ int lal_cuda_upload_layer(BinLayer *bl) {
     }
     g->uploaded = 1;
     bl->_gpu = g;
+    /* v13s: allocate device grad_accum */
+    cudaMalloc(&bl->d_grad_accum, (size_t)in * out * sizeof(float));
+    cudaMalloc(&bl->d_bias_grad_accum, out * sizeof(float));
+    cudaMemset(bl->d_grad_accum, 0, (size_t)in * out * sizeof(float));
+    cudaMemset(bl->d_bias_grad_accum, 0, out * sizeof(float));
     return 0;
 }
 
@@ -415,6 +420,9 @@ void lal_cuda_free_layer(BinLayer *bl) {
     if (g->d_mask) cudaFree(g->d_mask);
     free(g);
     bl->_gpu = NULL;
+    /* v13s: free device grad_accum */
+    if (bl->d_grad_accum) { cudaFree(bl->d_grad_accum); bl->d_grad_accum = NULL; }
+    if (bl->d_bias_grad_accum) { cudaFree(bl->d_bias_grad_accum); bl->d_bias_grad_accum = NULL; }
 }
 
 /* v13k: Forward using resident weights + cuBLAS.
@@ -1497,22 +1505,10 @@ void lal_cuda_full_backward(
         /* grad_W_down[j*mlp+i] += grad_mlp[j] * hidden[i] */
         LayerGPU *gd = (LayerGPU*)tl->mlp_down._gpu;
         if (gd && gd->uploaded && tl->mlp_down.grad_accum) {
-            /* Need device grad_accum. For now, accumulate on host. */
-            /* Download grad_mlp and hidden, compute on CPU, upload grad_accum */
-            static float *h_gmlp = NULL, *h_hid = NULL;
-            if (!h_gmlp) { h_gmlp = (float*)malloc(n * sizeof(float)); h_hid = (float*)malloc(mlp_dim * sizeof(float)); }
-            cudaMemcpy(h_gmlp, d_grad_x, n * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_hid, a->d_hid, mlp_dim * sizeof(float), cudaMemcpyDeviceToHost);
-            
-            /* Accumulate grad_W_down and grad_bias on host */
-            float *ga = tl->mlp_down.grad_accum;
-            for (int j = 0; j < n; j++) {
-                float g = h_gmlp[j] * rs;
-                for (int i = 0; i < mlp_dim; i++)
-                    ga[(size_t)j * mlp_dim + i] += g * h_hid[i];
-                if (tl->mlp_down.bias_grad_accum)
-                    tl->mlp_down.bias_grad_accum[j] += g;
-            }
+            /* v13s: GPU accumulation to device grad_accum (no download!) */
+            k_grad_W_bias<<<(n+thr-1)/thr, thr, 0, s>>>(
+                tl->mlp_down.d_grad_accum, tl->mlp_down.d_bias_grad_accum,
+                d_grad_x, a->d_hid, mlp_dim, n);
             
             /* grad_hidden = W_down^T @ grad_mlp */
             k_matvec_T<<<(mlp_dim+thr-1)/thr, thr, 0, s>>>(a->d_hid, gd->d_w, d_grad_x, mlp_dim, n);
@@ -1526,20 +1522,10 @@ void lal_cuda_full_backward(
         /* grad_W_gate += grad_hidden outer norm2 */
         LayerGPU *gg = (LayerGPU*)tl->mlp_gate._gpu;
         if (gg && gg->uploaded && tl->mlp_gate.grad_accum) {
-            static float *h_ghid = NULL, *h_gn2 = NULL;
-            if (!h_ghid) { h_ghid = (float*)malloc(mlp_dim * sizeof(float)); h_gn2 = (float*)malloc(n * sizeof(float)); }
-            cudaMemcpy(h_ghid, a->d_hid, mlp_dim * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_gn2, a->d_n2, n * sizeof(float), cudaMemcpyDeviceToHost);
-            
-            float *ga = tl->mlp_gate.grad_accum;
-            for (int j = 0; j < mlp_dim; j++) {
-                if (tl->mlp_gate.logic_mask && tl->mlp_gate.logic_mask[j] == 2) continue;  /* PRUNE */
-                float g = h_ghid[j];
-                for (int i = 0; i < n; i++)
-                    ga[(size_t)j * n + i] += g * h_gn2[i];
-                if (tl->mlp_gate.bias_grad_accum)
-                    tl->mlp_gate.bias_grad_accum[j] += g;
-            }
+            /* v13s: GPU accumulation */
+            k_grad_W_bias<<<(mlp_dim+thr-1)/thr, thr, 0, s>>>(
+                tl->mlp_gate.d_grad_accum, tl->mlp_gate.d_bias_grad_accum,
+                a->d_hid, a->d_n2, n, mlp_dim);
             
             /* grad_norm2 = W_gate^T @ grad_hidden */
             k_matvec_T<<<(n+thr-1)/thr, thr, 0, s>>>(a->d_n2, gg->d_w, a->d_hid, n, mlp_dim);
@@ -1560,20 +1546,10 @@ void lal_cuda_full_backward(
         
         LayerGPU *go = (LayerGPU*)tl->attn_o._gpu;
         if (go && go->uploaded && tl->attn_o.grad_accum) {
-            static float *h_gproj = NULL, *h_gao = NULL;
-            if (!h_gproj) { h_gproj = (float*)malloc(n * sizeof(float)); h_gao = (float*)malloc(n * sizeof(float)); }
-            cudaMemcpy(h_gproj, d_grad_x, n * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_gao, a->d_ao, n * sizeof(float), cudaMemcpyDeviceToHost);
-            
-            float *ga = tl->attn_o.grad_accum;
-            for (int j = 0; j < n; j++) {
-                if (tl->attn_o.logic_mask && tl->attn_o.logic_mask[j] == 2) continue;
-                float g = h_gproj[j] * rs;
-                for (int i = 0; i < n; i++)
-                    ga[(size_t)j * n + i] += g * h_gao[i];
-                if (tl->attn_o.bias_grad_accum)
-                    tl->attn_o.bias_grad_accum[j] += g;
-            }
+            /* v13s: GPU accumulation */
+            k_grad_W_bias<<<(n+thr-1)/thr, thr, 0, s>>>(
+                tl->attn_o.d_grad_accum, tl->attn_o.d_bias_grad_accum,
+                d_grad_x, a->d_ao, n, n);
             
             /* grad_attn_out = W_o^T @ grad_proj */
             k_matvec_T<<<(n+thr-1)/thr, thr, 0, s>>>(a->d_ao, go->d_w, d_grad_x, n, n);
@@ -1584,22 +1560,15 @@ void lal_cuda_full_backward(
         /* For QKV merged: grad_W_qkv += grad_qkv outer norm1 */
         LayerGPU *gq = (LayerGPU*)tl->attn_q._gpu;
         if (gq && gq->uploaded && tl->attn_q.grad_accum) {
-            static float *h_gqkv = NULL, *h_gn1 = NULL;
-            if (!h_gqkv) { h_gqkv = (float*)malloc(3*n * sizeof(float)); h_gn1 = (float*)malloc(n * sizeof(float)); }
-            /* grad_qkv = 0, grad_qkv[2n:3n] = grad_attn_out */
-            memset(h_gqkv, 0, 3*n * sizeof(float));
-            cudaMemcpy(h_gqkv + 2*n, a->d_ao, n * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_gn1, a->d_n1, n * sizeof(float), cudaMemcpyDeviceToHost);
-            
-            float *ga = tl->attn_q.grad_accum;
-            for (int j = 0; j < 3*n; j++) {
-                float g = h_gqkv[j];
-                if (g == 0) continue;
-                for (int i = 0; i < n; i++)
-                    ga[(size_t)j * n + i] += g * h_gn1[i];
-                if (tl->attn_q.bias_grad_accum)
-                    tl->attn_q.bias_grad_accum[j] += g;
-            }
+            /* v13s: GPU accumulation — only V part (2n:3n) has gradient */
+            /* Upload grad_qkv to device (only V part nonzero) */
+            static float *d_gqkv = NULL;
+            if (!d_gqkv) cudaMalloc(&d_gqkv, 3*n*sizeof(float));
+            cudaMemsetAsync(d_gqkv, 0, 3*n*sizeof(float), s);
+            cudaMemcpyAsync(d_gqkv + 2*n, a->d_ao, n*sizeof(float), cudaMemcpyDeviceToDevice, s);
+            k_grad_W_bias<<<(3*n+thr-1)/thr, thr, 0, s>>>(
+                tl->attn_q.d_grad_accum, tl->attn_q.d_bias_grad_accum,
+                d_gqkv, a->d_n1, n, 3*n);
             
             /* grad_norm1 = W_q^T @ grad_qkv */
             /* Upload h_gqkv to device, then call k_matvec_T */
@@ -1821,22 +1790,9 @@ float lal_cuda_logic_reg(
         float inv_nb = nb > 0 ? 1.0f / sqrtf((float)nb / batch) : 0;
         float layer_lr_scale = (l == 0) ? 1.0f : 0.5f;
 
-        /* Gradient accumulation on GPU */
-        /* Need device grad_accum — but grad_accum is host memory.
-         * Upload grad_accum, accumulate, download back.
-         * Or: keep grad_accum on device permanently.
-         * For now: upload, accumulate, download (simpler). */
-        static float *d_grad_accum = NULL;
-        static float *d_bias_grad = NULL;
-        if (!d_grad_accum) {
-            cudaMalloc(&d_grad_accum, (size_t)out_dim * in_dim * sizeof(float));
-            cudaMalloc(&d_bias_grad, out_dim * sizeof(float));
-        }
-        cudaMemsetAsync(d_grad_accum, 0, (size_t)out_dim * in_dim * sizeof(float), s);
-        cudaMemsetAsync(d_bias_grad, 0, out_dim * sizeof(float), s);
-
+        /* v13s: Accumulate directly to device grad_accum (no H2D/D2H!) */
         k_logic_grad_accum<<<(out_dim + thr - 1) / thr, thr, 0, s>>>(
-            d_grad_accum, d_bias_grad,
+            fc->d_grad_accum, fc->d_bias_grad_accum,
             d_act_a, d_act_b,
             d_gate_a, d_gate_b,
             (const uint8_t*)d_mask,
@@ -1844,25 +1800,8 @@ float lal_cuda_logic_reg(
             alpha, beta, gamma,
             lr, inv_nc, inv_nb, layer_lr_scale
         );
-
-        /* Download and add to host grad_accum */
-        static float *h_grad = NULL;
-        if (!h_grad) h_grad = (float*)malloc((size_t)out_dim * in_dim * sizeof(float));
-        cudaMemcpyAsync(h_grad, d_grad_accum, (size_t)out_dim * in_dim * sizeof(float),
-                        cudaMemcpyDeviceToHost, s);
-        static float *h_bgrad = NULL;
-        if (!h_bgrad) h_bgrad = (float*)malloc(out_dim * sizeof(float));
-        cudaMemcpyAsync(h_bgrad, d_bias_grad, out_dim * sizeof(float),
-                        cudaMemcpyDeviceToHost, s);
-        cudaStreamSynchronize(s);
-
-        /* Add to host grad_accum */
-        for (int i = 0; i < out_dim * in_dim; i++)
-            fc->grad_accum[i] += h_grad[i];
-        if (fc->bias_grad_accum)
-            for (int j = 0; j < out_dim; j++)
-                fc->bias_grad_accum[j] += h_bgrad[j];
     }
 
     return total_loss / (batch * n_layer);
 }
+
