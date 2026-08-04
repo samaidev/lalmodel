@@ -3435,6 +3435,15 @@ void model_batch_apply(Model *m, float lr, int batch_size) {
                 if (bl->bias_grad_accum && bl->d_bias_grad_accum)
                     cudaMemcpy(bl->bias_grad_accum, bl->d_bias_grad_accum,
                         bl->out_dim * sizeof(float), 2);
+                /* v13u debug: check gradient magnitude */
+                if (l == 0 && b == 2) {
+                    float gmax = 0, gsum = 0;
+                    for (int i = 0; i < in * out && i < 100; i++) {
+                        gmax = fmaxf(gmax, fabsf(bl->grad_accum[i]));
+                        gsum += fabsf(bl->grad_accum[i]);
+                    }
+                    printf("[DBG] L0 mlp_gate grad: max=%.6f avg=%.6f (first 100)\n", gmax, gsum/100);
+                }
             }
 #endif
 
