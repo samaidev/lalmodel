@@ -912,12 +912,7 @@ static void compute_all_gate_inputs_batch(Model *m, const float *initial_embs,
         /* Batch matmul: qkv = attn_q @ norm1  (QKV merged, out=3n)
          * For non-merged, just do V projection. */
         if (m->cfg.qkv_merged) {
-#ifdef LAL_CUDA
-            if (g_use_cuda && tl->attn_q._gpu) {
-                lal_cuda_fwd_batch(qkv_b, norm1b, &tl->attn_q, batch);
-            } else
-#endif
-            for (int b = 0; b < batch; b++)
+for (int b = 0; b < batch; b++)
                 bin_forward_pure_float(&qkv_b[b*3*n], &norm1b[b*n], &tl->attn_q);
         } else {
 #ifdef LAL_CUDA

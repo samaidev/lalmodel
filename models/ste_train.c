@@ -116,16 +116,8 @@ static float logic_guided_regularization(Model *m, float lr) {
      * Output layout: [layer, batch, n_embd] (layer-major for coalesced GPU write). */
     int batch = (int)N_PROBE_PAIRS;
 
-#ifdef LAL_CUDA
-    if (g_use_cuda) {
-        /* GPU path: lal_cuda_compute_gate_inputs_batch does everything on GPU.
-         * Output: gate_cache_a/b [n_layer * batch * n_embd] */
-        lal_cuda_compute_gate_inputs_batch(m, emb_cache_a, batch, gate_cache_a, n_embd);
-        lal_cuda_compute_gate_inputs_batch(m, emb_cache_b, batch, gate_cache_b, n_embd);
-    } else
-#endif
+    /* v13q: logic_reg uses CPU (fwd_batch has cuBLAS param issues) */
     {
-        /* CPU fallback: v13l batch forward */
         static float *gate_cache_all = NULL;
         static int gca_n = 0, gca_layers = 0;
         if (gca_n != n_embd || gca_layers != n_layer) {
