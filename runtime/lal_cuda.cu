@@ -1238,6 +1238,64 @@ __global__ void k_layernorm_backward(float *grad_x, const float *grad_y,
     }
 }
 
+
+/* GPU kernel: softmax + CE gradient in one pass
+ * Pass 1: compute max via reduction (stored in d_max)
+ * Pass 2: exp(logits - max), sum via reduction (stored in d_sum)  
+ * Pass 3: grad_logits[i] = softmax[i] - (i==target ? 1 : 0)
+ * For simplicity: use 3 separate kernel launches with shared memory reduction. */
+
+/* Kernel: find max of logits[vocab] */
+__global__ void k_reduce_max(float *out, const float *in, int n) {
+    extern __shared__ float smem[];
+    float local = -1e30f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        local = fmaxf(local, in[i]);
+    smem[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] = fmaxf(smem[threadIdx.x], smem[threadIdx.x+s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[0] = smem[0];
+}
+
+/* Kernel: compute exp(logits-max) and sum */
+__global__ void k_exp_sum(float *out_sum, float *exp_logits, const float *logits, 
+                           const float *max_val, int n) {
+    extern __shared__ float smem[];
+    float local = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float e = expf(logits[i] - max_val[0]);
+        exp_logits[i] = e;
+        local += e;
+    }
+    smem[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x+s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out_sum[0] = smem[0];
+}
+
+/* Kernel: grad_logits = softmax - onehot(target) */
+__global__ void k_ce_grad_logits(float *grad_logits, const float *exp_logits,
+                                   const float *sum_val, int target, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float p = exp_logits[i] / sum_val[0];
+    grad_logits[i] = p - (i == target ? 1.0f : 0.0f);
+}
+
+
+/* GPU kernel: scale array by scalar */
+__global__ void k_scale(float *x, float scale, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    x[i] *= scale;
+}
+
 __global__ void k_gelu_grad(float *grad, const float *x, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -1438,7 +1496,10 @@ float lal_cuda_full_forward(
         k_mlp_cap_residual<<<1, thr, thr*sizeof(float), s>>>(d_x, d_mlp, rs, 0.5f, 3.0f, n);
     }
     
-    /* 3. Final layernorm */
+    /* 3. Final layernorm — cache pre-LN x for backward */
+    static float *d_pre_final_ln = NULL;
+    if (!d_pre_final_ln) cudaMalloc(&d_pre_final_ln, n * sizeof(float));
+    cudaMemcpyAsync(d_pre_final_ln, d_x, n*4, cudaMemcpyDeviceToDevice, s);
     cudaMemcpyAsync(d_lnfw, m->ln_f_w, n*4, cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(d_lnfb, m->ln_f_b, n*4, cudaMemcpyHostToDevice, s);
     k_batch_layernorm<<<1, thr, 0, s>>>(d_x, d_x, d_lnfw, d_lnfb, 1, n);
@@ -1499,27 +1560,12 @@ void lal_cuda_full_backward(
     /* Need max first — do on CPU side (already have h_logits from forward) */
     /* For simplicity: recompute softmax on GPU via two-pass */
     
-    /* Pass 1: compute exp(logits - max) into d_softmax */
-    /* We need max_l — use a reduction kernel or just pass from forward */
-    /* For now: download logits, compute softmax, upload grad_logits */
-    static float *h_logits = NULL;
-    if (!h_logits) h_logits = (float*)malloc(vocab * sizeof(float));
-    cudaMemcpy(h_logits, d_logits, vocab * sizeof(float), cudaMemcpyDeviceToHost);
-    
-    float max_l = h_logits[0];
-    for (int i = 1; i < vocab; i++)
-        if (h_logits[i] > max_l) max_l = h_logits[i];
-    float exp_sum = 0;
-    for (int i = 0; i < vocab; i++) {
-        h_logits[i] = expf(h_logits[i] - max_l);
-        exp_sum += h_logits[i];
-    }
-    float inv_sum = 1.0f / (exp_sum + 1e-12f);
-    for (int i = 0; i < vocab; i++) {
-        float p = h_logits[i] * inv_sum;
-        h_logits[i] = p - (i == target ? 1.0f : 0.0f);  /* grad_logits */
-    }
-    cudaMemcpy(d_grad_logits, h_logits, vocab * sizeof(float), cudaMemcpyHostToDevice);
+    /* v13u: GPU softmax + CE gradient (no CPU loops!) */
+    static float *d_max = NULL, *d_sum = NULL, *d_exp = NULL;
+    if (!d_max) { cudaMalloc(&d_max, 4); cudaMalloc(&d_sum, 4); cudaMalloc(&d_exp, vocab*4); }
+    k_reduce_max<<<1, 1024, 1024*4, s>>>(d_max, d_logits, vocab);
+    k_exp_sum<<<1, 1024, 1024*4, s>>>(d_sum, d_exp, d_logits, d_max, vocab);
+    k_ce_grad_logits<<<(vocab+255)/256, 256, 0, s>>>(d_grad_logits, d_exp, d_sum, target, vocab);
     
     /* 2. grad_x_final = wte^T @ grad_logits  (backprop through logits) */
     k_matvec_T<<<(n+thr-1)/thr, thr, 0, s>>>(d_grad_x, d_wte, d_grad_logits, n, vocab);
@@ -1528,9 +1574,10 @@ void lal_cuda_full_backward(
      * But final_hidden (d_x) was overwritten by final layernorm. We need pre-LN x.
      * For now skip wte gradient (it's updated by logic_reg separately). */
     
-    /* 3. Backprop through final layernorm (simplified: just pass grad through)
-     * TODO: proper layernorm backward. For now, scale by ln_f_w. */
-    k_residual_clip<<<(n+thr-1)/thr, thr, 0, s>>>(d_grad_x, d_grad_x, 1.0f, 1e10f, n);
+    /* 3. Proper final LayerNorm backward */
+    extern float *d_pre_final_ln;
+    k_layernorm_backward<<<1, thr, 2*thr*sizeof(float), s>>>(
+        d_grad_x, d_grad_x, d_pre_final_ln, d_lnfw, n);
     
     /* 4. Backprop through layers in reverse */
     for (int l = n_layer - 1; l >= 0; l--) {
@@ -1555,19 +1602,21 @@ void lal_cuda_full_backward(
         /* Actually we need: grad_mlp = grad_x, then grad_W_down += grad_mlp outer hidden,
          * grad_hidden = W_down^T @ grad_mlp, grad_x += rs * grad_hidden (undo residual is complex) */
         
-        /* Simplified backward (skip mlp_cap and normalize_residual gradients): */
-        
-        /* grad_mlp_out = grad_x (from residual path) */
-        /* grad_W_down[j*mlp+i] += grad_mlp[j] * hidden[i] */
+        /* v13u: MLP backward with rs scaling */
+        /* grad_mlp = grad_x * rs (residual scale) */
+        /* Note: mlp_cap and normalize_residual gradients are approximate */
         LayerGPU *gd = (LayerGPU*)tl->mlp_down._gpu;
         if (gd && gd->uploaded && tl->mlp_down.grad_accum) {
-            /* v13s: GPU accumulation to device grad_accum (no download!) */
+            /* Scale d_grad_x by rs for grad_mlp */
+            k_scale<<<(n+thr-1)/thr, thr, 0, s>>>(d_grad_x, rs);  /* grad_mlp = grad_x * rs */
             k_grad_W_bias<<<(n+thr-1)/thr, thr, 0, s>>>(
                 tl->mlp_down.d_grad_accum, tl->mlp_down.d_bias_grad_accum,
                 d_grad_x, a->d_hid, mlp_dim, n);
             
             /* grad_hidden = W_down^T @ grad_mlp */
             k_matvec_T<<<(mlp_dim+thr-1)/thr, thr, 0, s>>>(a->d_hid, gd->d_w, d_grad_x, mlp_dim, n);
+            /* Unscale d_grad_x back (undo rs for residual path) */
+            k_scale<<<(n+thr-1)/thr, thr, 0, s>>>(d_grad_x, 1.0f/rs, n);
         }
         
         /* GELU backward: grad_hidden *= gelu'(pre_gelu) */
@@ -1606,10 +1655,12 @@ void lal_cuda_full_backward(
         
         LayerGPU *go = (LayerGPU*)tl->attn_o._gpu;
         if (go && go->uploaded && tl->attn_o.grad_accum) {
-            /* v13s: GPU accumulation */
+            /* v13u: scale grad by rs for attn residual */
+            k_scale<<<(n+thr-1)/thr, thr, 0, s>>>(d_grad_x, rs, n);
             k_grad_W_bias<<<(n+thr-1)/thr, thr, 0, s>>>(
                 tl->attn_o.d_grad_accum, tl->attn_o.d_bias_grad_accum,
                 d_grad_x, a->d_ao, n, n);
+            k_scale<<<(n+thr-1)/thr, thr, 0, s>>>(d_grad_x, 1.0f/rs, n);
             
             /* grad_attn_out = W_o^T @ grad_proj */
             k_matvec_T<<<(n+thr-1)/thr, thr, 0, s>>>(a->d_ao, go->d_w, d_grad_x, n, n);
