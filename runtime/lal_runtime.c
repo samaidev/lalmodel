@@ -3624,7 +3624,8 @@ void model_batch_apply(Model *m, float lr, int batch_size) {
             }
 
 layer_done:
-            /* BUG #54 FIX 方案I + v10: 定期检查 W_v effective rank + decay 0.999
+            #ifndef LAL_CUDA
+/* BUG #54 FIX 方案I + v10: 定期检查 W_v effective rank + decay 0.999
              *
              * 根因: 正反馈循环让 W_v 退化为 rank-1
              * v8 step100 rank=300 (好), step200 rank=5 (退化)
@@ -3858,6 +3859,9 @@ layer_done:
                            g_opt_step, l, off_diag_o, diag_dev_o);
                 }
             }
+            
+#endif /* skip N^3 ortho reg in CUDA mode */
+
             /* Weight clipping + repack: per-neuron based on logic_mask.
              * CORE (float): ±2.0 — needs room for precise differentiation.
              * BINARY (sign): ±1.0 — must stay near ±1 for sign function.
