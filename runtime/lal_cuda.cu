@@ -444,7 +444,7 @@ void lal_cuda_fwd_resident(float *y, const float *x, const BinLayer *bl) {
      * sgemm optimization may access slightly beyond out elements). */
     static float *d_x = NULL, *d_y = NULL;
     static int d_cap = 0;
-    int need = (in > out ? in : out) * 2;
+    int need = (in > out ? in : out) * 4;  /* v13o: 4x cap for cuBLAS gemvx prefetch */
     if (need > d_cap) {
         if (d_x) { cudaFree(d_x); cudaFree(d_y); }
         cudaMalloc(&d_x, need * sizeof(float));
@@ -473,9 +473,10 @@ void lal_cuda_fwd_resident(float *y, const float *x, const BinLayer *bl) {
     }
     float alpha = 1.0f;
     float beta = g->d_bias ? 1.0f : 0.0f;
-    cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
-                out, 1, in, &alpha, g->d_w, in, d_x, in,
-                &beta, d_y, out);
+    /* v13o: use sgemv (correct for vector case). A=[lda=in,n=out] col-major.
+     * y = alpha * A^T * x + beta * y  (OP_T transposes A) */
+    cublasSgemv(h, CUBLAS_OP_T, in, out, &alpha, g->d_w, in, d_x, 1,
+                &beta, d_y, 1);
 
     /* Zero out PRUNE rows if logic_mask present */
     if (g->d_mask) {
@@ -510,7 +511,7 @@ void lal_cuda_bwd_resident(float *grad_x, const float *grad_y, const BinLayer *b
     /* v13o: 2x buffer cap + sgemm instead of sgemv (same fix as fwd) */
     static float *d_gy = NULL, *d_gx = NULL;
     static int d_cap_bwd = 0;
-    int need = (in > out ? in : out) * 2;
+    int need = (in > out ? in : out) * 4;
     if (need > d_cap_bwd) {
         if (d_gy) { cudaFree(d_gy); cudaFree(d_gx); }
         cudaMalloc(&d_gy, need * sizeof(float));
@@ -533,9 +534,9 @@ void lal_cuda_bwd_resident(float *grad_x, const float *grad_y, const BinLayer *b
      *               alpha, d_w, lda=in, d_gy, ldb=out,
      *               beta, d_gx, ldc=in) */
     float alpha = 1.0f, beta = 0.0f;
-    cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
-                in, 1, out, &alpha, g->d_w, in, d_gy, out,
-                &beta, d_gx, in);
+    /* grad_x[in] = W_cm[in,out] @ grad_y[out], OP_N (no transpose) */
+    cublasSgemv(h, CUBLAS_OP_N, in, out, &alpha, g->d_w, in, d_gy, 1,
+                &beta, d_gx, 1);
 
     CUDA_CHECK(cudaMemcpy(grad_x, d_gx, in * sizeof(float), cudaMemcpyDeviceToHost));
 }

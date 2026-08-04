@@ -22,7 +22,7 @@ for fn in ['data/cognitive_foundation.jsonl', 'data/concept_boundary.jsonl', 'da
                 except: pass
 
 # 2. lal 短句数据
-for fn in ['../lal/data/train.jsonl', '../lal/data/stages/stage0_basics.jsonl']:
+for fn in ['lal/data/train.jsonl', 'lal/data/stages/stage0_basics.jsonl']:
     if os.path.exists(fn):
         with open(fn) as f:
             for line in f:
@@ -35,7 +35,7 @@ for fn in ['../lal/data/train.jsonl', '../lal/data/stages/stage0_basics.jsonl']:
 
 # 3. lal 长推理数据 (编程问答)
 prog_texts = []
-for fn in ['../lal/data/stages/prog_stage1.jsonl', '../lal/data/stages/prog_stage2.jsonl']:
+for fn in ['lal/data/stages/prog_stage1.jsonl', 'lal/data/stages/prog_stage2.jsonl']:
     if os.path.exists(fn):
         with open(fn) as f:
             for line in f:
