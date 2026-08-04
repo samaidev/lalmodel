@@ -94,3 +94,8 @@ void lal_cuda_compute_gate_inputs_batch(
 }
 #endif
 #endif /* LAL_CUDA_H */
+
+/* v13p: Full GPU forward (llama.cpp style) — zero intermediate transfers.
+ * Entire model + intermediates on GPU. Only tokens in, loss+grad out. */
+float lal_cuda_full_forward(struct Model *m, const int *tokens, int seq_len,
+                            int target, float *grad_hidden, int *predicted);

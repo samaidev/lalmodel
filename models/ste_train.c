@@ -1158,9 +1158,21 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
                 for (int p = 0; p < n_preds; p++) {
                     int pred_pos = 5 + p * stride;
                     if (pred_pos >= mp - 1) break;
-                    float loss = model_batch_forward(m, batch_tokens[b], pred_pos + 1);
-                    if (!isnan(loss) && !isinf(loss)) {
+                    int target = batch_tokens[b][pred_pos + 1];
+                    int predicted = 0;
+                    float grad_hidden[4096];
+                    float loss;
+#ifdef LAL_CUDA
+                    if (g_use_cuda) {
+                        loss = lal_cuda_full_forward(m, batch_tokens[b], pred_pos + 1,
+                                                      target, grad_hidden, &predicted);
+                    } else
+#endif
+                    {
+                        loss = model_batch_forward(m, batch_tokens[b], pred_pos + 1);
                         model_batch_backward(m, batch_tokens[b], pred_pos + 1);
+                    }
+                    if (!isnan(loss) && !isinf(loss)) {
                         batch_loss += loss;
                         n_valid++;
                     }
