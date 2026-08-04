@@ -1602,7 +1602,11 @@ void lal_cuda_full_backward(
             }
             
             /* grad_norm1 = W_q^T @ grad_qkv */
-            k_matvec_T<<<(n+thr-1)/thr, thr, 0, s>>>(a->d_n1, gq->d_w, h_gqkv, n, 3*n);
+            /* Upload h_gqkv to device, then call k_matvec_T */
+            static float *d_gqkv = NULL;
+            if (!d_gqkv) cudaMalloc(&d_gqkv, 3*n*sizeof(float));
+            cudaMemcpyAsync(d_gqkv, h_gqkv, 3*n*sizeof(float), cudaMemcpyHostToDevice, s);
+            k_matvec_T<<<(n+thr-1)/thr, thr, 0, s>>>(a->d_n1, gq->d_w, d_gqkv, n, 3*n);
             /* Wait, h_gqkv is host. Need to upload. Simplify: skip norm1 backward for now. */
         }
         
