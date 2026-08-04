@@ -1,0 +1,586 @@
+[*] Loaded 32768 vocab pieces from tokenizer/chinese_bpe.vocab
+=== LAL STE Whitebox-Supervised Training ===
+
+[*] Method: Straight-Through Estimator + CORE/BINARY/PRUNE Logic Guidance
+[*]   forward:  CORE = w_float * core_gain * K     (精确计算)
+[*]             BINARY = sign(w) * alpha * K       (二值符号)
+[*]             PRUNE = 0                           (静默剪枝)
+[*]   backward: STE through w_float (CORE+BINARY), PRUNE 无梯度
+[*]   update:   Adam on w_float
+[*] Logic Guidance (每步,全层):
+[*]             CORE  → maximize |act(a) - act(b)|  (差异化反义词)
+[*]             BINARY → minimize (act(a) - act(b))^2 (收敛共性)
+[*]             PRUNE → skip (保持静默)
+[*] Whitebox probe: every 10 steps observe CORE/BINARY/PRUNE circuit
+
+[*] Loaded 69990 samples from data/general_bpe.bin
+[*] Using Phase 1: Sprout (10L/512d) (~35M params, vocab=32768)
+[*] Generated Phase 1: Sprout (10L/512d) weights: 10 layers, 512 embd, ~35M params
+[*] Logic mask: Phase 2: Standard (20/70/10) (CORE=20% PRUNE=10%)
+[*] loaded 124 tensors
+[*] binarizing 10 layers (logic-guided)...
+    [logic] CORE=307 (20%), BINARY=1076 (70%), PRUNE=153 (10%)
+[*] done
+[*] freed 40 weight tensors (126 MB) after binarization
+[*] Model loaded: 10 layers, 512 embd, k_cache=YES
+
+
+=== LAL STE Training (B=4, max_pos=64, steps=100, start_step=0, total_sched=300, logic_lr=3.0000, logic_only=1) ===
+[*] STE: forward=sign(w), backward=w_float gradient
+[*] Whitebox probe every 10 steps
+[*] Semantic regularization every step
+[*] LOGIC-ONLY MODE: skipping CE loss, only concept-pair regularization (curriculum stage 1)
+
+  [LOGIC] mlp=-128.4296 attn=-14.6714
+  step     0/100 (global=0)  loss=0.0000  avg=0.0000  lr=0.000040  B=0  5866ms
+  [WB] boundary=97/100  core_diff=0.3405  bin_diff=0.3044  ratio=1.12  prune_act=0.0000
+  [WB] structure=14/20 (70%)  opp_sim=0.026
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=-636.2014 attn=-65.2199
+  step    10/100 (global=10)  loss=0.0000  avg=0.0000  lr=0.000440  B=0  5811ms
+  [WB] boundary=97/100  core_diff=1.4822  bin_diff=0.1878  ratio=7.89  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.026
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=-1048.8884 attn=-117.7843
+  step    20/100 (global=20)  loss=0.0000  avg=0.0000  lr=0.000840  B=0  5722ms
+  [WB] boundary=97/100  core_diff=3.4368  bin_diff=0.1451  ratio=23.68  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.026
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=-1033.6669 attn=-131.1294
+  step    30/100 (global=30)  loss=0.0000  avg=0.0000  lr=0.001240  B=0  5651ms
+  [WB] boundary=97/100  core_diff=4.2418  bin_diff=0.0971  ratio=43.68  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.026
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=-1050.0953 attn=-129.3149
+  step    40/100 (global=40)  loss=0.0000  avg=0.0000  lr=0.001640  B=0  5616ms
+  [WB] boundary=97/100  core_diff=2.8607  bin_diff=0.0703  ratio=40.71  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.026
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+    [plan-I] step 49 W_v approx_rank=22.3 (frob=21.98 max_row=0.99)
+    [ortho] step 49 L0 W_v off_diag=9.99 diag_dev=1.7435
+    [ortho] step 49 L0 W_o off_diag=28.31 diag_dev=0.6703
+    [plan-I] step 49 W_v approx_rank=22.2 (frob=21.95 max_row=0.99)
+    [ortho] step 49 L1 W_v off_diag=10.21 diag_dev=1.8989
+    [ortho] step 49 L1 W_o off_diag=22.40 diag_dev=0.9099
+    [plan-I] step 49 W_v approx_rank=22.2 (frob=21.93 max_row=0.99)
+    [ortho] step 49 L2 W_v off_diag=10.14 diag_dev=2.0197
+    [ortho] step 49 L2 W_o off_diag=21.94 diag_dev=1.0039
+    [plan-I] step 49 W_v approx_rank=22.3 (frob=21.99 max_row=0.99)
+    [ortho] step 49 L3 W_v off_diag=10.16 diag_dev=1.7167
+    [ortho] step 49 L3 W_o off_diag=21.86 diag_dev=1.0549
+    [plan-I] step 49 W_v approx_rank=22.2 (frob=21.94 max_row=0.99)
+    [ortho] step 49 L4 W_v off_diag=10.87 diag_dev=1.9728
+    [ortho] step 49 L4 W_o off_diag=22.64 diag_dev=1.0962
+    [plan-I] step 49 W_v approx_rank=22.2 (frob=21.94 max_row=0.99)
+    [ortho] step 49 L5 W_v off_diag=11.00 diag_dev=1.9977
+    [ortho] step 49 L5 W_o off_diag=22.89 diag_dev=1.1013
+    [plan-I] step 49 W_v approx_rank=22.3 (frob=21.96 max_row=0.99)
+    [ortho] step 49 L6 W_v off_diag=10.26 diag_dev=1.8670
+    [ortho] step 49 L6 W_o off_diag=23.30 diag_dev=1.1885
+    [plan-I] step 49 W_v approx_rank=22.2 (frob=21.94 max_row=0.99)
+    [ortho] step 49 L7 W_v off_diag=10.52 diag_dev=1.9825
+    [ortho] step 49 L7 W_o off_diag=23.02 diag_dev=1.1771
+    [plan-I] step 49 W_v approx_rank=22.2 (frob=21.94 max_row=0.99)
+    [ortho] step 49 L8 W_v off_diag=10.72 diag_dev=1.9800
+    [ortho] step 49 L8 W_o off_diag=22.86 diag_dev=1.1984
+    [plan-I] step 49 W_v approx_rank=22.2 (frob=21.93 max_row=0.99)
+    [ortho] step 49 L9 W_v off_diag=11.06 diag_dev=2.0074
+    [ortho] step 49 L9 W_o off_diag=23.40 diag_dev=1.2124
+  [LOGIC] mlp=-1035.4393 attn=-123.4453
+  step    50/100 (global=50)  loss=0.0000  avg=0.0000  lr=0.002000  B=0  5597ms
+  [WB] boundary=97/100  core_diff=3.1680  bin_diff=0.0619  ratio=51.18  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.026
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+[*] stateful inference started: window=9996, sinks=4, ctx=10240
+[*] sliding window configured: W=9996, sinks=4 (effective context: 10000)
+  [TRACE] "冷": L0[||x||=0.87 C409(+38.01--19.82) B1435(+124.67--64.22) P204(max0.000)] L5[||x||=3.00 C409(+140.23--23.86) B1435(+140.42--72.15) P204(max0.000)] L9[||x||=3.00 C409(+90.86--25.57) B1435(+146.50--68.88) P204(max0.000)] | H=14.76/15 top3=31568 10817 4293 
+  [LOGIC] mlp=-993.9666 attn=-119.2588
+  step    60/100 (global=60)  loss=0.0000  avg=0.0000  lr=0.001992  B=0  5585ms
+  [WB] boundary=97/100  core_diff=3.3526  bin_diff=0.0495  ratio=67.77  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.026
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=-961.5192 attn=-117.6512
+  step    70/100 (global=70)  loss=0.0000  avg=0.0000  lr=0.001969  B=0  5572ms
+  [WB] boundary=97/100  core_diff=3.2759  bin_diff=0.0488  ratio=67.16  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.026
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=-856.3163 attn=-115.3199
+  step    80/100 (global=80)  loss=0.0000  avg=0.0000  lr=0.001930  B=0  5561ms
+  [WB] boundary=97/100  core_diff=3.1343  bin_diff=0.0487  ratio=64.38  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.026
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=-832.8290 attn=-119.1981
+  step    90/100 (global=90)  loss=0.0000  avg=0.0000  lr=0.001876  B=0  5545ms
+  [WB] boundary=97/100  core_diff=3.1434  bin_diff=0.0475  ratio=66.20  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.026
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+    [plan-I] step 99 W_v approx_rank=22.4 (frob=22.38 max_row=1.00)
+    [ortho] step 99 L0 W_v off_diag=1.26 diag_dev=0.2923
+    [ortho] step 99 L0 W_o off_diag=21.98 diag_dev=0.1093
+    [plan-I] step 99 W_v approx_rank=22.4 (frob=22.34 max_row=1.00)
+    [ortho] step 99 L1 W_v off_diag=2.10 diag_dev=0.3933
+    [ortho] step 99 L1 W_o off_diag=11.75 diag_dev=0.0673
+    [plan-I] step 99 W_v approx_rank=22.4 (frob=22.32 max_row=1.00)
+    [ortho] step 99 L2 W_v off_diag=1.53 diag_dev=0.4198
+    [ortho] step 99 L2 W_o off_diag=11.15 diag_dev=0.0948
+    [plan-I] step 99 W_v approx_rank=22.4 (frob=22.38 max_row=1.00)
+    [ortho] step 99 L3 W_v off_diag=1.24 diag_dev=0.2806
+    [ortho] step 99 L3 W_o off_diag=17.86 diag_dev=0.0868
+    [plan-I] step 99 W_v approx_rank=22.4 (frob=22.35 max_row=1.00)
+    [ortho] step 99 L4 W_v off_diag=1.36 diag_dev=0.3438
+    [ortho] step 99 L4 W_o off_diag=18.26 diag_dev=0.0924
+    [plan-I] step 99 W_v approx_rank=22.4 (frob=22.34 max_row=1.00)
+    [ortho] step 99 L5 W_v off_diag=1.70 diag_dev=0.3787
+    [ortho] step 99 L5 W_o off_diag=17.16 diag_dev=0.0945
+    [plan-I] step 99 W_v approx_rank=22.4 (frob=22.34 max_row=1.00)
+    [ortho] step 99 L6 W_v off_diag=2.26 diag_dev=0.3822
+    [ortho] step 99 L6 W_o off_diag=17.98 diag_dev=0.1285
+    [plan-I] step 99 W_v approx_rank=22.4 (frob=22.33 max_row=1.00)
+    [ortho] step 99 L7 W_v off_diag=1.73 diag_dev=0.3943
+    [ortho] step 99 L7 W_o off_diag=18.20 diag_dev=0.1263
+    [plan-I] step 99 W_v approx_rank=22.4 (frob=22.34 max_row=1.00)
+    [ortho] step 99 L8 W_v off_diag=1.53 diag_dev=0.3838
+    [ortho] step 99 L8 W_o off_diag=18.02 diag_dev=0.1404
+    [plan-I] step 99 W_v approx_rank=22.4 (frob=22.32 max_row=1.00)
+    [ortho] step 99 L9 W_v off_diag=2.33 diag_dev=0.4210
+    [ortho] step 99 L9 W_o off_diag=19.25 diag_dev=0.1667
+  step    99/100 (global=99)  loss=0.0000  avg=0.0000  lr=0.001816  B=0  5526ms
+
+[*] STE training done in 552.6s (5525.9 ms/step)
+[*] Best recent loss: 0.0000
+
+[*] Saving trained weights to model_v13g.ste...
+[*] Saved 214410264 bytes
+=== Post-Training Whitebox Analysis (surface) ===
+
+=== LAL Whitebox Probe (step checkpoint) ===
+Model: 10L, 512 embd, 2048 mlp
+
+--- Embedding Concept Boundary ---
+
+        热  冷  大  小  上  下  亮  暗  重  轻  快  慢  湿  干
+  热  +1.00 -0.01 -0.05 +0.04 +0.08 -0.05 -0.03 -0.02 +0.06 -0.05 +0.09 +0.02 -0.09 -0.03
+  冷  -0.01 +1.00 -0.06 +0.01 +0.03 +0.03 +0.06 -0.00 -0.01 -0.05 -0.03 -0.08 -0.04 -0.02
+  大  -0.05 -0.06 +1.00 +0.02 -0.05 -0.06 +0.04 -0.06 -0.06 -0.03 -0.06 +0.01 +0.08 +0.01
+  小  +0.04 +0.01 +0.02 +1.00 +0.03 -0.01 +0.08 +0.01 +0.03 +0.08 +0.03 +0.01 -0.01 +0.02
+  上  +0.08 +0.03 -0.05 +0.03 +1.00 +0.02 +0.01 -0.04 -0.03 +0.02 +0.01 -0.01 +0.05 +0.05
+  下  -0.05 +0.03 -0.06 -0.01 +0.02 +1.00 -0.01 +0.03 +0.01 -0.01 -0.08 +0.01 -0.13 -0.04
+  亮  -0.03 +0.06 +0.04 +0.08 +0.01 -0.01 +1.00 -0.01 -0.03 -0.03 -0.12 +0.02 -0.02 -0.00
+  暗  -0.02 -0.00 -0.06 +0.01 -0.04 +0.03 -0.01 +1.00 -0.05 -0.04 +0.03 +0.02 -0.05 +0.02
+  重  +0.06 -0.01 -0.06 +0.03 -0.03 +0.01 -0.03 -0.05 +1.00 -0.05 +0.02 -0.01 +0.05 -0.05
+  轻  -0.05 -0.05 -0.03 +0.08 +0.02 -0.01 -0.03 -0.04 -0.05 +1.00 -0.01 +0.12 -0.01 +0.05
+  快  +0.09 -0.03 -0.06 +0.03 +0.01 -0.08 -0.12 +0.03 +0.02 -0.01 +1.00 +0.00 -0.04 +0.01
+  慢  +0.02 -0.08 +0.01 +0.01 -0.01 +0.01 +0.02 +0.02 -0.01 +0.12 +0.00 +1.00 +0.00 +0.09
+  湿  -0.09 -0.04 +0.08 -0.01 +0.05 -0.13 -0.02 -0.05 +0.05 -0.01 -0.04 +0.00 +1.00 +0.21
+  干  -0.03 -0.02 +0.01 +0.02 +0.05 -0.04 -0.00 +0.02 -0.05 +0.05 +0.01 +0.09 +0.21 +1.00
+
+  Opposite pairs (boundary clarity):
+    热 vs 冷: -0.0118 CLEAR
+    大 vs 小: +0.0210 CLEAR
+    上 vs 下: +0.0201 CLEAR
+    亮 vs 暗: -0.0074 CLEAR
+    重 vs 轻: -0.0500 CLEAR
+    快 vs 慢: +0.0028 CLEAR
+    湿 vs 干: +0.2053 CLEAR
+
+  Boundary score: 97/100 (STRONG)
+
+--- CORE Activation (simulated, layer 0) ---
+
+  热 vs 冷: CORE diff=3.1843 act=3.1745 OK | BIN diff=0.0306 | PRUNE act=0.0000
+  大 vs 小: CORE diff=3.1418 act=3.0759 OK | BIN diff=0.0412 | PRUNE act=0.0000
+  上 vs 下: CORE diff=3.1692 act=3.1371 OK | BIN diff=0.0358 | PRUNE act=0.0000
+  亮 vs 暗: CORE diff=3.1265 act=3.0089 OK | BIN diff=0.0524 | PRUNE act=0.0000
+  重 vs 轻: CORE diff=3.0781 act=2.9943 OK | BIN diff=0.0546 | PRUNE act=0.0000
+  快 vs 慢: CORE diff=3.1837 act=3.1144 OK | BIN diff=0.0416 | PRUNE act=0.0000
+  湿 vs 干: CORE diff=3.1700 act=3.1950 OK | BIN diff=0.0620 | PRUNE act=0.0000
+
+--- Weight Structure ---
+
+  L0 mlp: CORE=0.8287 BIN=0.3787 PRUNE=0.1338 OK | attn: CORE=0.7254 BIN=0.7166 PRUNE=0.4201 OK
+  L1 mlp: CORE=0.8896 BIN=0.4126 PRUNE=0.1334 OK | attn: CORE=0.7187 BIN=0.7148 PRUNE=0.4617 OK
+  ... (layers 2-8) ...
+  L9 mlp: CORE=1.1857 BIN=0.5591 PRUNE=0.1335 OK | attn: CORE=0.7211 BIN=0.7120 PRUNE=0.4806 OK
+
+  Structure: 85% OK (17/20)
+
+--- Embedding Concept Boundary ---
+
+        热  冷  大  小  上  下  亮  暗  重  轻  快  慢  湿  干
+  热  +1.00 -0.01 -0.05 +0.04 +0.08 -0.05 -0.03 -0.02 +0.06 -0.05 +0.09 +0.02 -0.09 -0.03
+  冷  -0.01 +1.00 -0.06 +0.01 +0.03 +0.03 +0.06 -0.00 -0.01 -0.05 -0.03 -0.08 -0.04 -0.02
+  大  -0.05 -0.06 +1.00 +0.02 -0.05 -0.06 +0.04 -0.06 -0.06 -0.03 -0.06 +0.01 +0.08 +0.01
+  小  +0.04 +0.01 +0.02 +1.00 +0.03 -0.01 +0.08 +0.01 +0.03 +0.08 +0.03 +0.01 -0.01 +0.02
+  上  +0.08 +0.03 -0.05 +0.03 +1.00 +0.02 +0.01 -0.04 -0.03 +0.02 +0.01 -0.01 +0.05 +0.05
+  下  -0.05 +0.03 -0.06 -0.01 +0.02 +1.00 -0.01 +0.03 +0.01 -0.01 -0.08 +0.01 -0.13 -0.04
+  亮  -0.03 +0.06 +0.04 +0.08 +0.01 -0.01 +1.00 -0.01 -0.03 -0.03 -0.12 +0.02 -0.02 -0.00
+  暗  -0.02 -0.00 -0.06 +0.01 -0.04 +0.03 -0.01 +1.00 -0.05 -0.04 +0.03 +0.02 -0.05 +0.02
+  重  +0.06 -0.01 -0.06 +0.03 -0.03 +0.01 -0.03 -0.05 +1.00 -0.05 +0.02 -0.01 +0.05 -0.05
+  轻  -0.05 -0.05 -0.03 +0.08 +0.02 -0.01 -0.03 -0.04 -0.05 +1.00 -0.01 +0.12 -0.01 +0.05
+  快  +0.09 -0.03 -0.06 +0.03 +0.01 -0.08 -0.12 +0.03 +0.02 -0.01 +1.00 +0.00 -0.04 +0.01
+  慢  +0.02 -0.08 +0.01 +0.01 -0.01 +0.01 +0.02 +0.02 -0.01 +0.12 +0.00 +1.00 +0.00 +0.09
+  湿  -0.09 -0.04 +0.08 -0.01 +0.05 -0.13 -0.02 -0.05 +0.05 -0.01 -0.04 +0.00 +1.00 +0.21
+  干  -0.03 -0.02 +0.01 +0.02 +0.05 -0.04 -0.00 +0.02 -0.05 +0.05 +0.01 +0.09 +0.21 +1.00
+
+  Opposite pairs (boundary clarity):
+    热 vs 冷: -0.0118 CLEAR
+    大 vs 小: +0.0210 CLEAR
+    上 vs 下: +0.0201 CLEAR
+    亮 vs 暗: -0.0074 CLEAR
+    重 vs 轻: -0.0500 CLEAR
+    快 vs 慢: +0.0028 CLEAR
+    湿 vs 干: +0.2053 CLEAR
+
+  Boundary score: 97/100 (STRONG)
+
+--- Concept Similarity (mid-layer weights) ---
+
+  Embedding similarity:
+        热  冷  大  小  上  下  亮  暗  重  轻  快  慢  湿  干
+  热  +1.00 -0.01 -0.05 +0.04 +0.08 -0.05 -0.03 -0.02 +0.06 -0.05 +0.09 +0.02 -0.09 -0.03
+  冷  -0.01 +1.00 -0.06 +0.01 +0.03 +0.03 +0.06 -0.00 -0.01 -0.05 -0.03 -0.08 -0.04 -0.02
+  大  -0.05 -0.06 +1.00 +0.02 -0.05 -0.06 +0.04 -0.06 -0.06 -0.03 -0.06 +0.01 +0.08 +0.01
+  小  +0.04 +0.01 +0.02 +1.00 +0.03 -0.01 +0.08 +0.01 +0.03 +0.08 +0.03 +0.01 -0.01 +0.02
+  上  +0.08 +0.03 -0.05 +0.03 +1.00 +0.02 +0.01 -0.04 -0.03 +0.02 +0.01 -0.01 +0.05 +0.05
+  下  -0.05 +0.03 -0.06 -0.01 +0.02 +1.00 -0.01 +0.03 +0.01 -0.01 -0.08 +0.01 -0.13 -0.04
+  亮  -0.03 +0.06 +0.04 +0.08 +0.01 -0.01 +1.00 -0.01 -0.03 -0.03 -0.12 +0.02 -0.02 -0.00
+  暗  -0.02 -0.00 -0.06 +0.01 -0.04 +0.03 -0.01 +1.00 -0.05 -0.04 +0.03 +0.02 -0.05 +0.02
+  重  +0.06 -0.01 -0.06 +0.03 -0.03 +0.01 -0.03 -0.05 +1.00 -0.05 +0.02 -0.01 +0.05 -0.05
+  轻  -0.05 -0.05 -0.03 +0.08 +0.02 -0.01 -0.03 -0.04 -0.05 +1.00 -0.01 +0.12 -0.01 +0.05
+  快  +0.09 -0.03 -0.06 +0.03 +0.01 -0.08 -0.12 +0.03 +0.02 -0.01 +1.00 +0.00 -0.04 +0.01
+  慢  +0.02 -0.08 +0.01 +0.01 -0.01 +0.01 +0.02 +0.02 -0.01 +0.12 +0.00 +1.00 +0.00 +0.09
+  湿  -0.09 -0.04 +0.08 -0.01 +0.05 -0.13 -0.02 -0.05 +0.05 -0.01 -0.04 +0.00 +1.00 +0.21
+  干  -0.03 -0.02 +0.01 +0.02 +0.05 -0.04 -0.00 +0.02 -0.05 +0.05 +0.01 +0.09 +0.21 +1.00
+
+
+========================================
+  DEEP WHITEBOX DIAGNOSIS
+  (explaining WHY generation is garbage)
+========================================
+
+--- 1. Embedding Space Differentiation ---
+
+  Embedding norms:
+    热=0.557 冷=0.586 大=0.584 小=0.580 上=0.566 下=0.590 亮=0.574 暗=0.590 火=0.563 水=0.578 
+
+  Avg cosine similarity:
+    Opposite pairs (should be LOW):  0.0105
+    Unrelated pairs (should be ~0):  -0.0010
+    Gap (unrelated - opposite):       -0.0115  [OK]
+
+--- 2. CORE Activation Magnitude ---
+
+  Layer 0 mlp activation (for '热'):
+    CORE  : max=3.6914 avg=3.1745  (n=409)
+    BINARY: max=1.4300 avg=0.2582  (n=1435)
+    CORE diff (热 vs 冷): 3.1843 (100.3% of avg)
+    [OK]
+
+--- 3. Weight Norm Layering (CORE > BINARY > PRUNE?) ---
+
+  L0: CORE=0.8287 BIN=0.3787 PRUNE=0.1338  [OK layered]
+  L1: CORE=0.8896 BIN=0.4126 PRUNE=0.1334  [OK layered]
+  L2: CORE=1.0802 BIN=0.4927 PRUNE=0.1336  [OK layered]
+  L3: CORE=1.2135 BIN=0.6382 PRUNE=0.1336  [OK layered]
+  L4: CORE=1.2280 BIN=0.6048 PRUNE=0.1335  [OK layered]
+  L5: CORE=1.1730 BIN=0.5800 PRUNE=0.1340  [OK layered]
+  L6: CORE=1.1880 BIN=0.5807 PRUNE=0.1334  [OK layered]
+  L7: CORE=1.2033 BIN=0.5607 PRUNE=0.1338  [OK layered]
+  L8: CORE=1.1862 BIN=0.5628 PRUNE=0.1339  [OK layered]
+  L9: CORE=1.1857 BIN=0.5591 PRUNE=0.1335  [OK layered]
+
+--- 4. Logits Distribution (mode collapse check) ---
+
+  Prompt '热' → top-5 next-token logits:
+    token 22981 '▁=▁9+6×9▁=▁63;' logit=2.3099
+    token 14293 '▁=▁0▁-▁(0)▁=▁0;' logit=2.2373
+    token 32468 '现' logit=2.2231
+    token 23039 ':11▁+▁3▁×▁4▁=▁?' logit=2.2012
+    token 13690 '2/2▁=▁182。' logit=2.0537
+
+  Logit range: 4.5795 (max=2.3099 min=-2.2695)
+  Softmax entropy: 14.7647 bits (uniform would be 15.00)
+  [OK]
+
+========================================
+  DIAGNOSIS SUMMARY
+========================================
+  If generation is garbage, likely causes:
+  1. Embeddings not spread (Section 1) → tokens sampled near-randomly
+  2. CORE activation too weak (Section 2) → model can't distinguish inputs
+  3. Weight norms not layered (Section 3) → logic mask is cosmetic
+  4. Logits collapsed/flat (Section 4) → repetitive or random output
+  Fix: train more steps, or increase logic_guided_regularization lr
+========================================
+
+
+========================================
+  LAYER-BY-LAYER COLLAPSE DIAGNOSIS
+  (火 vs 水 — cosine similarity per layer)
+========================================
+
+Layer         cosine_sim    l2_dist       ||a||       
+-----         ----------    -------       ------      
+emb           0.527385      0.794706      0.815478    
+L0            0.452857      3.138245      3.000001    
+L1            0.341266      3.443431      3.000000    
+L2            0.270711      3.623148      3.000000    
+L3            0.276856      3.607851      3.000000    
+L4            0.256783      3.657582      3.000000    
+L5            0.245409      3.685463      3.000001    
+L6            0.243816      3.689352      3.000001    
+L7            0.205425      3.781844      3.000000    
+L8            0.242774      3.691893      3.000000    
+L9            0.257950      3.654709      3.000000    
+final_ln      0.265321      (final_ln output)
+
+  (1.0=identical, 0.0=orthogonal)
+
+--- L0 Weight Check ---
+  L0 norm1_w[0:5]: 1.0000 1.0000 1.0000 1.0000 1.0000 
+  L0 norm1_w mean: 1.0000
+  L0 norm1_b[0:5]: 0.0000 0.0000 0.0000 0.0000 0.0000 
+
+--- L0 Deep Diagnosis (norm1_out + V) ---
+  embedding (火vs水) cosine: 0.527385  ||火||=0.8155 ||水||=0.8193
+  norm1_out   (火vs水) cosine: 0.527120  ||火||=22.5407 ||水||=22.5416
+  V=attn_v    (火vs水) cosine: 0.526391  ||火||=21.7713 ||水||=21.7262
+
+  norm1_out 火 [0:5]: -0.4496 0.8339 0.8826 2.1187 -0.7894 
+  norm1_out 水 [0:5]: -0.6849 1.7880 1.1816 1.5683 0.0476 
+  V 火        [0:5]: 0.9521 -1.1343 0.1107 0.2536 -0.2240 
+  V 水        [0:5]: 0.0114 -1.7637 1.6097 0.4834 -1.0384 
+
+  attn_q (QKV merged) weights: mean=0.000026 min=-0.154260 max=0.156059 n=786432
+  (如果 V 火vs水 cosine 高, 但 norm1_out cosine 低, 说明 W_v 把不同输入映射到相似输出)
+
+
+[*] Done
+[*] Loaded 32768 vocab pieces from tokenizer/chinese_bpe.vocab
+=== LAL STE Whitebox-Supervised Training ===
+
+[*] Method: Straight-Through Estimator + CORE/BINARY/PRUNE Logic Guidance
+[*]   forward:  CORE = w_float * core_gain * K     (精确计算)
+[*]             BINARY = sign(w) * alpha * K       (二值符号)
+[*]             PRUNE = 0                           (静默剪枝)
+[*]   backward: STE through w_float (CORE+BINARY), PRUNE 无梯度
+[*]   update:   Adam on w_float
+[*] Logic Guidance (每步,全层):
+[*]             CORE  → maximize |act(a) - act(b)|  (差异化反义词)
+[*]             BINARY → minimize (act(a) - act(b))^2 (收敛共性)
+[*]             PRUNE → skip (保持静默)
+[*] Whitebox probe: every 10 steps observe CORE/BINARY/PRUNE circuit
+
+[*] Loaded 69990 samples from data/general_bpe.bin
+[*] Using Phase 1: Sprout (10L/512d) (~35M params, vocab=32768)
+[*] Generated Phase 1: Sprout (10L/512d) weights: 10 layers, 512 embd, ~35M params
+[*] Logic mask: Phase 2: Standard (20/70/10) (CORE=20% PRUNE=10%)
+[*] loaded 124 tensors
+[*] binarizing 10 layers (logic-guided)...
+    [logic] CORE=307 (20%), BINARY=1076 (70%), PRUNE=153 (10%)
+[*] done
+[*] freed 40 weight tensors (126 MB) after binarization
+[*] Model loaded: 10 layers, 512 embd, k_cache=YES
+[*] Resuming from model_v13g.ste...
+[*] Resumed g_opt_step = 100 (Adam bias correction preserved)
+[*] Resumed weights loaded successfully
+
+
+=== LAL STE Training (B=4, max_pos=64, steps=200, start_step=100, total_sched=300, logic_lr=2.0000, logic_only=0) ===
+[*] STE: forward=sign(w), backward=w_float gradient
+[*] Whitebox probe every 10 steps
+[*] Semantic regularization every step
+  [LOGIC] mlp=-679.1204 attn=-116.9996
+  step     0/200 (global=100)  loss=10.4316  avg=10.4316  lr=0.000905  B=16  11768ms
+  [WB] boundary=97/100  core_diff=3.0560  bin_diff=0.0457  ratio=66.94  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.026
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=26.1083 attn=-20.4602
+  step    10/200 (global=110)  loss=9.6215  avg=9.5609  lr=0.000864  B=16  12742ms
+  [WB] boundary=97/100  core_diff=2.6370  bin_diff=0.0883  ratio=29.85  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.027
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=522.8444 attn=14.6758
+  step    20/200 (global=120)  loss=10.2142  avg=9.7074  lr=0.000819  B=16  12744ms
+  [WB] boundary=97/100  core_diff=2.2472  bin_diff=0.0949  ratio=23.69  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.028
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=726.9752 attn=23.5541
+  step    30/200 (global=130)  loss=10.2062  avg=9.8494  lr=0.000768  B=16  12795ms
+  [WB] boundary=97/100  core_diff=1.7689  bin_diff=0.0841  ratio=21.05  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.026
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=970.6948 attn=30.1051
+  step    40/200 (global=140)  loss=10.0568  avg=9.9521  lr=0.000713  B=16  12749ms
+  [WB] boundary=97/100  core_diff=1.3634  bin_diff=0.0707  ratio=19.28  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.025
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+    [plan-I] step 149 W_v approx_rank=21.4 (frob=22.41 max_row=1.05)
+    [ortho] step 149 L0 W_v off_diag=2.39 diag_dev=0.2332
+    [ortho] step 149 L0 W_o off_diag=1.41 diag_dev=0.0772
+    [plan-I] step 149 W_v approx_rank=20.2 (frob=22.38 max_row=1.11)
+    [ortho] step 149 L1 W_v off_diag=2.78 diag_dev=0.2913
+    [ortho] step 149 L1 W_o off_diag=1.35 diag_dev=0.0799
+    [plan-I] step 149 W_v approx_rank=21.8 (frob=22.36 max_row=1.03)
+    [ortho] step 149 L2 W_v off_diag=3.02 diag_dev=0.3381
+    [ortho] step 149 L2 W_o off_diag=1.37 diag_dev=0.0713
+    [plan-I] step 149 W_v approx_rank=21.9 (frob=22.41 max_row=1.03)
+    [ortho] step 149 L3 W_v off_diag=2.73 diag_dev=0.2339
+    [ortho] step 149 L3 W_o off_diag=1.34 diag_dev=0.0709
+    [plan-I] step 149 W_v approx_rank=21.9 (frob=22.38 max_row=1.02)
+    [ortho] step 149 L4 W_v off_diag=2.88 diag_dev=0.2947
+    [ortho] step 149 L4 W_o off_diag=1.34 diag_dev=0.0713
+    [plan-I] step 149 W_v approx_rank=21.8 (frob=22.38 max_row=1.03)
+    [ortho] step 149 L5 W_v off_diag=2.91 diag_dev=0.2971
+    [ortho] step 149 L5 W_o off_diag=1.34 diag_dev=0.0700
+    [plan-I] step 149 W_v approx_rank=22.0 (frob=22.37 max_row=1.02)
+    [ortho] step 149 L6 W_v off_diag=3.67 diag_dev=0.3161
+    [ortho] step 149 L6 W_o off_diag=1.35 diag_dev=0.0694
+    [plan-I] step 149 W_v approx_rank=21.3 (frob=22.38 max_row=1.05)
+    [ortho] step 149 L7 W_v off_diag=2.96 diag_dev=0.3098
+    [ortho] step 149 L7 W_o off_diag=1.36 diag_dev=0.0730
+    [plan-I] step 149 W_v approx_rank=21.7 (frob=22.38 max_row=1.03)
+    [ortho] step 149 L8 W_v off_diag=3.00 diag_dev=0.3010
+    [ortho] step 149 L8 W_o off_diag=1.39 diag_dev=0.0717
+    [plan-I] step 149 W_v approx_rank=21.6 (frob=22.37 max_row=1.03)
+    [ortho] step 149 L9 W_v off_diag=3.10 diag_dev=0.3215
+    [ortho] step 149 L9 W_o off_diag=1.39 diag_dev=0.0725
+  [LOGIC] mlp=1156.1926 attn=33.3428
+  step    50/200 (global=150)  loss=10.3558  avg=10.0253  lr=0.000655  B=16  12731ms
+  [WB] boundary=97/100  core_diff=1.1720  bin_diff=0.0641  ratio=18.30  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.030
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+[*] stateful inference started: window=9996, sinks=4, ctx=10240
+[*] sliding window configured: W=9996, sinks=4 (effective context: 10000)
+  [TRACE] "水": L0[||x||=1.54 C409(+2094.57--6.92) B1435(+1413.77--84.32) P204(max0.000)] L5[||x||=3.00 C409(+2695.41--4.58) B1435(+3309.34--32.04) P204(max0.000)] L9[||x||=3.00 C409(+3062.90--3.62) B1435(+2960.23--38.81) P204(max0.000)] | H=14.77/15 top3=10333 11637 12798 
+  [LOGIC] mlp=1315.1569 attn=35.8075
+  step    60/200 (global=160)  loss=10.3082  avg=10.0616  lr=0.000594  B=16  12712ms
+  [WB] boundary=97/100  core_diff=1.0383  bin_diff=0.0593  ratio=17.50  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.034
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=1458.6469 attn=38.4236
+  step    70/200 (global=170)  loss=10.2570  avg=10.1313  lr=0.000531  B=16  12726ms
+  [WB] boundary=96/100  core_diff=0.9344  bin_diff=0.0554  ratio=16.87  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.037
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=1589.5111 attn=40.6439
+  step    80/200 (global=180)  loss=9.9051  avg=10.2388  lr=0.000469  B=16  12761ms
+  [WB] boundary=96/100  core_diff=0.8711  bin_diff=0.0533  ratio=16.34  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.043
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=1694.9623 attn=41.8903
+  step    90/200 (global=190)  loss=10.3858  avg=10.2783  lr=0.000406  B=16  12751ms
+  [WB] boundary=95/100  core_diff=0.8292  bin_diff=0.0522  ratio=15.88  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.048
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+    [plan-I] step 199 W_v approx_rank=21.8 (frob=22.40 max_row=1.03)
+    [ortho] step 199 L0 W_v off_diag=1.65 diag_dev=0.2550
+    [ortho] step 199 L0 W_o off_diag=0.92 diag_dev=0.0768
+    [plan-I] step 199 W_v approx_rank=20.8 (frob=22.37 max_row=1.08)
+    [ortho] step 199 L1 W_v off_diag=1.78 diag_dev=0.3120
+    [ortho] step 199 L1 W_o off_diag=0.91 diag_dev=0.0842
+    [plan-I] step 199 W_v approx_rank=22.1 (frob=22.35 max_row=1.01)
+    [ortho] step 199 L2 W_v off_diag=1.90 diag_dev=0.3687
+    [ortho] step 199 L2 W_o off_diag=0.92 diag_dev=0.0743
+    [plan-I] step 199 W_v approx_rank=22.1 (frob=22.40 max_row=1.01)
+    [ortho] step 199 L3 W_v off_diag=1.64 diag_dev=0.2456
+    [ortho] step 199 L3 W_o off_diag=0.91 diag_dev=0.0748
+    [plan-I] step 199 W_v approx_rank=22.1 (frob=22.37 max_row=1.01)
+    [ortho] step 199 L4 W_v off_diag=1.79 diag_dev=0.3108
+    [ortho] step 199 L4 W_o off_diag=0.91 diag_dev=0.0753
+    [plan-I] step 199 W_v approx_rank=22.1 (frob=22.37 max_row=1.01)
+    [ortho] step 199 L5 W_v off_diag=1.81 diag_dev=0.3188
+    [ortho] step 199 L5 W_o off_diag=0.91 diag_dev=0.0743
+    [plan-I] step 199 W_v approx_rank=22.2 (frob=22.38 max_row=1.01)
+    [ortho] step 199 L6 W_v off_diag=1.76 diag_dev=0.2872
+    [ortho] step 199 L6 W_o off_diag=0.91 diag_dev=0.0740
+    [plan-I] step 199 W_v approx_rank=21.8 (frob=22.36 max_row=1.03)
+    [ortho] step 199 L7 W_v off_diag=1.83 diag_dev=0.3286
+    [ortho] step 199 L7 W_o off_diag=0.91 diag_dev=0.0758
+    [plan-I] step 199 W_v approx_rank=22.0 (frob=22.36 max_row=1.01)
+    [ortho] step 199 L8 W_v off_diag=1.87 diag_dev=0.3260
+    [ortho] step 199 L8 W_o off_diag=0.92 diag_dev=0.0751
+    [plan-I] step 199 W_v approx_rank=22.0 (frob=22.36 max_row=1.02)
+    [ortho] step 199 L9 W_v off_diag=1.85 diag_dev=0.3360
+    [ortho] step 199 L9 W_o off_diag=0.91 diag_dev=0.0750
+  [LOGIC] mlp=1778.8617 attn=42.5844
+  step   100/200 (global=200)  loss=10.1538  avg=10.2671  lr=0.000345  B=16  12752ms
+  [WB] boundary=95/100  core_diff=0.8229  bin_diff=0.0525  ratio=15.67  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.050
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+[*] stateful inference started: window=9996, sinks=4, ctx=10240
+[*] sliding window configured: W=9996, sinks=4 (effective context: 10000)
+  [TRACE] "大": L0[||x||=2.12 C409(+3539.82--6.26) B1435(+2786.57--80.38) P204(max0.000)] L5[||x||=3.00 C409(+4041.19--4.57) B1435(+4896.08--30.32) P204(max0.000)] L9[||x||=3.00 C409(+4515.75--3.48) B1435(+4465.93--37.56) P204(max0.000)] | H=14.77/15 top3=19111 11637 28472 
+  [LOGIC] mlp=1847.7518 attn=43.5436
+  step   110/200 (global=210)  loss=10.0875  avg=10.2473  lr=0.000287  B=16  12755ms
+  [WB] boundary=95/100  core_diff=0.8045  bin_diff=0.0522  ratio=15.40  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.051
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=1900.8795 attn=44.2500
+  step   120/200 (global=220)  loss=10.2433  avg=10.2359  lr=0.000232  B=16  12766ms
+  [WB] boundary=95/100  core_diff=0.7932  bin_diff=0.0518  ratio=15.31  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.052
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=1946.1473 attn=44.9817
+  step   130/200 (global=230)  loss=9.8492  avg=10.2095  lr=0.000181  B=16  12853ms
+  [WB] boundary=95/100  core_diff=0.7809  bin_diff=0.0511  ratio=15.27  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.053
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=1980.8912 attn=45.3336
+  step   140/200 (global=240)  loss=10.0778  avg=10.1846  lr=0.000136  B=16  12921ms
+  [WB] boundary=95/100  core_diff=0.7809  bin_diff=0.0516  ratio=15.12  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.053
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+    [plan-I] step 249 W_v approx_rank=22.2 (frob=22.39 max_row=1.01)
+    [ortho] step 249 L0 W_v off_diag=1.28 diag_dev=0.2766
+    [ortho] step 249 L0 W_o off_diag=0.74 diag_dev=0.0799
+    [plan-I] step 249 W_v approx_rank=21.8 (frob=22.36 max_row=1.03)
+    [ortho] step 249 L1 W_v off_diag=1.40 diag_dev=0.3271
+    [ortho] step 249 L1 W_o off_diag=0.74 diag_dev=0.0808
+    [plan-I] step 249 W_v approx_rank=22.3 (frob=22.34 max_row=1.00)
+    [ortho] step 249 L2 W_v off_diag=1.51 diag_dev=0.3862
+    [ortho] step 249 L2 W_o off_diag=0.74 diag_dev=0.0795
+    [plan-I] step 249 W_v approx_rank=22.4 (frob=22.39 max_row=1.00)
+    [ortho] step 249 L3 W_v off_diag=1.26 diag_dev=0.2658
+    [ortho] step 249 L3 W_o off_diag=0.74 diag_dev=0.0798
+    [plan-I] step 249 W_v approx_rank=22.4 (frob=22.36 max_row=1.00)
+    [ortho] step 249 L4 W_v off_diag=1.40 diag_dev=0.3290
+    [ortho] step 249 L4 W_o off_diag=0.74 diag_dev=0.0799
+    [plan-I] step 249 W_v approx_rank=22.3 (frob=22.36 max_row=1.00)
+    [ortho] step 249 L5 W_v off_diag=1.41 diag_dev=0.3312
+    [ortho] step 249 L5 W_o off_diag=0.74 diag_dev=0.0797
+    [plan-I] step 249 W_v approx_rank=22.3 (frob=22.37 max_row=1.00)
+    [ortho] step 249 L6 W_v off_diag=1.35 diag_dev=0.3094
+    [ortho] step 249 L6 W_o off_diag=0.74 diag_dev=0.0796
+    [plan-I] step 249 W_v approx_rank=22.3 (frob=22.35 max_row=1.00)
+    [ortho] step 249 L7 W_v off_diag=1.44 diag_dev=0.3488
+    [ortho] step 249 L7 W_o off_diag=0.74 diag_dev=0.0797
+    [plan-I] step 249 W_v approx_rank=22.3 (frob=22.35 max_row=1.00)
+    [ortho] step 249 L8 W_v off_diag=1.42 diag_dev=0.3453
+    [ortho] step 249 L8 W_o off_diag=0.74 diag_dev=0.0798
+    [plan-I] step 249 W_v approx_rank=22.3 (frob=22.35 max_row=1.00)
+    [ortho] step 249 L9 W_v off_diag=1.45 diag_dev=0.3475
+    [ortho] step 249 L9 W_o off_diag=0.74 diag_dev=0.0795
+  [LOGIC] mlp=2002.7969 attn=45.0497
+  step   150/200 (global=250)  loss=9.9674  avg=10.1608  lr=0.000095  B=16  12975ms
+  [WB] boundary=95/100  core_diff=0.7862  bin_diff=0.0525  ratio=14.97  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.054
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+[*] stateful inference started: window=9996, sinks=4, ctx=10240
+[*] sliding window configured: W=9996, sinks=4 (effective context: 10000)
+  [TRACE] "小": L0[||x||=2.52 C409(+4070.63--5.21) B1435(+3299.51--79.19) P204(max0.000)] L5[||x||=3.00 C409(+4565.84--4.56) B1435(+5498.33--30.00) P204(max0.000)] L9[||x||=3.00 C409(+5035.15--3.55) B1435(+5015.70--37.65) P204(max0.000)] | H=14.77/15 top3=232 28472 11637 
+  [LOGIC] mlp=2015.8055 attn=44.5459
+  step   160/200 (global=260)  loss=10.0537  avg=10.1670  lr=0.000062  B=16  12996ms
+  [WB] boundary=95/100  core_diff=0.7987  bin_diff=0.0541  ratio=14.77  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.054
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=2022.1964 attn=44.0499
+  step   170/200 (global=270)  loss=10.3029  avg=10.1592  lr=0.000035  B=16  13044ms
+  [WB] boundary=95/100  core_diff=0.8143  bin_diff=0.0555  ratio=14.67  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.054
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK
+  [LOGIC] mlp=2025.2473 attn=43.7205
+  step   180/200 (global=280)  loss=10.1242  avg=10.1407  lr=0.000016  B=16  13020ms
+  [WB] boundary=95/100  core_diff=0.8237  bin_diff=0.0568  ratio=14.49  prune_act=0.0000
+  [WB] structure=17/20 (85%)  opp_sim=0.054
+  [WB] BOUNDARY OK | CORE>BIN OK | PRUNE silent OK

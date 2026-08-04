@@ -292,9 +292,15 @@ static void compute_gate_input(Model *m, const float *initial_emb,
             for (int i = 0; i < mlp_dim; i++) hidden[i] = gelu(hidden[i]);
         }
         bin_forward_pure_float(mlp_out, hidden, &tl->mlp_down);
-        scale_to_norm(mlp_out, n, 0.3f);
-        for (int i = 0; i < n; i++) x[i] += rs * mlp_out[i];
-        clip_array(x, n, 10.0f);
+        /* v13d-merged: MLP cap at 0.5 + normalize_residual(3.0) — matches runtime */
+        {
+            float mns = 0;
+            for (int i = 0; i < n; i++) mns += mlp_out[i] * mlp_out[i];
+            float mn = sqrtf(mns) + 1e-8f;
+            float ms = (mn > 0.5f) ? (0.5f / mn) : 1.0f;
+            for (int i = 0; i < n; i++) x[i] += rs * ms * mlp_out[i];
+        }
+        normalize_residual(x, n, 3.0f);
     }
     /* Static buffers — NOT freed here (reused on next call).
      * They persist for the program lifetime and are auto-freed on exit. */
@@ -311,10 +317,18 @@ static void compute_gate_input(Model *m, const float *initial_emb,
  * the LN2 output (gate_input) at each layer. Result: n_layer forwards
  * instead of n_layer*(n_layer+1)/2. For n_layer=8: 8 instead of 36 (4.5x).
  *
- * out_gate_inputs: [n_layer * n_embd] — gate_input for each layer.
+ * out_gate_inputs: [n_layer * n_embd] — gate_input (norm2_out) for each layer.
+ *
+ * v13 EXTENSION: out_norm1_inputs (optional, may be NULL).
+ *   [n_layer * n_embd] — norm1_out (input to attn_q) for each layer.
+ *   Used by attention regularization to differentiate concept pairs at
+ *   the attention output (attn_o). Without this, attention gets no
+ *   logic-guided gradient and stays at random init (v12 root cause #3).
  * ======================================================================== */
 static void compute_all_gate_inputs(Model *m, const float *initial_emb,
-                                     float *out_gate_inputs, int n_embd) {
+                                     float *out_gate_inputs, int n_embd,
+                                     float *out_norm1_inputs, /* NULL ok */
+                                     float *out_final_hidden   /* NULL ok, v13g: for logit diversity loss */) {
     int n_layer = m->cfg.n_layer;
     int mlp_dim = m->cfg.mlp_dim;
     int n = n_embd;
@@ -359,6 +373,10 @@ static void compute_all_gate_inputs(Model *m, const float *initial_emb,
 
         norm_forward(norm1, x, tl->norm1_w, tl->norm1_b, m->cfg.norm_type, n);
 
+        /* v13: cache norm1_out for attention regularization */
+        if (out_norm1_inputs)
+            memcpy(&out_norm1_inputs[(size_t)l * n], norm1, n * sizeof(float));
+
         if (m->cfg.qkv_merged) {
             bin_forward_pure_float(qkv_buf, norm1, &tl->attn_q);
         } else {
@@ -373,8 +391,9 @@ static void compute_all_gate_inputs(Model *m, const float *initial_emb,
 
         norm_forward(norm2, x, tl->norm2_w, tl->norm2_b, m->cfg.norm_type, n);
 
-        /* Capture gate_input for this layer */
-        memcpy(&out_gate_inputs[(size_t)l * n], norm2, n * sizeof(float));
+        /* Capture gate_input for this layer (v13: NULL ok, skip write) */
+        if (out_gate_inputs)
+            memcpy(&out_gate_inputs[(size_t)l * n], norm2, n * sizeof(float));
 
         /* MLP to feed next layer */
         if (m->cfg.act_type == ACT_SWIGLU) {
@@ -386,9 +405,22 @@ static void compute_all_gate_inputs(Model *m, const float *initial_emb,
             for (int i = 0; i < mlp_dim; i++) hidden[i] = gelu(hidden[i]);
         }
         bin_forward_pure_float(mlp_out, hidden, &tl->mlp_down);
-        scale_to_norm(mlp_out, n, 0.3f);
-        for (int i = 0; i < n; i++) x[i] += rs * mlp_out[i];
-        clip_array(x, n, 10.0f);
+        /* v13d-merged: MLP cap at 0.5 + normalize_residual(3.0) — matches runtime */
+        {
+            float mns = 0;
+            for (int i = 0; i < n; i++) mns += mlp_out[i] * mlp_out[i];
+            float mn = sqrtf(mns) + 1e-8f;
+            float ms = (mn > 0.5f) ? (0.5f / mn) : 1.0f;
+            for (int i = 0; i < n; i++) x[i] += rs * ms * mlp_out[i];
+        }
+        normalize_residual(x, n, 3.0f);
+    }
+
+    /* v13g: apply final LayerNorm and return final hidden state.
+     * Used by logit_diversity_loss to compute logits = wte @ final_hidden
+     * and penalize collapse to punctuation tokens. */
+    if (out_final_hidden) {
+        norm_forward(out_final_hidden, x, m->ln_f_w, m->ln_f_b, m->cfg.norm_type, n);
     }
 }
 
@@ -830,3 +862,160 @@ static ProbeMetrics whitebox_probe_compact(Model *m) {
  * ======================================================================== */
 
 #endif /* LAL_WHITEBOX_PROBE_H */
+
+/* ========================================================================
+ * v13l: Batch compute_all_gate_inputs — process all concept pairs at once.
+ *
+ * Replaces 14× calls to compute_all_gate_inputs (each doing 10-layer
+ * forward = 80 cuBLAS calls) with 1× batched call (10 layers × 8 matmuls
+ * = 80 cuBLAS calls total, but each is a batched sgemm).
+ *
+ * This reduces cuBLAS launch overhead by 14x for logic_reg.
+ *
+ * initial_embs: [batch * n_embd] — concept embeddings concatenated
+ * out_gate_inputs: [batch * n_layer * n_embd] — gate input for each batch+layer
+ * ======================================================================== */
+static void compute_all_gate_inputs_batch(Model *m, const float *initial_embs,
+                                           int batch,
+                                           float *out_gate_inputs, /* [batch * n_layer * n_embd] */
+                                           int n_embd) {
+    int n_layer = m->cfg.n_layer;
+    int mlp_dim = m->cfg.mlp_dim;
+    int n = n_embd;
+    float rs = m->cfg.residual_scale;
+
+    /* Batch-sized buffers: [batch, dim] */
+    static float *xb = NULL, *norm1b = NULL, *norm2b = NULL;
+    static float *qkv_b = NULL, *attn_out_b = NULL, *proj_b = NULL;
+    static float *gate_b = NULL, *up_b = NULL, *hidden_b = NULL, *mlp_out_b = NULL;
+    static int s_n = 0, s_mlp = 0, s_batch = 0;
+
+    if (s_n != n || s_mlp != mlp_dim || s_batch != batch) {
+        free(xb); free(norm1b); free(norm2b);
+        free(qkv_b); free(attn_out_b); free(proj_b);
+        free(gate_b); free(up_b); free(hidden_b); free(mlp_out_b);
+        xb = malloc((size_t)batch * n * sizeof(float));
+        norm1b = malloc((size_t)batch * n * sizeof(float));
+        norm2b = malloc((size_t)batch * n * sizeof(float));
+        qkv_b = malloc((size_t)batch * 3 * n * sizeof(float));  /* QKV merged */
+        attn_out_b = malloc((size_t)batch * n * sizeof(float));
+        proj_b = malloc((size_t)batch * n * sizeof(float));
+        gate_b = malloc((size_t)batch * mlp_dim * sizeof(float));
+        up_b = malloc((size_t)batch * mlp_dim * sizeof(float));
+        hidden_b = malloc((size_t)batch * mlp_dim * sizeof(float));
+        mlp_out_b = malloc((size_t)batch * n * sizeof(float));
+        s_n = n; s_mlp = mlp_dim; s_batch = batch;
+    }
+
+    /* x = initial_embs + wpe (broadcast wpe to all batches) */
+    memcpy(xb, initial_embs, (size_t)batch * n * sizeof(float));
+    if (m->wpe) {
+        for (int b = 0; b < batch; b++)
+            for (int i = 0; i < n; i++)
+                xb[b*n + i] += m->wpe[i];
+    }
+
+    for (int l = 0; l < n_layer; l++) {
+        TransLayer *tl = &m->layers[l];
+
+        /* Batch norm1: per-row LayerNorm (sequential over batch for now,
+         * norm_forward is per-vector. Could be batched too but not bottleneck.) */
+        for (int b = 0; b < batch; b++) {
+            norm_forward(&norm1b[b*n], &xb[b*n], tl->norm1_w, tl->norm1_b,
+                         m->cfg.norm_type, n);
+        }
+
+        /* Batch matmul: qkv = attn_q @ norm1  (QKV merged, out=3n)
+         * For non-merged, just do V projection. */
+        if (m->cfg.qkv_merged) {
+for (int b = 0; b < batch; b++)
+                bin_forward_pure_float(&qkv_b[b*3*n], &norm1b[b*n], &tl->attn_q);
+        } else {
+#ifdef LAL_CUDA
+            if (g_use_cuda && tl->attn_v._gpu) {
+                for (int b = 0; b < batch; b++)
+                    bin_forward_pure_float(&attn_out_b[b*n], &norm1b[b*n], &tl->attn_v);
+            } else
+#endif
+            for (int b = 0; b < batch; b++)
+                bin_forward_pure_float(&attn_out_b[b*n], &norm1b[b*n], &tl->attn_v);
+        }
+
+        /* attn_out = V (for QKV merged, V is at offset 2n) */
+        if (m->cfg.qkv_merged) {
+            for (int b = 0; b < batch; b++)
+                memcpy(&attn_out_b[b*n], &qkv_b[b*3*n + 2*n], n * sizeof(float));
+        }
+
+        /* Batch: proj_out = attn_o @ attn_out */
+#ifdef LAL_CUDA
+        if (g_use_cuda && tl->attn_o._gpu) {
+            for (int b = 0; b < batch; b++)
+                bin_forward_pure_float(&proj_b[b*n], &attn_out_b[b*n], &tl->attn_o);
+        } else
+#endif
+        for (int b = 0; b < batch; b++)
+            bin_forward_pure_float(&proj_b[b*n], &attn_out_b[b*n], &tl->attn_o);
+
+        /* x += rs * proj_out (elementwise, batched) */
+        for (int b = 0; b < batch; b++) {
+            for (int i = 0; i < n; i++) xb[b*n + i] += rs * proj_b[b*n + i];
+            clip_array(&xb[b*n], n, 10.0f);
+        }
+
+        /* Batch norm2 */
+        for (int b = 0; b < batch; b++) {
+            norm_forward(&norm2b[b*n], &xb[b*n], tl->norm2_w, tl->norm2_b,
+                         m->cfg.norm_type, n);
+            if (out_gate_inputs)
+                memcpy(&out_gate_inputs[((size_t)b * n_layer + l) * n],
+                       &norm2b[b*n], n * sizeof(float));
+        }
+
+        /* MLP: gate, up, activation, down — all batched */
+        if (m->cfg.act_type == ACT_SWIGLU) {
+#ifdef LAL_CUDA
+            if (g_use_cuda && tl->mlp_gate._gpu) {
+                for (int b = 0; b < batch; b++)
+                    bin_forward_pure_float(&gate_b[b*mlp_dim], &norm2b[b*n], &tl->mlp_gate);
+                for (int b = 0; b < batch; b++)
+                    bin_forward_pure_float(&up_b[b*mlp_dim], &norm2b[b*n], &tl->mlp_up);
+            } else
+#endif
+            for (int b = 0; b < batch; b++) {
+                bin_forward_pure_float(&gate_b[b*mlp_dim], &norm2b[b*n], &tl->mlp_gate);
+                bin_forward_pure_float(&up_b[b*mlp_dim],   &norm2b[b*n], &tl->mlp_up);
+            }
+            for (int b = 0; b < batch; b++)
+                for (int i = 0; i < mlp_dim; i++)
+                    hidden_b[b*mlp_dim + i] = silu(gate_b[b*mlp_dim + i]) * up_b[b*mlp_dim + i];
+        } else {
+#ifdef LAL_CUDA
+            if (g_use_cuda && tl->mlp_gate._gpu) {
+                for (int b = 0; b < batch; b++)
+                    bin_forward_pure_float(&hidden_b[b*mlp_dim], &norm2b[b*n], &tl->mlp_gate);
+            } else
+#endif
+            for (int b = 0; b < batch; b++)
+                bin_forward_pure_float(&hidden_b[b*mlp_dim], &norm2b[b*n], &tl->mlp_gate);
+            for (int b = 0; b < batch; b++)
+                for (int i = 0; i < mlp_dim; i++)
+                    hidden_b[b*mlp_dim + i] = gelu(hidden_b[b*mlp_dim + i]);
+        }
+
+#ifdef LAL_CUDA
+        if (g_use_cuda && tl->mlp_down._gpu) {
+            for (int b = 0; b < batch; b++)
+                bin_forward_pure_float(&mlp_out_b[b*n], &hidden_b[b*mlp_dim], &tl->mlp_down);
+        } else
+#endif
+        for (int b = 0; b < batch; b++)
+            bin_forward_pure_float(&mlp_out_b[b*n], &hidden_b[b*mlp_dim], &tl->mlp_down);
+
+        /* x += rs * mlp_out */
+        for (int b = 0; b < batch; b++) {
+            for (int i = 0; i < n; i++) xb[b*n + i] += rs * mlp_out_b[b*n + i];
+            clip_array(&xb[b*n], n, 10.0f);
+        }
+    }
+}

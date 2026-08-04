@@ -84,6 +84,12 @@ typedef struct {
     int       n_core;     /* Count of CORE outputs */
     int       n_prune;    /* Count of PRUNE outputs */
     int       in_dim, out_dim, n_words, n_words_T;
+
+    /* v13k: GPU resident weights (NULL when CUDA off or upload failed). */
+    void *_gpu;          /* opaque pointer to LayerGPU struct */
+    /* v13s: device-side grad_accum (for GPU-only accumulation, no H2D/D2H per step) */
+    float *d_grad_accum;      /* device [out*in] — mirrors grad_accum */
+    float *d_bias_grad_accum; /* device [out] — mirrors bias_grad_accum */
 } BinLayer;
 
 void bin_layer_init(BinLayer *bl, const float *W, const float *bias,

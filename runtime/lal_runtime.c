@@ -9,7 +9,13 @@
  */
 #include "lal_runtime.h"
 #ifdef LAL_CUDA
-#include "lal_cuda.h"   /* CUDA GPU training backend (runtime/lal_cuda.cu) */
+#include "lal_cuda.h"
+
+/* v13u: declare cudaMemcpy constants without cuda_runtime.h */
+#ifdef LAL_CUDA
+#define MY_2 2
+#define MY_1 1
+#endif   /* CUDA GPU training backend (runtime/lal_cuda.cu) */
 #endif
 
 /* Forward declarations for full-vocab softmax (defined later in this file,
@@ -246,8 +252,6 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
     if (cfg->attn_type == ATTN_ROPE)
         apply_rope(act->q, act->k, seq_pos, cfg->n_head, n / cfg->n_head, n);
 
-    /* Simplified attention: V copy (full attention in future) */
-    memcpy(act->attn_out, act->v, n * sizeof(float));
     /* Attention: real causal multi-head (KV cache) if flag is on and cache
      * is allocated, else legacy V-copy (degenerate, no token mixing).
      * [FIX 致命2] The V-copy was a placeholder — see attention_forward(). */
@@ -259,10 +263,11 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
         memcpy(act->attn_out, act->v, n * sizeof(float));
     }
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
-    /* v13d: scale attention output to moderate perturbation (0.3 norm).
-     * v13b used 0.1 (too conservative, only 0.5% direction change per layer).
-     * v13d uses 0.3 (4.2% direction change, allowing meaningful transformations).
-     * normalize_residual removed: pre-LN architecture handles normalization. */
+    /* v13d-merged: scale attention output to 0.3 norm for controlled perturbation.
+     * v13b used 0.1 (too conservative), v13d uses 0.3 (good expressiveness).
+     * attn_scale stored in TransAct for backward pass gradient correction.
+     * Remote used g_attn_residual_scale (global=1.0) — local scale_to_norm is
+     * superior: adaptive per-token scaling + backward-compatible. */
     {
         float pn = 0;
         for (int i = 0; i < n; i++) pn += act->proj_out[i] * act->proj_out[i];
@@ -302,14 +307,19 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_fwd(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    /* v13d: scale MLP output to moderate perturbation (0.3 norm) */
+    /* v13d-merged: MLP cap approach from remote + backward-compatible scale storage.
+     * Remote: cap ||mlp_out|| at 0.5 (only reduce if too large, preserve small signals).
+     * Local: store mlp_scale in TransAct for backward pass gradient correction.
+     * normalize_residual(3.0) from remote: prevents residual stream drift. */
     {
-        float mn = 0;
-        for (int i = 0; i < n; i++) mn += act->mlp_out[i] * act->mlp_out[i];
-        act->mlp_scale = 0.3f / (sqrtf(mn) + 1e-8f);
-        for (int i = 0; i < n; i++) act->mlp_out[i] *= act->mlp_scale;
+        float mlp_norm_sq = 0;
+        for (int i = 0; i < n; i++) mlp_norm_sq += act->mlp_out[i] * act->mlp_out[i];
+        float mlp_norm = sqrtf(mlp_norm_sq) + 1e-8f;
+        float mlp_cap = 0.5f;
+        act->mlp_scale = (mlp_norm > mlp_cap) ? (mlp_cap / mlp_norm) : 1.0f;
+        for (int i = 0; i < n; i++) x[i] += rs * act->mlp_scale * act->mlp_out[i];
     }
-    for (int i = 0; i < n; i++) x[i] += rs * act->mlp_out[i];
+    normalize_residual(x, n, 3.0f);
 }
 
 /* Pure-float forward: same as trans_layer_forward but uses bin_forward_pure_float
@@ -347,7 +357,7 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
         memcpy(act->attn_out, act->v, n * sizeof(float));
 
     bin_forward_pure_float(act->proj_out, act->attn_out, &tl->attn_o);
-    /* v13d: scale attention output to 0.3 norm, no normalize_residual */
+    /* v13d-merged: scale attention output to 0.3 norm (same as standard forward) */
     {
         float pn = 0;
         for (int i = 0; i < n; i++) pn += act->proj_out[i] * act->proj_out[i];
@@ -378,14 +388,16 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_forward_pure_float(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    /* v13d: scale MLP output to 0.3 norm, no normalize_residual */
+    /* v13d-merged: MLP cap + backward-compatible scale + normalize_residual (same as standard) */
     {
-        float mn = 0;
-        for (int i = 0; i < n; i++) mn += act->mlp_out[i] * act->mlp_out[i];
-        act->mlp_scale = 0.3f / (sqrtf(mn) + 1e-8f);
-        for (int i = 0; i < n; i++) act->mlp_out[i] *= act->mlp_scale;
+        float mlp_norm_sq = 0;
+        for (int i = 0; i < n; i++) mlp_norm_sq += act->mlp_out[i] * act->mlp_out[i];
+        float mlp_norm = sqrtf(mlp_norm_sq) + 1e-8f;
+        float mlp_cap = 0.5f;
+        act->mlp_scale = (mlp_norm > mlp_cap) ? (mlp_cap / mlp_norm) : 1.0f;
+        for (int i = 0; i < n; i++) x[i] += rs * act->mlp_scale * act->mlp_out[i];
     }
-    for (int i = 0; i < n; i++) x[i] += rs * act->mlp_out[i];
+    normalize_residual(x, n, 3.0f);
 }
 
 /* Global flag: use STE backward (updates w_float + repacks wbits) */
@@ -441,6 +453,14 @@ float lr_schedule(int step, int warmup_steps, int total_steps, float base_lr) {
  * PRUNE outputs 0 (skipped). */
 void bin_forward_pure_float(float *y, const float *x, const BinLayer *bl) {
     int in = bl->in_dim, out = bl->out_dim;
+#ifdef LAL_CUDA
+    /* v13o: Re-enabled GPU CE path. Fixed fwd_resident to use sgemm
+     * instead of sgemv (sgemv had out-of-bounds for QKV merged out=3n).
+     * 2x buffer cap for safety. */
+    /* v13q: fwd_resident disabled (sgemv OOB for QKV merged).
+     * logic_reg uses lal_cuda_compute_gate_inputs_batch (fused, no OOB).
+     * CE uses lal_cuda_full_forward. This CPU path is fallback only. */
+#endif
     if (bl->logic_mask) {
         int core_idx = 0;
         for (int j = 0; j < out; j++) {
@@ -939,28 +959,28 @@ void model_load(Model *m, const char *weight_path, ModelConfig cfg,
             sprintf(key, "h.%d.attn.c_attn.weight", l);
             char bk[256]; strncpy(bk, key, sizeof(bk));
             char *dot = strstr(bk, ".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            BIN_INIT_NO_LOGIC(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
+            BIN_INIT(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
                      tensor_get(m->tensors, m->n_tensors, bk), n, 3*n);
         } else {
             sprintf(key, "model.layers.%d.self_attn.q_proj.weight", l);
             char bk[256]; strncpy(bk, key, sizeof(bk));
             char *dot = strstr(bk, ".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            BIN_INIT_NO_LOGIC(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
+            BIN_INIT(&tl->attn_q, tensor_get(m->tensors, m->n_tensors, key),
                      tensor_get(m->tensors, m->n_tensors, bk), n, n);
             sprintf(key, "model.layers.%d.self_attn.k_proj.weight", l);
             strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            BIN_INIT_NO_LOGIC(&tl->attn_k, tensor_get(m->tensors, m->n_tensors, key),
+            BIN_INIT(&tl->attn_k, tensor_get(m->tensors, m->n_tensors, key),
                      tensor_get(m->tensors, m->n_tensors, bk), n, n);
             sprintf(key, "model.layers.%d.self_attn.v_proj.weight", l);
             strncpy(bk, key, sizeof(bk)); dot=strstr(bk,".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-            BIN_INIT_NO_LOGIC(&tl->attn_v, tensor_get(m->tensors, m->n_tensors, key),
+            BIN_INIT(&tl->attn_v, tensor_get(m->tensors, m->n_tensors, key),
                      tensor_get(m->tensors, m->n_tensors, bk), n, n);
         }
 
         sprintf(key, qkv_merged ? "h.%d.attn.c_proj.weight" : "model.layers.%d.self_attn.o_proj.weight", l);
         char bk[256]; strncpy(bk, key, sizeof(bk));
         char *dot = strstr(bk, ".weight"); if(dot){*dot=0;strcat(bk,".bias");}
-        BIN_INIT_NO_LOGIC(&tl->attn_o, tensor_get(m->tensors, m->n_tensors, key),
+        BIN_INIT(&tl->attn_o, tensor_get(m->tensors, m->n_tensors, key),
                  tensor_get(m->tensors, m->n_tensors, bk), n, n);
 
         if (cfg.act_type == ACT_SWIGLU) {
@@ -1040,6 +1060,28 @@ void model_load(Model *m, const char *weight_path, ModelConfig cfg,
     /* Auto-allocate KV cache if real attention is requested at load time.
      * Callers can also call model_kv_cache_alloc() later to enable it. */
     if (g_use_real_attention) model_kv_cache_alloc(m);
+
+#ifdef LAL_CUDA
+    /* v13k: Upload all layer weights to GPU (resident) for fast forward/backward.
+     * Called once after model_load. Weights stay on GPU until model_free.
+     * Updated w_float is synced to GPU after each model_batch_apply. */
+    if (g_use_cuda) {
+        extern int lal_cuda_upload_layer(BinLayer*);
+        int uploaded = 0;
+        for (int l = 0; l < cfg.n_layer; l++) {
+            TransLayer *tl = &m->layers[l];
+            BinLayer *bls[8] = {&tl->attn_q, &tl->attn_o, &tl->mlp_gate, &tl->mlp_down};
+            int n_bl = 4;
+            if (!cfg.qkv_merged) { bls[4] = &tl->attn_k; bls[5] = &tl->attn_v; n_bl = 6; }
+            if (cfg.act_type == ACT_SWIGLU) { bls[n_bl] = &tl->mlp_up; n_bl++; }
+            for (int b = 0; b < n_bl; b++) {
+                if (bls[b]->w_float && lal_cuda_upload_layer(bls[b]) == 0)
+                    uploaded++;
+            }
+        }
+        printf("[*] uploaded %d layers to GPU (resident weights)\n", uploaded);
+    }
+#endif
 }
 
 float model_forward(Model *m, const int *tokens, int n_tokens) {
@@ -1506,6 +1548,13 @@ void bin_layer_init_logic(BinLayer *bl, const float *W, const float *bias,
 }
 
 void bin_layer_free(BinLayer *bl) {
+#ifdef LAL_CUDA
+    /* v13k: free GPU resident buffers */
+    if (bl->_gpu) {
+        extern void lal_cuda_free_layer(BinLayer*);
+        lal_cuda_free_layer(bl);
+    }
+#endif
     free(bl->wbits); free(bl->wbits_T); free(bl->zbits); free(bl->alpha); free(bl->bias);
     free(bl->w_float); free(bl->w_core); free(bl->logic_mask);
     free(bl->m_adam); free(bl->v_adam); free(bl->grad_accum); free(bl->bias_grad_accum);
@@ -3133,7 +3182,7 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
 
     /* Output projection */
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
-    /* v13d: scale attention output to 0.3 norm, no normalize_residual */
+    /* v13d-merged: scale attention output to 0.3 norm (same as standard forward) */
     {
         float pn = 0;
         for (int i = 0; i < n; i++) pn += act->proj_out[i] * act->proj_out[i];
@@ -3166,14 +3215,16 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_fwd(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    /* v13d: scale MLP output to 0.3 norm, no normalize_residual */
+    /* v13d-merged: MLP cap + backward-compatible scale + normalize_residual (same as standard) */
     {
-        float mn = 0;
-        for (int i = 0; i < n; i++) mn += act->mlp_out[i] * act->mlp_out[i];
-        act->mlp_scale = 0.3f / (sqrtf(mn) + 1e-8f);
-        for (int i = 0; i < n; i++) act->mlp_out[i] *= act->mlp_scale;
+        float mlp_norm_sq = 0;
+        for (int i = 0; i < n; i++) mlp_norm_sq += act->mlp_out[i] * act->mlp_out[i];
+        float mlp_norm = sqrtf(mlp_norm_sq) + 1e-8f;
+        float mlp_cap = 0.5f;
+        act->mlp_scale = (mlp_norm > mlp_cap) ? (mlp_cap / mlp_norm) : 1.0f;
+        for (int i = 0; i < n; i++) x[i] += rs * act->mlp_scale * act->mlp_out[i];
     }
-    for (int i = 0; i < n; i++) x[i] += rs * act->mlp_out[i];
+    normalize_residual(x, n, 3.0f);
 }
 
 /* ─── Stateful Inference: Begin New Session ─────────────────────── */
@@ -3255,6 +3306,24 @@ void model_batch_alloc(Model *m) {
 }
 
 void model_batch_begin(Model *m) {
+#ifdef LAL_CUDA
+    /* v13u: zero device grad_accum */
+    if (g_use_cuda) {
+        for (int l = 0; l < m->cfg.n_layer; l++) {
+            TransLayer *tl = &m->layers[l];
+            BinLayer *bls[] = {&tl->attn_q, &tl->attn_o, &tl->mlp_gate, &tl->mlp_down};
+            for (int b = 0; b < 4; b++) {
+                if (bls[b]->d_grad_accum) {
+                    cudaMemset(bls[b]->d_grad_accum, 0,
+                        (size_t)bls[b]->in_dim * bls[b]->out_dim * sizeof(float));
+                    if (bls[b]->d_bias_grad_accum)
+                        cudaMemset(bls[b]->d_bias_grad_accum, 0,
+                            bls[b]->out_dim * sizeof(float));
+                }
+            }
+        }
+    }
+#endif
     for (int l = 0; l < m->cfg.n_layer; l++) {
         TransLayer *tl = &m->layers[l];
         /* Zero norm weight gradients */
@@ -3397,6 +3466,27 @@ void model_batch_apply(Model *m, float lr, int batch_size) {
         for (int b = 0; b < n_bl; b++) {
             BinLayer *bl = bls[b];
             if (!bl->grad_accum || !bl->w_float) continue;
+
+#ifdef LAL_CUDA
+            /* v13u: download device grad_accum to host before Adam */
+            if (g_use_cuda && bl->d_grad_accum) {
+                cudaMemcpy(bl->grad_accum, bl->d_grad_accum,
+                    (size_t)bl->in_dim * bl->out_dim * sizeof(float),
+                    2);
+                if (bl->bias_grad_accum && bl->d_bias_grad_accum)
+                    cudaMemcpy(bl->bias_grad_accum, bl->d_bias_grad_accum,
+                        bl->out_dim * sizeof(float), 2);
+                /* v13u debug: check gradient magnitude */
+                if (l == 0 && b == 2) {
+                    float gmax = 0, gsum = 0;
+                    for (int i = 0; i < in * out && i < 100; i++) {
+                        gmax = fmaxf(gmax, fabsf(bl->grad_accum[i]));
+                        gsum += fabsf(bl->grad_accum[i]);
+                    }
+                    printf("[DBG] L0 mlp_gate grad: max=%.6f avg=%.6f (first 100)\n", gmax, gsum/100);
+                }
+            }
+#endif
 
             int in = bl->in_dim, out = bl->out_dim;
             int t = g_opt_step + 1;
@@ -3620,7 +3710,8 @@ void model_batch_apply(Model *m, float lr, int batch_size) {
             }
 
 layer_done:
-            /* BUG #54 FIX 方案I + v10: 定期检查 W_v effective rank + decay 0.999
+            #ifndef LAL_CUDA
+/* BUG #54 FIX 方案I + v10: 定期检查 W_v effective rank + decay 0.999
              *
              * 根因: 正反馈循环让 W_v 退化为 rank-1
              * v8 step100 rank=300 (好), step200 rank=5 (退化)
@@ -3854,6 +3945,9 @@ layer_done:
                            g_opt_step, l, off_diag_o, diag_dev_o);
                 }
             }
+            
+#endif /* skip N^3 ortho reg in CUDA mode */
+
             /* Weight clipping + repack: per-neuron based on logic_mask.
              * CORE (float): ±2.0 — needs room for precise differentiation.
              * BINARY (sign): ±1.0 — must stay near ±1 for sign function.
@@ -4064,6 +4158,24 @@ layer_done:
                 bin_layer_repack(bls[b]);
         }
     }
+
+#ifdef LAL_CUDA
+    /* v13k: Sync updated w_float to GPU for next forward pass.
+     * Called after all layers' weights are updated by Adam. */
+    if (g_use_cuda) {
+        extern void lal_cuda_sync_layer(BinLayer*);
+        for (int l = 0; l < m->cfg.n_layer; l++) {
+            TransLayer *tl = &m->layers[l];
+            BinLayer *bls[8] = {&tl->attn_q, &tl->attn_o, &tl->mlp_gate, &tl->mlp_down};
+            int n_bl = 4;
+            if (!m->cfg.qkv_merged) { bls[4] = &tl->attn_k; bls[5] = &tl->attn_v; n_bl = 6; }
+            if (m->cfg.act_type == ACT_SWIGLU) { bls[n_bl] = &tl->mlp_up; n_bl++; }
+            for (int b = 0; b < n_bl; b++) {
+                if (bls[b]->_gpu) lal_cuda_sync_layer(bls[b]);
+            }
+        }
+    }
+#endif
 
     /* Increment Adam step once per batch */
     if (g_use_adam) g_opt_step++;
