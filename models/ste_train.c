@@ -1167,6 +1167,7 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
                     if (g_use_cuda) {
                         loss = lal_cuda_full_forward(m, batch_tokens[b], pred_pos + 1,
                                                       target, grad_hidden, &predicted);
+                        lal_cuda_full_backward(m, batch_tokens[b], pred_pos + 1, target);
                     } else
 #endif
                     {
