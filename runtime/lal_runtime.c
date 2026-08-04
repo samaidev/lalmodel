@@ -3265,6 +3265,24 @@ void model_batch_alloc(Model *m) {
 }
 
 void model_batch_begin(Model *m) {
+#ifdef LAL_CUDA
+    /* v13u: zero device grad_accum */
+    if (g_use_cuda) {
+        for (int l = 0; l < m->cfg.n_layer; l++) {
+            TransLayer *tl = &m->layers[l];
+            BinLayer *bls[] = {&tl->attn_q, &tl->attn_o, &tl->mlp_gate, &tl->mlp_down};
+            for (int b = 0; b < 4; b++) {
+                if (bls[b]->d_grad_accum) {
+                    cudaMemset(bls[b]->d_grad_accum, 0,
+                        (size_t)bls[b]->in_dim * bls[b]->out_dim * sizeof(float));
+                    if (bls[b]->d_bias_grad_accum)
+                        cudaMemset(bls[b]->d_bias_grad_accum, 0,
+                            bls[b]->out_dim * sizeof(float));
+                }
+            }
+        }
+    }
+#endif
     for (int l = 0; l < m->cfg.n_layer; l++) {
         TransLayer *tl = &m->layers[l];
         /* Zero norm weight gradients */
