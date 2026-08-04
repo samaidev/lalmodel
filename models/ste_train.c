@@ -50,6 +50,7 @@ static float logic_guided_regularization(Model *m, float lr) {
     float alpha = 4.0f;   /* CORE 差异化权重 (v1: 2.0, v2: 4.0) */
     float beta = 0.2f;    /* BINARY 收敛权重 */
     float total_loss = 0.0f;
+    float logic_loss = 0.0f;
     int n_guided_layers = 0;
 
     /* 统计三类神经元总数 */
@@ -105,174 +106,75 @@ static float logic_guided_regularization(Model *m, float lr) {
     }
 
     /* 预计算所有 emb (14 次,不是 112 次) */
-    for (int p = 0; p < (int)N_PROBE_PAIRS; p++) {
-        ConceptPair *cp = &probe_pairs[p];
-        get_concept_embedding(m, cp->bytes_a, &emb_cache_a[(size_t)p * n_embd], n_embd);
-        get_concept_embedding(m, cp->bytes_b, &emb_cache_b[(size_t)p * n_embd], n_embd);
-    }
-
-    /* v13m: GPU fused batch forward -- ALL intermediates stay on GPU.
-     * Replaces v13l's per-matmul H2D/D2H with single upload + per-layer D2H(norm2).
-     * Output layout: [layer, batch, n_embd] (layer-major for coalesced GPU write). */
-    int batch = (int)N_PROBE_PAIRS;
-
-    /* v13q: logic_reg uses CPU (fwd_batch has cuBLAS param issues) */
+    /* v13r: GPU logic_reg — simulate_activation + grad_accum on GPU */
+#ifdef LAL_CUDA
+    if (g_use_cuda) {
+        logic_loss = lal_cuda_logic_reg(m, gate_cache_a, gate_cache_b, lr);
+    } else
+#endif
     {
-        static float *gate_cache_all = NULL;
-        static int gca_n = 0, gca_layers = 0;
-        if (gca_n != n_embd || gca_layers != n_layer) {
-            free(gate_cache_all);
-            gate_cache_all = malloc((size_t)batch * n_layer * n_embd * sizeof(float));
-            gca_n = n_embd; gca_layers = n_layer;
-        }
-        compute_all_gate_inputs_batch(m, emb_cache_a, batch, gate_cache_all, n_embd);
-        memcpy(gate_cache_a, gate_cache_all, (size_t)batch * n_layer * n_embd * sizeof(float));
-        compute_all_gate_inputs_batch(m, emb_cache_b, batch, gate_cache_all, n_embd);
-        memcpy(gate_cache_b, gate_cache_all, (size_t)batch * n_layer * n_embd * sizeof(float));
-    }
-
-    /* 对每个 pair 用缓存的 gate_input 算激活和梯度 */
-    float *act_a = malloc(mlp_dim * sizeof(float));
-    float *act_b = malloc(mlp_dim * sizeof(float));
-
-    /* v13g: final_hidden buffers for logit diversity loss */
-    static float *final_a = NULL, *final_b = NULL;
-    static int fh_n = 0;
-    if (fh_n != n_embd) {
-        free(final_a); free(final_b);
-        final_a = malloc(n_embd * sizeof(float));
-        final_b = malloc(n_embd * sizeof(float));
-        fh_n = n_embd;
-    }
-
-    for (int p = 0; p < (int)N_PROBE_PAIRS; p++) {
-        /* v13l: gate_cache_a/b already filled by batch forward above.
-         * final_a/final_b not computed in batch mode (would need separate pass).
-         * Skip logit diversity loss for now (was minor effect). */
-
-        /* 对每层用缓存的 gate_input 算激活和梯度 */
-        for (int l = 0; l < n_layer; l++) {
-            BinLayer *fc = &m->layers[l].mlp_gate;
-            uint8_t *mask = fc->logic_mask;
-            if (!mask) continue;
-
-            int layer_in_dim = fc->in_dim;
-            /* v13l: gate_cache is now [batch * n_layer * n_embd] */
-            float *gate_a = &gate_cache_a[((size_t)l * batch + p) * n_embd];
-            float *gate_b = &gate_cache_b[((size_t)l * batch + p) * n_embd];
-
-            simulate_activation(m, gate_a, l, act_a, mlp_dim);
-            simulate_activation(m, gate_b, l, act_b, mlp_dim);
-
-            /* 计算损失 + 统计
-             * BUG #49 FIX: CORE loss 用 -alpha*|diff| 时,模型可以通过让所有
-             * CORE激活都很大来最小化loss(因为|diff|在两个方向都会增大)。
-             * 这导致CORE对所有概念都产生高激活但不区分概念(act=3.75, diff=0.23)。
-             * 修复: 用 tanh(adiff) 饱和函数,让diff超过一定值后不再奖励。
-             * tanh 在 0附近≈x(线性),在>2后≈1(饱和),防止无限制增大激活。 */
-            int layer_nc = 0, layer_nb = 0;
-            for (int j = 0; j < mlp_dim; j++) {
-                if (mask[j] == 2) continue;
-                float diff = act_a[j] - act_b[j];
-                float adiff = fabsf(diff);
-                if (mask[j] == 0) {
-                    /* OPTIMIZATION v2: tanh(adiff*0.5) 放宽饱和点 */
-                    total_loss -= alpha * tanhf(adiff * 0.5f);
-                    /* OPTIMIZATION v3: 激活幅度惩罚 — 防止 CORE 对所有概念高激活但不区分
-                     * 惩罚 |act_a| + |act_b| 过大, 强制 CORE 保持适度激活
-                     * gamma=0.1 让幅度惩罚和差异化惩罚平衡 */
-                    float gamma = 0.3f;
-                    total_loss += gamma * (fabsf(act_a[j]) + fabsf(act_b[j]));
-                    layer_nc++;
-                } else {
-                    total_loss += beta * diff * diff;
-                    layer_nb++;
-                }
-            }
-
-            float inv_nc = layer_nc > 0 ? 1.0f / sqrtf((float)layer_nc) : 0;
-            float inv_nb = layer_nb > 0 ? 1.0f / sqrtf((float)layer_nb) : 0;
-            float layer_lr_scale = (l == 0) ? 1.0f : 0.5f;
-
-            for (int j = 0; j < mlp_dim; j++) {
-                if (mask[j] == 2) continue;
-                float diff = act_a[j] - act_b[j];
-                float *ga = &fc->grad_accum[(size_t)j * layer_in_dim];
-
-                if (mask[j] == 0) {  /* CORE */
-                    /* OPTIMIZATION v2: gradient of -alpha*tanh(|diff|*0.5):
-                     * d/dw [-alpha*tanh(|diff|*0.5)] = -alpha*0.5 * sign(diff) * (1-tanh²(|diff|*0.5))
-                     * The 0.5 factor and (1-tanh²) provide gentler saturation than v1. */
-                    float s = diff > 0 ? 1.0f : -1.0f;
-                    float tanh_adiff = tanhf(fabsf(diff) * 0.5f);
-                    float diff_grad = -alpha * 0.5f * s * (1.0f - tanh_adiff * tanh_adiff);
-                    /* OPTIMIZATION v3: 激活幅度惩罚梯度
-                     * d/dw [gamma*(|act_a|+|act_b|)] = gamma * sign(act) * d_act/dw
-                     * 对 gate_a: gamma*sign(act_a), 对 gate_b: gamma*sign(act_b) */
-                    float gamma = 0.3f;
-                    float mag_grad_a = gamma * (act_a[j] > 0 ? 1.0f : -1.0f);
-                    float mag_grad_b = gamma * (act_b[j] > 0 ? 1.0f : -1.0f);
-                    float grad_scale = (diff_grad + mag_grad_a) * inv_nc * layer_lr_scale * lr;
-                    /* 对 gate_a 和 gate_b 分别应用 (diff_grad 对 a 用 +, 对 b 用 -) */
-                    for (int i = 0; i < layer_in_dim; i++)
-                        ga[i] += grad_scale * (gate_a[i] - gate_b[i]) + mag_grad_b * inv_nc * layer_lr_scale * lr * gate_b[i];
-                    if (fc->bias_grad_accum)
-                        fc->bias_grad_accum[j] += grad_scale + mag_grad_b * inv_nc * layer_lr_scale * lr;
-                } else {  /* BINARY */
-                    float grad_scale = beta * 2.0f * diff * inv_nb * layer_lr_scale * lr;
-                    for (int i = 0; i < layer_in_dim; i++)
-                        ga[i] += grad_scale * (gate_a[i] - gate_b[i]);
-                    if (fc->bias_grad_accum)
-                        fc->bias_grad_accum[j] += grad_scale;
-                }
-            }
-        }
-
-        /* v13g: Logit diversity loss — 惩罚首 token 坍缩到标点.
-         * v13d 问题: 所有输入的首 token logits 都坍缩到 ',' (id=31865, logit=4.67)
-         * 和 '。' (id=31861, logit=4.05), 远高于其他 token. 生成总是以标点开头.
-         *
-         * 方案: 用 final_a/final_b (已缓存) 算高频标点 token 的 logit,
-         * 如果 logit > threshold (2.0), 加 loss = penalty_weight * (logit - 2.0).
-         * 梯度: d(loss)/d(wte[v]) = penalty_weight * final_hidden, 加到 grad_wte_accum.
-         * 这让 wte[v] 的权重行被推离 final_hidden 方向, 降低该 token 的 logit. */
-        {
-            static const int penalty_tokens[] = {31865, 31861, 31906, 31919, 31920};
-            static const int n_penalty = sizeof(penalty_tokens) / sizeof(penalty_tokens[0]);
-            const float logit_threshold = 2.0f;
-            const float penalty_weight = 0.3f * lr;  /* 与 logic_lr 同步缩放 */
-            int vocab = m->cfg.vocab_size;
-
-            for (int t = 0; t < n_penalty; t++) {
-                int v = penalty_tokens[t];
-                if (v < 0 || v >= vocab) continue;
-                /* logit = wte[v] · final_hidden */
-                float la = 0, lb = 0;
-                for (int i = 0; i < n_embd; i++) {
-                    la += m->wte[(size_t)v * n_embd + i] * final_a[i];
-                    lb += m->wte[(size_t)v * n_embd + i] * final_b[i];
-                }
-                /* 惩罚 a */
-                if (la > logit_threshold) {
-                    total_loss += penalty_weight * (la - logit_threshold);
-                    if (m->grad_wte_accum) {
-                        for (int i = 0; i < n_embd; i++)
-                            m->grad_wte_accum[(size_t)v * n_embd + i] += penalty_weight * final_a[i];
+        /* CPU fallback: original logic_reg loop */
+        int batch = (int)N_PROBE_PAIRS;
+        float *act_a = malloc(mlp_dim * sizeof(float));
+        float *act_b = malloc(mlp_dim * sizeof(float));
+        for (int p = 0; p < (int)N_PROBE_PAIRS; p++) {
+            for (int l = 0; l < n_layer; l++) {
+                BinLayer *fc = &m->layers[l].mlp_gate;
+                uint8_t *mask = fc->logic_mask;
+                if (!mask) continue;
+                int layer_in_dim = fc->in_dim;
+                float *gate_a = &gate_cache_a[((size_t)l * batch + p) * n_embd];
+                float *gate_b = &gate_cache_b[((size_t)l * batch + p) * n_embd];
+                simulate_activation(m, gate_a, l, act_a, mlp_dim);
+                simulate_activation(m, gate_b, l, act_b, mlp_dim);
+                int layer_nc = 0, layer_nb = 0;
+                for (int j = 0; j < mlp_dim; j++) {
+                    if (mask[j] == 2) continue;
+                    float diff = act_a[j] - act_b[j];
+                    float adiff = fabsf(diff);
+                    if (mask[j] == 0) {
+                        total_loss -= alpha * tanhf(adiff * 0.5f);
+                        float gamma = 0.3f;
+                        total_loss += gamma * (fabsf(act_a[j]) + fabsf(act_b[j]));
+                        layer_nc++;
+                    } else {
+                        total_loss += beta * diff * diff;
+                        layer_nb++;
                     }
                 }
-                /* 惩罚 b */
-                if (lb > logit_threshold) {
-                    total_loss += penalty_weight * (lb - logit_threshold);
-                    if (m->grad_wte_accum) {
-                        for (int i = 0; i < n_embd; i++)
-                            m->grad_wte_accum[(size_t)v * n_embd + i] += penalty_weight * final_b[i];
+                float inv_nc = layer_nc > 0 ? 1.0f / sqrtf((float)layer_nc) : 0;
+                float inv_nb = layer_nb > 0 ? 1.0f / sqrtf((float)layer_nb) : 0;
+                float layer_lr_scale = (l == 0) ? 1.0f : 0.5f;
+                for (int j = 0; j < mlp_dim; j++) {
+                    if (mask[j] == 2) continue;
+                    float diff = act_a[j] - act_b[j];
+                    float *ga = &fc->grad_accum[(size_t)j * layer_in_dim];
+                    if (mask[j] == 0) {
+                        float s = diff > 0 ? 1.0f : -1.0f;
+                        float tanh_adiff = tanhf(fabsf(diff) * 0.5f);
+                        float diff_grad = -alpha * 0.5f * s * (1.0f - tanh_adiff * tanh_adiff);
+                        float gamma = 0.3f;
+                        float mag_grad_a = gamma * (act_a[j] > 0 ? 1.0f : -1.0f);
+                        float mag_grad_b = gamma * (act_b[j] > 0 ? 1.0f : -1.0f);
+                        float grad_scale = (diff_grad + mag_grad_a) * inv_nc * layer_lr_scale * lr;
+                        for (int i = 0; i < layer_in_dim; i++)
+                            ga[i] += grad_scale * (gate_a[i] - gate_b[i]) + mag_grad_b * inv_nc * layer_lr_scale * lr * gate_b[i];
+                        if (fc->bias_grad_accum)
+                            fc->bias_grad_accum[j] += grad_scale + mag_grad_b * inv_nc * layer_lr_scale * lr;
+                    } else {
+                        float grad_scale = beta * 2.0f * diff * inv_nb * layer_lr_scale * lr;
+                        for (int i = 0; i < layer_in_dim; i++)
+                            ga[i] += grad_scale * (gate_a[i] - gate_b[i]);
+                        if (fc->bias_grad_accum)
+                            fc->bias_grad_accum[j] += grad_scale;
                     }
                 }
             }
         }
+        free(act_a); free(act_b);
+        logic_loss = total_loss / (N_PROBE_PAIRS * n_guided_layers);
     }
-
-    free(act_a); free(act_b);
+    
 
     /* 注:wte 推开试验过,但 byte-level 下反义词共享首 byte(热=0xE783AD, 冷=0xE586B7),
      * 推开单个 byte embedding 会污染所有以该 byte 开头的字符,适得其反。
@@ -284,7 +186,7 @@ static float logic_guided_regularization(Model *m, float lr) {
     last_binary = total_binary;
     last_prune = total_prune;
 
-    return total_loss / (N_PROBE_PAIRS * n_guided_layers);
+    return logic_loss;
 }
 
 /* 获取上次逻辑引导的三类神经元统计 */

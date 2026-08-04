@@ -91,6 +91,7 @@ void lal_cuda_compute_gate_inputs_batch(
     float *out_gate_inputs, int n_embd);
 
 /* v13p/q: Full GPU forward+backward */
+float lal_cuda_logic_reg(Model *m, const float *gate_a, const float *gate_b, float lr);
 float lal_cuda_full_forward(Model *m, const int *tokens, int seq_len,
                             int target, float *grad_hidden, int *predicted);
 void lal_cuda_full_backward(Model *m, const int *tokens, int seq_len, int target);

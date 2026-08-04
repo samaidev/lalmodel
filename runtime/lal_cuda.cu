@@ -1616,3 +1616,253 @@ void lal_cuda_full_backward(
     
     cudaStreamSynchronize(s);
 }
+
+/* ===================== v13r: GPU logic_reg =====================
+ *
+ * Replaces CPU logic_guided_regularization inner loop.
+ * For each layer, for each concept pair (a,b):
+ *   1. act_a = simulate_activation(gate_a)  → k_matvec on GPU
+ *   2. act_b = simulate_activation(gate_b)  → k_matvec on GPU
+ *   3. For each output j: compute diff, loss, gradient
+ *   4. Accumulate gradient into grad_accum
+ *
+ * All concept pairs batched: act_a/b is [N_PAIRS, mlp_dim].
+ */
+
+/* GPU kernel: simulate_activation for all pairs at once.
+ * act[pair, j] = bias[j] + sum_i W[j*in+i] * gate[pair, i]
+ * W is [out, in] row-major, gate is [batch, in], act is [batch, out].
+ * This is a batched matvec: act = gate @ W^T
+ * Each thread computes one (pair, j) element. */
+__global__ void k_sim_act_batch(float *act, const float *W, const float *bias,
+                                  const float *gate, int in_dim, int out_dim,
+                                  int batch, const uint8_t *mask) {
+    int pair = blockIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= out_dim || pair >= batch) return;
+    if (mask && mask[j] == 2) {  /* PRUNE */
+        act[pair * out_dim + j] = 0.0f;
+        return;
+    }
+    float s = bias ? bias[j] : 0.0f;
+    const float *wr = W + (size_t)j * in_dim;
+    const float *g = gate + (size_t)pair * in_dim;
+    for (int i = 0; i < in_dim; i++)
+        s += wr[i] * g[i];
+    act[pair * out_dim + j] = s;
+}
+
+/* GPU kernel: compute logic_reg loss + gradient accumulation.
+ * For each (pair, j):
+ *   CORE: loss -= alpha * tanh(|diff|*0.5) + gamma*(|act_a|+|act_b|)
+ *         grad: -alpha*0.5*sign(diff)*(1-tanh²) + gamma*sign(act)
+ *   BINARY: loss += beta * diff²
+ *           grad: beta*2*diff
+ * Accumulate grad into grad_accum[j*in + i] += grad_scale * (gate_a[i] - gate_b[i])
+ *
+ * This is the expensive part: for each j, loop over in_dim.
+ * Thread per j, each thread loops over in_dim (512). */
+__global__ void k_logic_grad_accum(
+    float *grad_accum,       /* [out * in] — weight gradient */
+    float *bias_grad_accum,  /* [out] — bias gradient */
+    const float *act_a,      /* [batch * out] — activations for concept A */
+    const float *act_b,      /* [batch * out] — activations for concept B */
+    const float *gate_a,     /* [batch * in] — gate inputs for A */
+    const float *gate_b,     /* [batch * in] — gate inputs for B */
+    const uint8_t *mask,     /* [out] — logic mask */
+    int in_dim, int out_dim, int batch,
+    float alpha, float beta, float gamma,
+    float lr, float inv_nc, float inv_nb, float layer_lr_scale
+) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= out_dim) return;
+    if (mask && mask[j] == 2) return;  /* PRUNE: skip */
+
+    /* Aggregate loss + gradient across all pairs */
+    float total_grad_a = 0.0f;  /* accumulated grad for gate_a direction */
+    float total_grad_b = 0.0f;  /* accumulated grad for gate_b direction */
+
+    for (int p = 0; p < batch; p++) {
+        float aa = act_a[p * out_dim + j];
+        float ab = act_b[p * out_dim + j];
+        float diff = aa - ab;
+        float adiff = fabsf(diff);
+
+        if (mask[j] == 0) {  /* CORE */
+            float s = diff > 0 ? 1.0f : -1.0f;
+            float tanh_adiff = tanhf(adiff * 0.5f);
+            float diff_grad = -alpha * 0.5f * s * (1.0f - tanh_adiff * tanh_adiff);
+            float mag_grad_a = gamma * (aa > 0 ? 1.0f : -1.0f);
+            float mag_grad_b = gamma * (ab > 0 ? 1.0f : -1.0f);
+            total_grad_a += (diff_grad + mag_grad_a) * inv_nc * layer_lr_scale * lr;
+            total_grad_b += mag_grad_b * inv_nc * layer_lr_scale * lr;
+        } else {  /* BINARY */
+            float grad_scale = beta * 2.0f * diff * inv_nb * layer_lr_scale * lr;
+            total_grad_a += grad_scale;
+            total_grad_b -= grad_scale;
+        }
+    }
+
+    /* Accumulate: grad_accum[j*in + i] += total_grad_a * gate_a[p*in+i]
+     *                                + total_grad_b * gate_b[p*in+i]
+     * But gate_a/b differ per pair. Need to loop over pairs again. */
+    float *ga = grad_accum + (size_t)j * in_dim;
+    for (int p = 0; p < batch; p++) {
+        const float *g_a = gate_a + (size_t)p * in_dim;
+        const float *g_b = gate_b + (size_t)p * in_dim;
+        for (int i = 0; i < in_dim; i++)
+            ga[i] += total_grad_a * g_a[i] + total_grad_b * g_b[i];
+    }
+
+    if (bias_grad_accum)
+        bias_grad_accum[j] += total_grad_a + total_grad_b;
+}
+
+/* v13r: GPU logic_guided_regularization.
+ * Computes simulate_activation + grad_accum for all layers, all pairs, on GPU.
+ * gate_a/b are [batch, n_embd] per layer (from CPU compute_all_gate_inputs_batch).
+ * Uploads them to GPU, runs k_sim_act_batch + k_logic_grad_accum per layer. */
+extern "C"
+float lal_cuda_logic_reg(
+    Model *m,
+    const float *gate_a_host,  /* [n_layer * batch * n_embd] */
+    const float *gate_b_host,  /* [n_layer * batch * n_embd] */
+    float lr
+) {
+    int n = m->cfg.n_embd;
+    int n_layer = m->cfg.n_layer;
+    int mlp_dim = m->cfg.mlp_dim;
+    int batch = 7;  /* N_PROBE_PAIRS */
+    float alpha = 4.0f, beta = 0.2f, gamma = 0.3f;
+    float total_loss = 0.0f;
+
+    static cudaStream_t s = NULL;
+    if (!s) cudaStreamCreate(&s);
+
+    /* Persistent device buffers */
+    static float *d_gate_a = NULL, *d_gate_b = NULL;
+    static float *d_act_a = NULL, *d_act_b = NULL;
+    static int d_cap = 0;
+    int need = batch * (n > mlp_dim ? n : mlp_dim);
+    if (need > d_cap) {
+        if (d_gate_a) { cudaFree(d_gate_a); cudaFree(d_gate_b);
+                        cudaFree(d_act_a); cudaFree(d_act_b); }
+        cudaMalloc(&d_gate_a, batch * n * sizeof(float));
+        cudaMalloc(&d_gate_b, batch * n * sizeof(float));
+        cudaMalloc(&d_act_a, batch * mlp_dim * sizeof(float));
+        cudaMalloc(&d_act_b, batch * mlp_dim * sizeof(float));
+        d_cap = need;
+    }
+
+    int thr = 256;
+
+    for (int l = 0; l < n_layer; l++) {
+        BinLayer *fc = &m->layers[l].mlp_gate;
+        if (!fc->logic_mask || !fc->_gpu) continue;
+
+        LayerGPU *g = (LayerGPU*)fc->_gpu;
+        int in_dim = fc->in_dim;
+        int out_dim = fc->out_dim;
+
+        /* Upload gate inputs for this layer */
+        const float *layer_gate_a = gate_a_host + (size_t)l * batch * n;
+        const float *layer_gate_b = gate_b_host + (size_t)l * batch * n;
+        cudaMemcpyAsync(d_gate_a, layer_gate_a, batch * n * sizeof(float),
+                        cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(d_gate_b, layer_gate_b, batch * n * sizeof(float),
+                        cudaMemcpyHostToDevice, s);
+
+        /* Upload logic_mask */
+        static float *d_mask = NULL;
+        if (!d_mask) cudaMalloc(&d_mask, out_dim * sizeof(uint8_t));
+        cudaMemcpyAsync(d_mask, fc->logic_mask, out_dim * sizeof(uint8_t),
+                        cudaMemcpyHostToDevice, s);
+
+        /* Compute activations: act = gate @ W^T (+ bias, with PRUNE zeroing) */
+        dim3 grid_a((out_dim + thr - 1) / thr, batch);
+        k_sim_act_batch<<<grid_a, thr, 0, s>>>(d_act_a, g->d_w, g->d_bias,
+                                                d_gate_a, in_dim, out_dim, batch,
+                                                (const uint8_t*)d_mask);
+        k_sim_act_batch<<<grid_a, thr, 0, s>>>(d_act_b, g->d_w, g->d_bias,
+                                                d_gate_b, in_dim, out_dim, batch,
+                                                (const uint8_t*)d_mask);
+
+        /* Download activations for loss computation (CPU side) */
+        /* Actually: compute loss on GPU too. But loss needs reduction.
+         * For simplicity: download act_a, act_b, compute loss on CPU. */
+        static float *h_act_a = NULL, *h_act_b = NULL;
+        if (!h_act_a) { h_act_a = (float*)malloc(batch * mlp_dim * sizeof(float));
+                        h_act_b = (float*)malloc(batch * mlp_dim * sizeof(float)); }
+        cudaMemcpyAsync(h_act_a, d_act_a, batch * mlp_dim * sizeof(float),
+                        cudaMemcpyDeviceToHost, s);
+        cudaMemcpyAsync(h_act_b, d_act_b, batch * mlp_dim * sizeof(float),
+                        cudaMemcpyDeviceToHost, s);
+        cudaStreamSynchronize(s);
+
+        /* Compute loss + counts on CPU */
+        int nc = 0, nb = 0;
+        for (int p = 0; p < batch; p++) {
+            for (int j = 0; j < out_dim; j++) {
+                if (fc->logic_mask[j] == 2) continue;
+                float diff = h_act_a[p*out_dim+j] - h_act_b[p*out_dim+j];
+                float adiff = fabsf(diff);
+                if (fc->logic_mask[j] == 0) {
+                    total_loss -= alpha * tanhf(adiff * 0.5f);
+                    total_loss += gamma * (fabsf(h_act_a[p*out_dim+j]) + fabsf(h_act_b[p*out_dim+j]));
+                    nc++;
+                } else {
+                    total_loss += beta * diff * diff;
+                    nb++;
+                }
+            }
+        }
+
+        float inv_nc = nc > 0 ? 1.0f / sqrtf((float)nc / batch) : 0;
+        float inv_nb = nb > 0 ? 1.0f / sqrtf((float)nb / batch) : 0;
+        float layer_lr_scale = (l == 0) ? 1.0f : 0.5f;
+
+        /* Gradient accumulation on GPU */
+        /* Need device grad_accum — but grad_accum is host memory.
+         * Upload grad_accum, accumulate, download back.
+         * Or: keep grad_accum on device permanently.
+         * For now: upload, accumulate, download (simpler). */
+        static float *d_grad_accum = NULL;
+        static float *d_bias_grad = NULL;
+        if (!d_grad_accum) {
+            cudaMalloc(&d_grad_accum, (size_t)out_dim * in_dim * sizeof(float));
+            cudaMalloc(&d_bias_grad, out_dim * sizeof(float));
+        }
+        cudaMemsetAsync(d_grad_accum, 0, (size_t)out_dim * in_dim * sizeof(float), s);
+        cudaMemsetAsync(d_bias_grad, 0, out_dim * sizeof(float), s);
+
+        k_logic_grad_accum<<<(out_dim + thr - 1) / thr, thr, 0, s>>>(
+            d_grad_accum, d_bias_grad,
+            d_act_a, d_act_b,
+            d_gate_a, d_gate_b,
+            (const uint8_t*)d_mask,
+            in_dim, out_dim, batch,
+            alpha, beta, gamma,
+            lr, inv_nc, inv_nb, layer_lr_scale
+        );
+
+        /* Download and add to host grad_accum */
+        static float *h_grad = NULL;
+        if (!h_grad) h_grad = (float*)malloc((size_t)out_dim * in_dim * sizeof(float));
+        cudaMemcpyAsync(h_grad, d_grad_accum, (size_t)out_dim * in_dim * sizeof(float),
+                        cudaMemcpyDeviceToHost, s);
+        static float *h_bgrad = NULL;
+        if (!h_bgrad) h_bgrad = (float*)malloc(out_dim * sizeof(float));
+        cudaMemcpyAsync(h_bgrad, d_bias_grad, out_dim * sizeof(float),
+                        cudaMemcpyDeviceToHost, s);
+        cudaStreamSynchronize(s);
+
+        /* Add to host grad_accum */
+        for (int i = 0; i < out_dim * in_dim; i++)
+            fc->grad_accum[i] += h_grad[i];
+        if (fc->bias_grad_accum)
+            for (int j = 0; j < out_dim; j++)
+                fc->bias_grad_accum[j] += h_bgrad[j];
+    }
+
+    return total_loss / (batch * n_layer);
+}
