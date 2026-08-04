@@ -917,7 +917,8 @@ for (int b = 0; b < batch; b++)
         } else {
 #ifdef LAL_CUDA
             if (g_use_cuda && tl->attn_v._gpu) {
-                lal_cuda_fwd_batch(attn_out_b, norm1b, &tl->attn_v, batch);
+                for (int b = 0; b < batch; b++)
+                    bin_forward_pure_float(&attn_out_b[b*n], &norm1b[b*n], &tl->attn_v);
             } else
 #endif
             for (int b = 0; b < batch; b++)
@@ -933,7 +934,8 @@ for (int b = 0; b < batch; b++)
         /* Batch: proj_out = attn_o @ attn_out */
 #ifdef LAL_CUDA
         if (g_use_cuda && tl->attn_o._gpu) {
-            lal_cuda_fwd_batch(proj_b, attn_out_b, &tl->attn_o, batch);
+            for (int b = 0; b < batch; b++)
+                bin_forward_pure_float(&proj_b[b*n], &attn_out_b[b*n], &tl->attn_o);
         } else
 #endif
         for (int b = 0; b < batch; b++)
@@ -958,8 +960,10 @@ for (int b = 0; b < batch; b++)
         if (m->cfg.act_type == ACT_SWIGLU) {
 #ifdef LAL_CUDA
             if (g_use_cuda && tl->mlp_gate._gpu) {
-                lal_cuda_fwd_batch(gate_b, norm2b, &tl->mlp_gate, batch);
-                lal_cuda_fwd_batch(up_b,   norm2b, &tl->mlp_up, batch);
+                for (int b = 0; b < batch; b++)
+                    bin_forward_pure_float(&gate_b[b*mlp_dim], &norm2b[b*n], &tl->mlp_gate);
+                for (int b = 0; b < batch; b++)
+                    bin_forward_pure_float(&up_b[b*mlp_dim], &norm2b[b*n], &tl->mlp_up);
             } else
 #endif
             for (int b = 0; b < batch; b++) {
@@ -972,7 +976,8 @@ for (int b = 0; b < batch; b++)
         } else {
 #ifdef LAL_CUDA
             if (g_use_cuda && tl->mlp_gate._gpu) {
-                lal_cuda_fwd_batch(hidden_b, norm2b, &tl->mlp_gate, batch);
+                for (int b = 0; b < batch; b++)
+                    bin_forward_pure_float(&hidden_b[b*mlp_dim], &norm2b[b*n], &tl->mlp_gate);
             } else
 #endif
             for (int b = 0; b < batch; b++)
@@ -984,7 +989,8 @@ for (int b = 0; b < batch; b++)
 
 #ifdef LAL_CUDA
         if (g_use_cuda && tl->mlp_down._gpu) {
-            lal_cuda_fwd_batch(mlp_out_b, hidden_b, &tl->mlp_down, batch);
+            for (int b = 0; b < batch; b++)
+                bin_forward_pure_float(&mlp_out_b[b*n], &hidden_b[b*mlp_dim], &tl->mlp_down);
         } else
 #endif
         for (int b = 0; b < batch; b++)
