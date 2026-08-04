@@ -9,6 +9,9 @@
  */
 #include "lal_runtime.h"
 #ifdef LAL_CUDA
+#ifdef LAL_CUDA
+#include <cuda_runtime.h>
+#endif
 #include "lal_cuda.h"   /* CUDA GPU training backend (runtime/lal_cuda.cu) */
 #endif
 
