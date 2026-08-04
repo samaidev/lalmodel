@@ -1626,7 +1626,7 @@ void lal_cuda_full_backward(
         
         /* grad_W_gate += grad_hidden outer norm2 */
         LayerGPU *gg = (LayerGPU*)tl->mlp_gate._gpu;
-        if (gg && gg->uploaded && tl->mlp_gate.grad_accum) {
+        if (gg && gg->uploaded && tl->mlp_gate.d_grad_accum) {
             /* v13s: GPU accumulation */
             k_grad_W_bias<<<(mlp_dim+thr-1)/thr, thr, 0, s>>>(
                 tl->mlp_gate.d_grad_accum, tl->mlp_gate.d_bias_grad_accum,
@@ -1654,7 +1654,7 @@ void lal_cuda_full_backward(
          *           grad_x -= rs * grad_proj (undo residual, then add grad_attn_out path) */
         
         LayerGPU *go = (LayerGPU*)tl->attn_o._gpu;
-        if (go && go->uploaded && tl->attn_o.grad_accum) {
+        if (go && go->uploaded && tl->attn_o.d_grad_accum) {
             /* v13u: scale grad by rs for attn residual */
             k_scale<<<(n+thr-1)/thr, thr, 0, s>>>(d_grad_x, rs, n);
             k_grad_W_bias<<<(n+thr-1)/thr, thr, 0, s>>>(
@@ -1670,7 +1670,7 @@ void lal_cuda_full_backward(
         /* grad_qkv[2n:3n] = grad_attn_out */
         /* For QKV merged: grad_W_qkv += grad_qkv outer norm1 */
         LayerGPU *gq = (LayerGPU*)tl->attn_q._gpu;
-        if (gq && gq->uploaded && tl->attn_q.grad_accum) {
+        if (gq && gq->uploaded && tl->attn_q.d_grad_accum) {
             /* v13s: GPU accumulation — only V part (2n:3n) has gradient */
             /* Upload grad_qkv to device (only V part nonzero) */
             static float *d_gqkv = NULL;
@@ -1838,7 +1838,7 @@ float lal_cuda_logic_reg(
 
     for (int l = 0; l < n_layer; l++) {
         BinLayer *fc = &m->layers[l].mlp_gate;
-        if (!fc->logic_mask || !fc->_gpu) continue;
+        if (!fc->logic_mask || !fc->_gpu || !fc->d_grad_accum) continue;
 
         LayerGPU *g = (LayerGPU*)fc->_gpu;
         int in_dim = fc->in_dim;
