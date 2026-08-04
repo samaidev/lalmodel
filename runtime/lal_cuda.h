@@ -1,3 +1,4 @@
+#include <cuda_runtime.h>
 #ifndef LAL_CUDA_H
 #define LAL_CUDA_H
 #ifdef __cplusplus
