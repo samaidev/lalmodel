@@ -1060,6 +1060,139 @@ __global__ void k_mlp_cap_residual(float *x, const float *mlp_out,
         x[i] *= x_scale;
 }
 
+/* ===================== v13q: Full GPU backward (cached activations) =====================
+ *
+ * Forward caches all intermediate activations on GPU (d_act array).
+ * Backward replays in reverse, computing gradients for w_float using
+ * k_matvec_transpose (W^T @ grad) and accumulating into grad_accum.
+ *
+ * Architecture (per layer l, reversed):
+ *   Forward:  x → norm1 → qkv → v_copy → proj → x+=proj → norm2 → gate → gelu → down → x+=mlp
+ *   Backward: grad_x ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ←
+ *
+ * Key kernels needed for backward:
+ *   k_matvec_T: grad_x[i] = sum_j W[j*in+i] * grad_y[j]  (W^T @ grad_y)
+ *   k_grad_W:   grad_W[j*in+i] += grad_y[j] * x[i]       (outer product accumulation)
+ *   k_gelu_grad: grad = grad * gelu_grad(x)
+ *   k_layernorm_grad: backprop through layernorm
+ */
+
+/* Persistent activation cache for backward */
+typedef struct {
+    float *d_x_pre;      /* [n] x before each layer (for residual skip) */
+    float *d_n1;         /* [n] norm1 output */
+    float *d_n2;         /* [n] norm2 output */
+    float *d_ao;         /* [n] attn_out (V copy) */
+    float *d_hid;        /* [mlp_dim] hidden (post-gelu) */
+    float *d_proj;       /* [n] proj_out */
+    float *d_mlp;        /* [n] mlp_out */
+    float *d_mlp_scale;  /* [1] mlp cap scale */
+} LayerAct;
+
+static LayerAct *g_acts = NULL;
+static int g_acts_nlayer = 0;
+static int g_acts_n = 0;
+static int g_acts_mlp = 0;
+static float *d_grad_x = NULL;      /* [n] gradient w.r.t. x (working buffer) */
+static float *d_grad_logits = NULL; /* [vocab] softmax - onehot */
+static float *d_softmax = NULL;     /* [vocab] softmax probabilities */
+
+/* Allocate activation cache for all layers */
+static void alloc_acts(int n_layer, int n, int mlp_dim, int vocab) {
+    if (g_acts && g_acts_nlayer == n_layer && g_acts_n == n) return;
+    if (g_acts) {
+        for (int l = 0; l < g_acts_nlayer; l++) {
+            cudaFree(g_acts[l].d_x_pre); cudaFree(g_acts[l].d_n1);
+            cudaFree(g_acts[l].d_n2); cudaFree(g_acts[l].d_ao);
+            cudaFree(g_acts[l].d_hid); cudaFree(g_acts[l].d_proj);
+            cudaFree(g_acts[l].d_mlp);
+        }
+        free(g_acts);
+    }
+    g_acts = (LayerAct*)calloc(n_layer, sizeof(LayerAct));
+    for (int l = 0; l < n_layer; l++) {
+        cudaMalloc(&g_acts[l].d_x_pre, n * sizeof(float));
+        cudaMalloc(&g_acts[l].d_n1, n * sizeof(float));
+        cudaMalloc(&g_acts[l].d_n2, n * sizeof(float));
+        cudaMalloc(&g_acts[l].d_ao, n * sizeof(float));
+        cudaMalloc(&g_acts[l].d_hid, mlp_dim * sizeof(float));
+        cudaMalloc(&g_acts[l].d_proj, n * sizeof(float));
+        cudaMalloc(&g_acts[l].d_mlp, n * sizeof(float));
+    }
+    if (!d_grad_x) cudaMalloc(&d_grad_x, n * sizeof(float));
+    if (!d_grad_logits) cudaMalloc(&d_grad_logits, vocab * sizeof(float));
+    if (!d_softmax) cudaMalloc(&d_softmax, vocab * sizeof(float));
+    g_acts_nlayer = n_layer; g_acts_n = n; g_acts_mlp = mlp_dim;
+}
+
+/* GPU kernel: transpose matvec — grad_x = W^T @ grad_y
+ *   W is [out, in] row-major: W[j*in + i]
+ *   grad_x[i] = sum_j W[j*in+i] * grad_y[j] */
+__global__ void k_matvec_T(float *grad_x, const float *W,
+                            const float *grad_y, int in_dim, int out_dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= in_dim) return;
+    float s = 0.0f;
+    for (int j = 0; j < out_dim; j++)
+        s += W[(size_t)j * in_dim + i] * grad_y[j];
+    grad_x[i] = s;
+}
+
+/* GPU kernel: accumulate weight gradient — grad_W[j*in+i] += grad_y[j] * x[i]
+ * Also accumulate bias gradient: grad_bias[j] += grad_y[j] */
+__global__ void k_grad_W_bias(float *grad_W, float *grad_bias,
+                                const float *grad_y, const float *x,
+                                int in_dim, int out_dim) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= out_dim) return;
+    float gy = grad_y[j];
+    float *gw = grad_W + (size_t)j * in_dim;
+    for (int i = 0; i < in_dim; i++)
+        gw[i] += gy * x[i];
+    if (grad_bias)
+        grad_bias[j] += gy;
+}
+
+/* GPU kernel: GELU gradient — grad *= 0.5 * (1 + tanh(sqrt(2/pi)(x + 0.044715x^3)))
+ *   + constant from gelu'(x) */
+__global__ void k_gelu_grad(float *grad, const float *x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = x[i];
+    float c = 0.7978845608f * (v + 0.044715f * v * v * v);
+    float t = tanhf(c);
+    /* gelu'(x) = 0.5 * (1 + t) + 0.5 * x * (1 - t*t) * 0.7978845608 * (1 + 0.134145 * x*x) */
+    float dv = 0.5f * (1.0f + t) + 0.5f * v * (1.0f - t*t) * 0.7978845608f * (1.0f + 0.134145f * v * v);
+    grad[i] *= dv;
+}
+
+/* GPU kernel: softmax - onehot (CE gradient w.r.t. logits) */
+__global__ void k_ce_grad(float *grad_logits, float *softmax,
+                           const float *logits, int target, float max_l, int vocab) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= vocab) return;
+    float p = expf(logits[i] - max_l);  /* unnormalized */
+    softmax[i] = p;  /* will normalize on host or via reduction */
+    grad_logits[i] = p;  /* temp, normalize after */
+}
+
+/* Normalize softmax and compute grad_logits = softmax - onehot(target) */
+__global__ void k_normalize_ce_grad(float *grad_logits, float *softmax,
+                                      float inv_sum, int target, int vocab) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= vocab) return;
+    float p = softmax[i] * inv_sum;
+    softmax[i] = p;
+    grad_logits[i] = p - (i == target ? 1.0f : 0.0f);
+}
+
+/* v13q: Full GPU backward.
+ * Given softmax from forward, compute gradients for all weights.
+ * Accumulates into bl->grad_accum (host-side, downloaded at end). */
+
+static float *d_logits = NULL;  /* [vocab] shared forward/backward */
+static float *d_wte = NULL;     /* [vocab*n] shared */
+
 /* v13p: Full GPU forward for CE training.
  * Input: token IDs [seq_len], target token
  * Output: CE loss (returned), grad_hidden [n_embd] (for backward)
@@ -1083,7 +1216,6 @@ __global__ void k_matvec(float *y, const float *W, const float *x,
     y[j] = s;
 }
 
-extern "C"
 float lal_cuda_full_forward(
     Model *m,
     const int *tokens,     /* host, [seq_len] */
@@ -1111,8 +1243,7 @@ float lal_cuda_full_forward(
     static float *d_proj = NULL;    /* [n] proj out */
     static float *d_hid = NULL;     /* [mlp_dim] hidden */
     static float *d_mlp = NULL;     /* [n] mlp out */
-    static float *d_logits = NULL;  /* [vocab] logits */
-    static float *d_wte = NULL;     /* [vocab * n] wte on device */
+    /* d_logits and d_wte are file-scope static (shared with backward) */
     static float *d_wpe = NULL;     /* [n_ctx * n] wpe on device */
     static float *d_nw1=NULL,*d_nb1=NULL,*d_nw2=NULL,*d_nb2=NULL,*d_lnfw=NULL,*d_lnfb=NULL;
     static int d_cap = 0;
@@ -1277,135 +1408,6 @@ float lal_cuda_full_forward(
     return loss;
 }
 
-/* ===================== v13q: Full GPU backward (cached activations) =====================
- *
- * Forward caches all intermediate activations on GPU (d_act array).
- * Backward replays in reverse, computing gradients for w_float using
- * k_matvec_transpose (W^T @ grad) and accumulating into grad_accum.
- *
- * Architecture (per layer l, reversed):
- *   Forward:  x → norm1 → qkv → v_copy → proj → x+=proj → norm2 → gate → gelu → down → x+=mlp
- *   Backward: grad_x ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ←
- *
- * Key kernels needed for backward:
- *   k_matvec_T: grad_x[i] = sum_j W[j*in+i] * grad_y[j]  (W^T @ grad_y)
- *   k_grad_W:   grad_W[j*in+i] += grad_y[j] * x[i]       (outer product accumulation)
- *   k_gelu_grad: grad = grad * gelu_grad(x)
- *   k_layernorm_grad: backprop through layernorm
- */
-
-/* Persistent activation cache for backward */
-typedef struct {
-    float *d_x_pre;      /* [n] x before each layer (for residual skip) */
-    float *d_n1;         /* [n] norm1 output */
-    float *d_n2;         /* [n] norm2 output */
-    float *d_ao;         /* [n] attn_out (V copy) */
-    float *d_hid;        /* [mlp_dim] hidden (post-gelu) */
-    float *d_proj;       /* [n] proj_out */
-    float *d_mlp;        /* [n] mlp_out */
-    float *d_mlp_scale;  /* [1] mlp cap scale */
-} LayerAct;
-
-static LayerAct *g_acts = NULL;
-static int g_acts_nlayer = 0;
-static int g_acts_n = 0;
-static int g_acts_mlp = 0;
-static float *d_grad_x = NULL;      /* [n] gradient w.r.t. x (working buffer) */
-static float *d_grad_logits = NULL; /* [vocab] softmax - onehot */
-static float *d_softmax = NULL;     /* [vocab] softmax probabilities */
-
-/* Allocate activation cache for all layers */
-static void alloc_acts(int n_layer, int n, int mlp_dim, int vocab) {
-    if (g_acts && g_acts_nlayer == n_layer && g_acts_n == n) return;
-    if (g_acts) {
-        for (int l = 0; l < g_acts_nlayer; l++) {
-            cudaFree(g_acts[l].d_x_pre); cudaFree(g_acts[l].d_n1);
-            cudaFree(g_acts[l].d_n2); cudaFree(g_acts[l].d_ao);
-            cudaFree(g_acts[l].d_hid); cudaFree(g_acts[l].d_proj);
-            cudaFree(g_acts[l].d_mlp);
-        }
-        free(g_acts);
-    }
-    g_acts = (LayerAct*)calloc(n_layer, sizeof(LayerAct));
-    for (int l = 0; l < n_layer; l++) {
-        cudaMalloc(&g_acts[l].d_x_pre, n * sizeof(float));
-        cudaMalloc(&g_acts[l].d_n1, n * sizeof(float));
-        cudaMalloc(&g_acts[l].d_n2, n * sizeof(float));
-        cudaMalloc(&g_acts[l].d_ao, n * sizeof(float));
-        cudaMalloc(&g_acts[l].d_hid, mlp_dim * sizeof(float));
-        cudaMalloc(&g_acts[l].d_proj, n * sizeof(float));
-        cudaMalloc(&g_acts[l].d_mlp, n * sizeof(float));
-    }
-    if (!d_grad_x) cudaMalloc(&d_grad_x, n * sizeof(float));
-    if (!d_grad_logits) cudaMalloc(&d_grad_logits, vocab * sizeof(float));
-    if (!d_softmax) cudaMalloc(&d_softmax, vocab * sizeof(float));
-    g_acts_nlayer = n_layer; g_acts_n = n; g_acts_mlp = mlp_dim;
-}
-
-/* GPU kernel: transpose matvec — grad_x = W^T @ grad_y
- *   W is [out, in] row-major: W[j*in + i]
- *   grad_x[i] = sum_j W[j*in+i] * grad_y[j] */
-__global__ void k_matvec_T(float *grad_x, const float *W,
-                            const float *grad_y, int in_dim, int out_dim) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= in_dim) return;
-    float s = 0.0f;
-    for (int j = 0; j < out_dim; j++)
-        s += W[(size_t)j * in_dim + i] * grad_y[j];
-    grad_x[i] = s;
-}
-
-/* GPU kernel: accumulate weight gradient — grad_W[j*in+i] += grad_y[j] * x[i]
- * Also accumulate bias gradient: grad_bias[j] += grad_y[j] */
-__global__ void k_grad_W_bias(float *grad_W, float *grad_bias,
-                                const float *grad_y, const float *x,
-                                int in_dim, int out_dim) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= out_dim) return;
-    float gy = grad_y[j];
-    float *gw = grad_W + (size_t)j * in_dim;
-    for (int i = 0; i < in_dim; i++)
-        gw[i] += gy * x[i];
-    if (grad_bias)
-        grad_bias[j] += gy;
-}
-
-/* GPU kernel: GELU gradient — grad *= 0.5 * (1 + tanh(sqrt(2/pi)(x + 0.044715x^3)))
- *   + constant from gelu'(x) */
-__global__ void k_gelu_grad(float *grad, const float *x, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float v = x[i];
-    float c = 0.7978845608f * (v + 0.044715f * v * v * v);
-    float t = tanhf(c);
-    /* gelu'(x) = 0.5 * (1 + t) + 0.5 * x * (1 - t*t) * 0.7978845608 * (1 + 0.134145 * x*x) */
-    float dv = 0.5f * (1.0f + t) + 0.5f * v * (1.0f - t*t) * 0.7978845608f * (1.0f + 0.134145f * v * v);
-    grad[i] *= dv;
-}
-
-/* GPU kernel: softmax - onehot (CE gradient w.r.t. logits) */
-__global__ void k_ce_grad(float *grad_logits, float *softmax,
-                           const float *logits, int target, float max_l, int vocab) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= vocab) return;
-    float p = expf(logits[i] - max_l);  /* unnormalized */
-    softmax[i] = p;  /* will normalize on host or via reduction */
-    grad_logits[i] = p;  /* temp, normalize after */
-}
-
-/* Normalize softmax and compute grad_logits = softmax - onehot(target) */
-__global__ void k_normalize_ce_grad(float *grad_logits, float *softmax,
-                                      float inv_sum, int target, int vocab) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= vocab) return;
-    float p = softmax[i] * inv_sum;
-    softmax[i] = p;
-    grad_logits[i] = p - (i == target ? 1.0f : 0.0f);
-}
-
-/* v13q: Full GPU backward.
- * Given softmax from forward, compute gradients for all weights.
- * Accumulates into bl->grad_accum (host-side, downloaded at end). */
 extern "C"
 void lal_cuda_full_backward(
     Model *m,
