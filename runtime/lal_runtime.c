@@ -9,10 +9,13 @@
  */
 #include "lal_runtime.h"
 #ifdef LAL_CUDA
+#include "lal_cuda.h"
+
+/* v13u: declare cudaMemcpy constants without cuda_runtime.h */
 #ifdef LAL_CUDA
-#include <cuda_runtime.h>
-#endif
-#include "lal_cuda.h"   /* CUDA GPU training backend (runtime/lal_cuda.cu) */
+#define MY_2 2
+#define MY_1 1
+#endif   /* CUDA GPU training backend (runtime/lal_cuda.cu) */
 #endif
 
 /* Forward declarations for full-vocab softmax (defined later in this file,
@@ -3410,10 +3413,10 @@ void model_batch_apply(Model *m, float lr, int batch_size) {
             if (g_use_cuda && bl->d_grad_accum) {
                 cudaMemcpy(bl->grad_accum, bl->d_grad_accum,
                     (size_t)bl->in_dim * bl->out_dim * sizeof(float),
-                    cudaMemcpyDeviceToHost);
+                    2);
                 if (bl->bias_grad_accum && bl->d_bias_grad_accum)
                     cudaMemcpy(bl->bias_grad_accum, bl->d_bias_grad_accum,
-                        bl->out_dim * sizeof(float), cudaMemcpyDeviceToHost);
+                        bl->out_dim * sizeof(float), 2);
             }
 #endif
 
