@@ -1163,6 +1163,81 @@ __global__ void k_grad_W_bias(float *grad_W, float *grad_bias,
 
 /* GPU kernel: GELU gradient — grad *= 0.5 * (1 + tanh(sqrt(2/pi)(x + 0.044715x^3)))
  *   + constant from gelu'(x) */
+
+/* GPU kernel: LayerNorm backward
+ * Given: grad_y (gradient w.r.t. LN output), x (pre-LN input), w (LN weight)
+ * Compute: grad_x (gradient w.r.t. x)
+ * LN forward: y = (x - mean) * inv_std * w + b
+ * grad_x[i] = inv_std * w[i] * (grad_y[i] - mean(grad_y*w) - x_norm[i] * mean(grad_y*w*x_norm))
+ * where x_norm[i] = (x[i] - mean) * inv_std
+ *
+ * Two-pass: first compute mean and dot products, then apply.
+ * Uses shared memory for reduction. */
+__global__ void k_layernorm_backward(float *grad_x, const float *grad_y,
+                                       const float *x, const float *w,
+                                       int n) {
+    extern __shared__ float smem[];
+    
+    /* Pass 1: compute mean(x), inv_std, mean(grad_y*w), mean(grad_y*w*x_norm) */
+    float local_sum = 0.0f, local_gw = 0.0f, local_gwx = 0.0f;
+    float local_mean = 0.0f; /* will compute via reduction */
+    
+    /* First: compute mean of x */
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        local_sum += x[i];
+    smem[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    float mean = smem[0] / n;
+    __syncthreads();
+    
+    /* Compute var and inv_std */
+    local_sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float d = x[i] - mean;
+        local_sum += d * d;
+    }
+    smem[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv_std = rsqrtf(smem[0] / n + 1e-5f);
+    __syncthreads();
+    
+    /* Compute x_norm[i] = (x[i]-mean)*inv_std, then mean(grad_y*w*x_norm) */
+    local_gw = 0.0f; local_gwx = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float xn = (x[i] - mean) * inv_std;
+        float gyw = grad_y[i] * w[i];
+        local_gw += gyw;
+        local_gwx += gyw * xn;
+    }
+    smem[threadIdx.x] = local_gw;
+    smem[blockDim.x + threadIdx.x] = local_gwx;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            smem[threadIdx.x] += smem[threadIdx.x + s];
+            smem[blockDim.x + threadIdx.x] += smem[blockDim.x + threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    float mean_gw = smem[0] / n;
+    float mean_gwx = smem[blockDim.x] / n;
+    __syncthreads();
+    
+    /* Pass 2: grad_x[i] = inv_std * w[i] * (grad_y[i] - mean_gw - x_norm[i]*mean_gwx) */
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float xn = (x[i] - mean) * inv_std;
+        grad_x[i] = inv_std * w[i] * (grad_y[i] - mean_gw - xn * mean_gwx);
+    }
+}
+
 __global__ void k_gelu_grad(float *grad, const float *x, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -1347,8 +1422,9 @@ float lal_cuda_full_forward(
             if (gg->d_mask)
                 k_zero_prune<<<(mlp_dim+255)/256, 256, 0, s>>>(d_hid, gg->d_mask, mlp_dim);
         }
-        k_gelu<<<(mlp_dim+255)/256, 256, 0, s>>>(d_hid, mlp_dim);
+        /* v13t: cache pre-GELU for backward */
         cudaMemcpyAsync(g_acts[l].d_hid, d_hid, mlp_dim*4, cudaMemcpyDeviceToDevice, s);
+        k_gelu<<<(mlp_dim+255)/256, 256, 0, s>>>(d_hid, mlp_dim);
         
         /* mlp_out = W_down @ hidden */
         LayerGPU *gd = (LayerGPU*)tl->mlp_down._gpu;
@@ -1511,10 +1587,14 @@ void lal_cuda_full_backward(
             k_matvec_T<<<(n+thr-1)/thr, thr, 0, s>>>(a->d_n2, gg->d_w, a->d_hid, n, mlp_dim);
         }
         
-        /* Backprop through norm2 (simplified: pass grad through) */
-        /* grad_x = grad_norm2 (from MLP path) + grad_x (from residual path) */
-        /* For now: grad_x = grad_norm2 + grad_x */
-        /* Use k_residual_clip to add: grad_x += grad_norm2 */
+        /* v13t: Proper LayerNorm2 backward */
+        /* Upload norm2 weights */
+        static float *d_nw2_bwd = NULL, *d_nb2_bwd = NULL;
+        if (!d_nw2_bwd) { cudaMalloc(&d_nw2_bwd, n*4); cudaMalloc(&d_nb2_bwd, n*4); }
+        cudaMemcpyAsync(d_nw2_bwd, tl->norm2_w, n*4, cudaMemcpyHostToDevice, s);
+        k_layernorm_backward<<<1, thr, 2*thr*sizeof(float), s>>>(
+            a->d_n2, a->d_n2, a->d_x_pre, d_nw2_bwd, n);
+        /* grad_x += grad_norm2 (residual path) */
         k_residual_clip<<<(n+thr-1)/thr, thr, 0, s>>>(d_grad_x, a->d_n2, 1.0f, 1e10f, n);
         
         /* --- Attention backward ---
@@ -1554,7 +1634,12 @@ void lal_cuda_full_backward(
             k_matvec_T<<<(n+thr-1)/thr, thr, 0, s>>>(a->d_n1, gq->d_w, d_gqkv, n, 3*n);
         }
         
-        /* Backprop through norm1 (simplified: pass through) */
+        /* v13t: Proper LayerNorm1 backward */
+        static float *d_nw1_bwd = NULL;
+        if (!d_nw1_bwd) cudaMalloc(&d_nw1_bwd, n*4);
+        cudaMemcpyAsync(d_nw1_bwd, tl->norm1_w, n*4, cudaMemcpyHostToDevice, s);
+        k_layernorm_backward<<<1, thr, 2*thr*sizeof(float), s>>>(
+            a->d_n1, a->d_n1, a->d_x_pre, d_nw1_bwd, n);
         k_residual_clip<<<(n+thr-1)/thr, thr, 0, s>>>(d_grad_x, a->d_n1, 1.0f, 1e10f, n);
     }
     
