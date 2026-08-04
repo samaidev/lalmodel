@@ -433,9 +433,13 @@ float lr_schedule(int step, int warmup_steps, int total_steps, float base_lr) {
 void bin_forward_pure_float(float *y, const float *x, const BinLayer *bl) {
     int in = bl->in_dim, out = bl->out_dim;
 #ifdef LAL_CUDA
-    /* v13m: GPU forward disabled for CE path (fwd_resident has cuBLAS sizing bug).
-     * logic_reg uses fused lal_cuda_layer_forward_batch instead.
-     * CE falls through to CPU. */
+    /* v13o: Re-enabled GPU CE path. Fixed fwd_resident to use sgemm
+     * instead of sgemv (sgemv had out-of-bounds for QKV merged out=3n).
+     * 2x buffer cap for safety. */
+    if (g_use_cuda && bl->w_float && bl->_gpu) {
+        lal_cuda_fwd_resident(y, x, bl);
+        return;
+    }
 #endif
     if (bl->logic_mask) {
         int core_idx = 0;

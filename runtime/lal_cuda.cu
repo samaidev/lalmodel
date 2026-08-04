@@ -440,32 +440,42 @@ void lal_cuda_fwd_resident(float *y, const float *x, const BinLayer *bl) {
     int in = bl->in_dim, out = bl->out_dim;
     cublasHandle_t h = get_cublas();
 
-    /* v13k: persistent x/y buffers to avoid per-call cudaMalloc/Free.
-     * Max dim is n_embd=512 or mlp_dim=1792, so allocate once for max size. */
+    /* v13o: persistent x/y buffers. Use 2x cap for safety (cuBLAS internal
+     * sgemm optimization may access slightly beyond out elements). */
     static float *d_x = NULL, *d_y = NULL;
     static int d_cap = 0;
-    int need = in > out ? in : out;
+    int need = (in > out ? in : out) * 2;
     if (need > d_cap) {
         if (d_x) { cudaFree(d_x); cudaFree(d_y); }
         cudaMalloc(&d_x, need * sizeof(float));
         cudaMalloc(&d_y, need * sizeof(float));
         d_cap = need;
     }
+    /* Clear d_y to 0 first (in case bias is NULL, beta=0 still works) */
+    cudaMemset(d_y, 0, out * sizeof(float));
 
     CUDA_CHECK(cudaMemcpy(d_x, x, in * sizeof(float), cudaMemcpyHostToDevice));
 
-    /* y = W @ x + bias, beta=1 adds bias pre-filled */
+    /* v13o: Use sgemm instead of sgemv for correctness with large out_dim.
+     * sgemv with OP_T internally dispatches to sgemm kernel that had
+     * out-of-bounds access for QKV merged layers (out=3*n=1536).
+     * sgemm with n=1 (batch=1) is equivalent but uses different code path.
+     *
+     * y[out] = W[out,in] @ x[in]  (W row-major == W col-major [in,out])
+     * cuBLAS col-major: Y[out,1] = W_cm[in,out] @ X[in,1]
+     *   cublasSgemm(OP_N, OP_N, m=out, n=1, k=in,
+     *               alpha, d_w, lda=in, d_x, ldb=in,
+     *               beta, d_y, ldc=out)
+     * With bias: pre-fill d_y with bias, beta=1. */
     if (g->d_bias) {
         CUDA_CHECK(cudaMemcpy(d_y, g->d_bias, out * sizeof(float),
                               cudaMemcpyDeviceToDevice));
-        float alpha = 1.0f, beta = 1.0f;
-        cublasSgemv(h, CUBLAS_OP_T, in, out, &alpha, g->d_w, in, d_x, 1,
-                    &beta, d_y, 1);
-    } else {
-        float alpha = 1.0f, beta = 0.0f;
-        cublasSgemv(h, CUBLAS_OP_T, in, out, &alpha, g->d_w, in, d_x, 1,
-                    &beta, d_y, 1);
     }
+    float alpha = 1.0f;
+    float beta = g->d_bias ? 1.0f : 0.0f;
+    cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
+                out, 1, in, &alpha, g->d_w, in, d_x, in,
+                &beta, d_y, out);
 
     /* Zero out PRUNE rows if logic_mask present */
     if (g->d_mask) {
@@ -474,7 +484,6 @@ void lal_cuda_fwd_resident(float *y, const float *x, const BinLayer *bl) {
     }
 
     CUDA_CHECK(cudaMemcpy(y, d_y, out * sizeof(float), cudaMemcpyDeviceToHost));
-    /* v13k: don't free d_x/d_y — they're persistent static buffers */
 }
 
 /* v13k: Backward grad_x using resident weights + cuBLAS.
@@ -498,10 +507,10 @@ void lal_cuda_bwd_resident(float *grad_x, const float *grad_y, const BinLayer *b
     int in = bl->in_dim, out = bl->out_dim;
     cublasHandle_t h = get_cublas();
 
-    /* v13k: reuse forward's persistent buffers (d_x as d_gy, d_y as d_gx) */
+    /* v13o: 2x buffer cap + sgemm instead of sgemv (same fix as fwd) */
     static float *d_gy = NULL, *d_gx = NULL;
     static int d_cap_bwd = 0;
-    int need = in > out ? in : out;
+    int need = (in > out ? in : out) * 2;
     if (need > d_cap_bwd) {
         if (d_gy) { cudaFree(d_gy); cudaFree(d_gx); }
         cudaMalloc(&d_gy, need * sizeof(float));
@@ -517,13 +526,18 @@ void lal_cuda_bwd_resident(float *grad_x, const float *grad_y, const BinLayer *b
         k_zero_prune<<<blk, thr>>>(d_gy, g->d_mask, out);
     }
 
+    /* v13o: Use sgemm instead of sgemv.
+     * grad_x[in] = W_cm[in,out] @ grad_y[out]
+     * cuBLAS: grad_x[m=in,1] = A[lda=in,n=out] @ x[ldb=out,1]
+     *   cublasSgemm(OP_N, OP_N, m=in, n=1, k=out,
+     *               alpha, d_w, lda=in, d_gy, ldb=out,
+     *               beta, d_gx, ldc=in) */
     float alpha = 1.0f, beta = 0.0f;
-    /* grad_x = W_cm @ grad_y, W_cm is [in, out] col-major == W row-major [out, in] */
-    cublasSgemv(h, CUBLAS_OP_N, in, out, &alpha, g->d_w, in, d_gy, 1,
-                &beta, d_gx, 1);
+    cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
+                in, 1, out, &alpha, g->d_w, in, d_gy, out,
+                &beta, d_gx, in);
 
     CUDA_CHECK(cudaMemcpy(grad_x, d_gx, in * sizeof(float), cudaMemcpyDeviceToHost));
-    /* v13k: don't free — persistent buffers */
 }
 
 /* Helper kernel: fill d_y[b*out..b*out+out] = bias[0..out] for each b */
