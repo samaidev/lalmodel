@@ -831,6 +831,22 @@ static int ste_load(Model *m, const char *path) {
             fread(bl->alpha, sizeof(float), bl->out_dim, f);
             if (bl->logic_mask) {
                 fread(bl->logic_mask, 1, bl->out_dim, f);
+                /* FIX: recompute n_core and reallocate w_core — the loaded
+                 * logic_mask may have a different CORE count than the one
+                 * computed during model_load (different weight distribution).
+                 * Without this, bin_layer_repack writes beyond w_core buffer,
+                 * causing memory corruption and NaN in forward pass. */
+                int new_n_core = 0;
+                for (int j = 0; j < bl->out_dim; j++) {
+                    if (bl->logic_mask[j] == 0) new_n_core++;
+                }
+                if (new_n_core != bl->n_core) {
+                    bl->n_core = new_n_core;
+                    free(bl->w_core);
+                    bl->w_core = (new_n_core > 0)
+                        ? malloc((size_t)new_n_core * bl->in_dim * sizeof(float))
+                        : NULL;
+                }
                 /* 重建 w_core 和 wbits */
                 bin_layer_repack(bl);
             }
