@@ -3402,6 +3402,18 @@ void model_batch_apply(Model *m, float lr, int batch_size) {
             BinLayer *bl = bls[b];
             if (!bl->grad_accum || !bl->w_float) continue;
 
+#ifdef LAL_CUDA
+            /* v13u: download device grad_accum to host before Adam */
+            if (g_use_cuda && bl->d_grad_accum) {
+                cudaMemcpy(bl->grad_accum, bl->d_grad_accum,
+                    (size_t)bl->in_dim * bl->out_dim * sizeof(float),
+                    cudaMemcpyDeviceToHost);
+                if (bl->bias_grad_accum && bl->d_bias_grad_accum)
+                    cudaMemcpy(bl->bias_grad_accum, bl->d_bias_grad_accum,
+                        bl->out_dim * sizeof(float), cudaMemcpyDeviceToHost);
+            }
+#endif
+
             int in = bl->in_dim, out = bl->out_dim;
             int t = g_opt_step + 1;
             float bc1 = 1.0f - powf(g_adam_beta1, (float)t);
