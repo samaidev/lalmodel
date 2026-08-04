@@ -1070,6 +1070,19 @@ __global__ void k_mlp_cap_residual(float *x, const float *mlp_out,
  *   final_norm → logits = wte @ x → CE loss
  *
  * All on GPU, single stream, zero intermediate H2D/D2H. */
+
+/* v13p: custom matvec — no cuBLAS tiling OOB */
+__global__ void k_matvec(float *y, const float *W, const float *x,
+                          const float *bias, int in_dim, int out_dim) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= out_dim) return;
+    float s = bias ? bias[j] : 0.0f;
+    const float *wr = W + (size_t)j * in_dim;
+    for (int i = 0; i < in_dim; i++)
+        s += wr[i] * x[i];
+    y[j] = s;
+}
+
 extern "C"
 float lal_cuda_full_forward(
     Model *m,
@@ -1161,7 +1174,7 @@ float lal_cuda_full_forward(
             else
                 cudaMemsetAsync(d_qkv, 0, 3*n*4, s);
             beta = gq->d_bias ? 1.0f : 0.0f;
-            cublasSgemv(h, CUBLAS_OP_T, n, 3*n, &alpha, gq->d_w, n, d_n1, 1, &beta, d_qkv, 1);
+            k_matvec<<<(3*n+255)/256, 256, 0, s>>>(d_qkv, gq->d_w, d_n1, gq->d_bias, n, 3*n);
         }
         
         /* V copy: attn_out = qkv[2n:3n] */
@@ -1175,7 +1188,7 @@ float lal_cuda_full_forward(
             else
                 cudaMemsetAsync(d_proj, 0, n*4, s);
             beta = go->d_bias ? 1.0f : 0.0f;
-            cublasSgemv(h, CUBLAS_OP_T, n, n, &alpha, go->d_w, n, d_ao, 1, &beta, d_proj, 1);
+            k_matvec<<<(n+255)/256, 256, 0, s>>>(d_proj, go->d_w, d_ao, go->d_bias, n, n);
             if (go->d_mask)
                 k_zero_prune<<<(n+255)/256, 256, 0, s>>>(d_proj, go->d_mask, n);
         }
@@ -1194,7 +1207,7 @@ float lal_cuda_full_forward(
             else
                 cudaMemsetAsync(d_hid, 0, mlp_dim*4, s);
             beta = gg->d_bias ? 1.0f : 0.0f;
-            cublasSgemv(h, CUBLAS_OP_T, n, mlp_dim, &alpha, gg->d_w, n, d_n2, 1, &beta, d_hid, 1);
+            k_matvec<<<(mlp_dim+255)/256, 256, 0, s>>>(d_hid, gg->d_w, d_n2, gg->d_bias, n, mlp_dim);
             if (gg->d_mask)
                 k_zero_prune<<<(mlp_dim+255)/256, 256, 0, s>>>(d_hid, gg->d_mask, mlp_dim);
         }
@@ -1208,7 +1221,7 @@ float lal_cuda_full_forward(
             else
                 cudaMemsetAsync(d_mlp, 0, n*4, s);
             beta = gd->d_bias ? 1.0f : 0.0f;
-            cublasSgemv(h, CUBLAS_OP_T, mlp_dim, n, &alpha, gd->d_w, mlp_dim, d_hid, 1, &beta, d_mlp, 1);
+            k_matvec<<<(n+255)/256, 256, 0, s>>>(d_mlp, gd->d_w, d_hid, gd->d_bias, mlp_dim, n);
         }
         
         /* x += rs * mlp_out (with cap) + normalize_residual */
@@ -1221,7 +1234,7 @@ float lal_cuda_full_forward(
     k_batch_layernorm<<<1, thr, 0, s>>>(d_x, d_x, d_lnfw, d_lnfb, 1, n);
     
     /* 4. logits = wte @ x  (full vocab) */
-    cublasSgemv(h, CUBLAS_OP_T, n, vocab, &alpha, d_wte, n, d_x, 1, &beta, d_logits, 1);
+    k_matvec<<<(vocab+255)/256, 256, 0, s>>>(d_logits, d_wte, d_x, NULL, n, vocab);
     
     /* 5. CE loss + argmax on GPU (download only loss + argmax + grad) */
     /* For now: download logits, compute CE on CPU (simpler, vocab=32768 is small) */
