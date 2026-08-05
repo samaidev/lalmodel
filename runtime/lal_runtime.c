@@ -263,15 +263,18 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
         memcpy(act->attn_out, act->v, n * sizeof(float));
     }
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
-    /* v13d-merged: scale attention output to 0.3 norm for controlled perturbation.
-     * v13b used 0.1 (too conservative), v13d uses 0.3 (good expressiveness).
-     * attn_scale stored in TransAct for backward pass gradient correction.
-     * Remote used g_attn_residual_scale (global=1.0) — local scale_to_norm is
-     * superior: adaptive per-token scaling + backward-compatible. */
+    /* v13j: Proportional attention scaling — scale attn output to 15% of
+     * current residual norm. Fixed 0.3 was too small when residual grows
+     * to 8+ (only 3.5% perturbation), causing representation collapse.
+     * Proportional scaling ensures attention can always meaningfully
+     * change the residual direction regardless of depth. */
     {
-        float pn = 0;
-        for (int i = 0; i < n; i++) pn += act->proj_out[i] * act->proj_out[i];
-        act->attn_scale = 0.3f / (sqrtf(pn) + 1e-8f);
+        float xn = 0, pn = 0;
+        for (int i = 0; i < n; i++) { xn += x[i] * x[i]; pn += act->proj_out[i] * act->proj_out[i]; }
+        xn = sqrtf(xn) + 1e-8f;
+        pn = sqrtf(pn) + 1e-8f;
+        float target = 0.15f * xn;
+        act->attn_scale = target / pn;
         for (int i = 0; i < n; i++) act->proj_out[i] *= act->attn_scale;
     }
     for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
@@ -307,19 +310,19 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_fwd(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    /* v13d-merged: MLP cap approach from remote + backward-compatible scale storage.
-     * Remote: cap ||mlp_out|| at 0.5 (only reduce if too large, preserve small signals).
-     * Local: store mlp_scale in TransAct for backward pass gradient correction.
-     * normalize_residual(3.0) from remote: prevents residual stream drift. */
+    /* v13j: Proportional MLP scaling — cap ||mlp_out|| at 25% of current
+     * residual norm. Fixed cap=1.0 was too small when residual grows to 8+.
+     * Proportional ensures MLP can contribute meaningfully at all depths. */
     {
-        float mlp_norm_sq = 0;
-        for (int i = 0; i < n; i++) mlp_norm_sq += act->mlp_out[i] * act->mlp_out[i];
+        float xn = 0, mlp_norm_sq = 0;
+        for (int i = 0; i < n; i++) { xn += x[i] * x[i]; mlp_norm_sq += act->mlp_out[i] * act->mlp_out[i]; }
+        float xn_norm = sqrtf(xn) + 1e-8f;
         float mlp_norm = sqrtf(mlp_norm_sq) + 1e-8f;
-        float mlp_cap = 0.5f;
+        float mlp_cap = 0.25f * xn_norm;
         act->mlp_scale = (mlp_norm > mlp_cap) ? (mlp_cap / mlp_norm) : 1.0f;
         for (int i = 0; i < n; i++) x[i] += rs * act->mlp_scale * act->mlp_out[i];
     }
-    normalize_residual(x, n, 3.0f);
+    normalize_residual(x, n, 6.0f);
 }
 
 /* Pure-float forward: same as trans_layer_forward but uses bin_forward_pure_float
@@ -357,11 +360,14 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
         memcpy(act->attn_out, act->v, n * sizeof(float));
 
     bin_forward_pure_float(act->proj_out, act->attn_out, &tl->attn_o);
-    /* v13d-merged: scale attention output to 0.3 norm (same as standard forward) */
+    /* v13j: Proportional attention scaling (same as standard forward) */
     {
-        float pn = 0;
-        for (int i = 0; i < n; i++) pn += act->proj_out[i] * act->proj_out[i];
-        act->attn_scale = 0.3f / (sqrtf(pn) + 1e-8f);
+        float xn = 0, pn = 0;
+        for (int i = 0; i < n; i++) { xn += x[i] * x[i]; pn += act->proj_out[i] * act->proj_out[i]; }
+        xn = sqrtf(xn) + 1e-8f;
+        pn = sqrtf(pn) + 1e-8f;
+        float target = 0.15f * xn;
+        act->attn_scale = target / pn;
         for (int i = 0; i < n; i++) act->proj_out[i] *= act->attn_scale;
     }
     for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
@@ -388,16 +394,17 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_forward_pure_float(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    /* v13d-merged: MLP cap + backward-compatible scale + normalize_residual (same as standard) */
+    /* v13j: Proportional MLP scaling + normalize_residual(6.0) (same as standard) */
     {
-        float mlp_norm_sq = 0;
-        for (int i = 0; i < n; i++) mlp_norm_sq += act->mlp_out[i] * act->mlp_out[i];
+        float xn = 0, mlp_norm_sq = 0;
+        for (int i = 0; i < n; i++) { xn += x[i] * x[i]; mlp_norm_sq += act->mlp_out[i] * act->mlp_out[i]; }
+        float xn_norm = sqrtf(xn) + 1e-8f;
         float mlp_norm = sqrtf(mlp_norm_sq) + 1e-8f;
-        float mlp_cap = 0.5f;
+        float mlp_cap = 0.25f * xn_norm;
         act->mlp_scale = (mlp_norm > mlp_cap) ? (mlp_cap / mlp_norm) : 1.0f;
         for (int i = 0; i < n; i++) x[i] += rs * act->mlp_scale * act->mlp_out[i];
     }
-    normalize_residual(x, n, 3.0f);
+    normalize_residual(x, n, 6.0f);
 }
 
 /* Global flag: use STE backward (updates w_float + repacks wbits) */
@@ -3182,11 +3189,14 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
 
     /* Output projection */
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
-    /* v13d-merged: scale attention output to 0.3 norm (same as standard forward) */
+    /* v13j: Proportional attention scaling (same as standard forward) */
     {
-        float pn = 0;
-        for (int i = 0; i < n; i++) pn += act->proj_out[i] * act->proj_out[i];
-        act->attn_scale = 0.3f / (sqrtf(pn) + 1e-8f);
+        float xn = 0, pn = 0;
+        for (int i = 0; i < n; i++) { xn += x[i] * x[i]; pn += act->proj_out[i] * act->proj_out[i]; }
+        xn = sqrtf(xn) + 1e-8f;
+        pn = sqrtf(pn) + 1e-8f;
+        float target = 0.15f * xn;
+        act->attn_scale = target / pn;
         for (int i = 0; i < n; i++) act->proj_out[i] *= act->attn_scale;
     }
     for (int i = 0; i < n; i++) x[i] += rs * act->proj_out[i];
@@ -3215,16 +3225,17 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
     }
 
     bin_fwd(act->mlp_out, act->mlp_hidden, &tl->mlp_down);
-    /* v13d-merged: MLP cap + backward-compatible scale + normalize_residual (same as standard) */
+    /* v13j: Proportional MLP scaling + normalize_residual(6.0) (same as standard) */
     {
-        float mlp_norm_sq = 0;
-        for (int i = 0; i < n; i++) mlp_norm_sq += act->mlp_out[i] * act->mlp_out[i];
+        float xn = 0, mlp_norm_sq = 0;
+        for (int i = 0; i < n; i++) { xn += x[i] * x[i]; mlp_norm_sq += act->mlp_out[i] * act->mlp_out[i]; }
+        float xn_norm = sqrtf(xn) + 1e-8f;
         float mlp_norm = sqrtf(mlp_norm_sq) + 1e-8f;
-        float mlp_cap = 0.5f;
+        float mlp_cap = 0.25f * xn_norm;
         act->mlp_scale = (mlp_norm > mlp_cap) ? (mlp_cap / mlp_norm) : 1.0f;
         for (int i = 0; i < n; i++) x[i] += rs * act->mlp_scale * act->mlp_out[i];
     }
-    normalize_residual(x, n, 3.0f);
+    normalize_residual(x, n, 6.0f);
 }
 
 /* ─── Stateful Inference: Begin New Session ─────────────────────── */

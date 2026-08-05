@@ -270,8 +270,16 @@ static void compute_gate_input(Model *m, const float *initial_emb,
 
         /* Output projection + residual */
         bin_forward_pure_float(proj_out, attn_out, &tl->attn_o);
-        scale_to_norm(proj_out, n, 0.3f);
-        for (int i = 0; i < n; i++) x[i] += rs * proj_out[i];
+        /* v13j: Proportional attention scaling — 15% of residual norm */
+        {
+            float xn = 0, pn = 0;
+            for (int i = 0; i < n; i++) { xn += x[i] * x[i]; pn += proj_out[i] * proj_out[i]; }
+            xn = sqrtf(xn) + 1e-8f;
+            pn = sqrtf(pn) + 1e-8f;
+            float target = 0.15f * xn;
+            float as = target / pn;
+            for (int i = 0; i < n; i++) x[i] += rs * as * proj_out[i];
+        }
         clip_array(x, n, 10.0f);
 
         /* LN2: norm2 = LN2(x) — this is the mlp_gate input */
@@ -292,15 +300,17 @@ static void compute_gate_input(Model *m, const float *initial_emb,
             for (int i = 0; i < mlp_dim; i++) hidden[i] = gelu(hidden[i]);
         }
         bin_forward_pure_float(mlp_out, hidden, &tl->mlp_down);
-        /* v13d-merged: MLP cap at 0.5 + normalize_residual(3.0) — matches runtime */
+        /* v13j: Proportional MLP scaling — 25% of residual norm + normalize_residual(6.0) */
         {
-            float mns = 0;
-            for (int i = 0; i < n; i++) mns += mlp_out[i] * mlp_out[i];
+            float xn = 0, mns = 0;
+            for (int i = 0; i < n; i++) { xn += x[i] * x[i]; mns += mlp_out[i] * mlp_out[i]; }
+            float xn_norm = sqrtf(xn) + 1e-8f;
             float mn = sqrtf(mns) + 1e-8f;
-            float ms = (mn > 0.5f) ? (0.5f / mn) : 1.0f;
+            float cap = 0.25f * xn_norm;
+            float ms = (mn > cap) ? (cap / mn) : 1.0f;
             for (int i = 0; i < n; i++) x[i] += rs * ms * mlp_out[i];
         }
-        normalize_residual(x, n, 3.0f);
+        normalize_residual(x, n, 6.0f);
     }
     /* Static buffers — NOT freed here (reused on next call).
      * They persist for the program lifetime and are auto-freed on exit. */
@@ -385,8 +395,16 @@ static void compute_all_gate_inputs(Model *m, const float *initial_emb,
         memcpy(attn_out, v, n * sizeof(float));
 
         bin_forward_pure_float(proj_out, attn_out, &tl->attn_o);
-        scale_to_norm(proj_out, n, 0.3f);
-        for (int i = 0; i < n; i++) x[i] += rs * proj_out[i];
+        /* v13j: Proportional attention scaling — 15% of residual norm */
+        {
+            float xn = 0, pn = 0;
+            for (int i = 0; i < n; i++) { xn += x[i] * x[i]; pn += proj_out[i] * proj_out[i]; }
+            xn = sqrtf(xn) + 1e-8f;
+            pn = sqrtf(pn) + 1e-8f;
+            float target = 0.15f * xn;
+            float as = target / pn;
+            for (int i = 0; i < n; i++) x[i] += rs * as * proj_out[i];
+        }
         clip_array(x, n, 10.0f);
 
         norm_forward(norm2, x, tl->norm2_w, tl->norm2_b, m->cfg.norm_type, n);
@@ -405,15 +423,17 @@ static void compute_all_gate_inputs(Model *m, const float *initial_emb,
             for (int i = 0; i < mlp_dim; i++) hidden[i] = gelu(hidden[i]);
         }
         bin_forward_pure_float(mlp_out, hidden, &tl->mlp_down);
-        /* v13d-merged: MLP cap at 0.5 + normalize_residual(3.0) — matches runtime */
+        /* v13j: Proportional MLP scaling — 25% of residual norm + normalize_residual(6.0) */
         {
-            float mns = 0;
-            for (int i = 0; i < n; i++) mns += mlp_out[i] * mlp_out[i];
+            float xn = 0, mns = 0;
+            for (int i = 0; i < n; i++) { xn += x[i] * x[i]; mns += mlp_out[i] * mlp_out[i]; }
+            float xn_norm = sqrtf(xn) + 1e-8f;
             float mn = sqrtf(mns) + 1e-8f;
-            float ms = (mn > 0.5f) ? (0.5f / mn) : 1.0f;
+            float cap = 0.25f * xn_norm;
+            float ms = (mn > cap) ? (cap / mn) : 1.0f;
             for (int i = 0; i < n; i++) x[i] += rs * ms * mlp_out[i];
         }
-        normalize_residual(x, n, 3.0f);
+        normalize_residual(x, n, 6.0f);
     }
 
     /* v13g: apply final LayerNorm and return final hidden state.
