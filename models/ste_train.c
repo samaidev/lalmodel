@@ -1682,14 +1682,17 @@ int main(int argc, char **argv) {
     /* 深度白箱诊断:解释生成质量 */
     deep_whitebox_diagnosis(&model);
 
+    /* v14: 关系探针 — 监控概念间关系(火→热,猫→动物),不只看概念区分 */
+    relation_probe(&model);
+
     /* === 逐层 hidden state 诊断: 定位 logits 坍缩根因 ===
      * 比较两个不同 prompt ('火' vs '水') 在每层的 hidden state cosine similarity.
      * 如果某层后 cosine→1.0, 说明该层抹掉了 prompt 信号. */
     {
         int n = model.cfg.n_embd;
         int nL = model.cfg.n_layer;
-        int tok_fire = 32646;  /* 火 */
-        int tok_water = 31940;  /* 水 */
+        int tok_fire = 1164;   /* 火 (v2 tokenizer: ▁火 = 259+1164, use 1164 directly) */
+        int tok_water = 962;   /* 水 (v2 tokenizer: ▁水 = 259+962, use 962 directly) */
 
         static float xa[4096], xb[4096];
         static float la[16][4096], lb[16][4096];
