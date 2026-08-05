@@ -1522,6 +1522,7 @@ int main(int argc, char **argv) {
     float temp = 0.4f;
     int top_k = 8;
     int logic_only = 0;  /* v13g: --logic-only, 课程学习 stage 1 只训概念对不训 CE */
+    const char *tokenizer_path = "tokenizer/chinese_bpe.vocab";  /* --tokenizer */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--steps") && i+1 < argc) n_steps = atoi(argv[++i]);
@@ -1551,6 +1552,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--resume") && i+1 < argc) resume_path = argv[++i];
         else if (!strcmp(argv[i], "--diagnose-only")) { n_steps = 0; }
         else if (!strcmp(argv[i], "--logic-only")) { logic_only = 1; }  /* v13g */
+        else if (!strcmp(argv[i], "--tokenizer") && i+1 < argc) tokenizer_path = argv[++i];
         else if (!strcmp(argv[i], "--help")) {
             printf("Usage: ste_train [options]\n"
                    "  --steps N         Training steps (default 200)\n"
@@ -1560,6 +1562,7 @@ int main(int argc, char **argv) {
                    "  --start-step N    Skip N steps for LR schedule (used with --resume for chunked training)\n"
                    "  --total-steps N   Total steps for LR schedule (default: --steps; set larger for chunked training)\n"
                    "  --data PATH       Data .bin path\n"
+                   "  --tokenizer PATH  Tokenizer .vocab path (default: tokenizer/chinese_bpe.vocab)\n"
                    "  --save PATH       Save trained weights to .ste file\n"
                    "  --resume PATH     Load .ste weights and continue training\n"
                    "  --diagnose-only   Skip training, just load + diagnose + generate\n"
@@ -1576,7 +1579,7 @@ int main(int argc, char **argv) {
 
     /* BPE 模式加载 vocab */
     if (vocab_size > 256) {
-        load_vocab("tokenizer/chinese_bpe.vocab");
+        load_vocab(tokenizer_path);
     }
 
     printf("=== LAL STE Whitebox-Supervised Training ===\n\n");

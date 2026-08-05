@@ -2538,17 +2538,31 @@ void clip_array(float *x, int n, float clip_val) {
  * This causes logits = dot(final_ln, wte) to explode, making sampling degenerate.
  *
  * LayerNorm normalizes the INPUT to each sublayer, but NOT the residual x itself.
- * So x grows unboundedly between layers.
+ * So x grows unboundedly between layers (or collapses to near-zero).
  *
- * Fix: after each residual addition, scale x so ||x|| = target_norm (~3.0).
+ * Fix: after each residual addition, scale x so ||x|| ≈ target_norm.
  * This is similar to "RMSNorm on residual stream" used in some architectures.
- * target_norm=3.0 matches the natural ||x|| after embedding + position encoding
- * in early layers (before the residual starts accumulating). */
+ *
+ * v13m: CRITICAL FIX — previously only capped at target_norm (6.0), never
+ * boosted. Since ||x|| starts at ~3.5 (below 6.0) and shrinks ~25% per
+ * layer due to binary projections, normalize_residual NEVER fired, creating
+ * a death spiral: ||x|| 3.54 → 2.64 → 1.95 → 1.46 → ... → 0.76.
+ * The proportional scaling (0.15*||x||) amplified this: as ||x|| shrank,
+ * attention/MLP contributions shrank too, unable to maintain signal.
+ *
+ * Fix: enforce BOTH minimum and maximum. If ||x|| < target_min, scale UP
+ * to target_min. If ||x|| > target_max, scale DOWN to target_max.
+ * This keeps the residual in a healthy range [3.0, 6.0] across all layers. */
 void normalize_residual(float *x, int n, float target_norm) {
     float norm_sq = 0;
     for (int i = 0; i < n; i++) norm_sq += x[i] * x[i];
     float norm = sqrtf(norm_sq) + 1e-8f;
-    if (norm > target_norm) {
+    /* v13m: enforce minimum — prevent residual death spiral */
+    float target_min = target_norm * 0.5f;  /* 3.0 when target=6.0 */
+    if (norm < target_min) {
+        float scale = target_min / norm;
+        for (int i = 0; i < n; i++) x[i] *= scale;
+    } else if (norm > target_norm) {
         float scale = target_norm / norm;
         for (int i = 0; i < n; i++) x[i] *= scale;
     }
