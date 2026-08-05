@@ -239,7 +239,17 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
     compute_mean_std(act->x_pre_norm1, n, &act->norm1_cache[0], &act->norm1_cache[1]);
 
     /* Attention */
-    if (cfg->qkv_merged) {
+    if (g_skip_wv) {
+        /* v13l: Skip W_v projection — use LN1 output directly as attention
+         * output. This bypasses Q/K/V computation entirely, preserving the
+         * full diversity of norm1_out. W_o still projects the output.
+         * Rationale: W_v tends to collapse to low rank, destroying input
+         * diversity. By using norm1_out directly, we ensure all n_embd
+         * dimensions contribute to the attention output. */
+        memcpy(act->attn_out, act->norm1_out, n * sizeof(float));
+        /* Skip Q/K/V computation — set q/k/v to zero (not used) */
+        memset(act->q, 0, 3 * n * sizeof(float));
+    } else if (cfg->qkv_merged) {
         bin_fwd(act->q, act->norm1_out, &tl->attn_q);
         act->k = act->q + n;
         act->v = act->q + 2 * n;
@@ -249,18 +259,22 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
         bin_fwd(act->v, act->norm1_out, &tl->attn_v);
     }
 
-    if (cfg->attn_type == ATTN_ROPE)
+    if (!g_skip_wv && cfg->attn_type == ATTN_ROPE)
         apply_rope(act->q, act->k, seq_pos, cfg->n_head, n / cfg->n_head, n);
 
     /* Attention: real causal multi-head (KV cache) if flag is on and cache
      * is allocated, else legacy V-copy (degenerate, no token mixing).
-     * [FIX 致命2] The V-copy was a placeholder — see attention_forward(). */
-    if (g_use_real_attention && tl->_kv_k && tl->_kv_v) {
-        attention_forward(act->attn_out, act->q, n, cfg->n_head, seq_pos,
-                          tl->_kv_k, tl->_kv_v);
-    } else {
-        /* Legacy V-copy (degenerate, no QK mixing). */
-        memcpy(act->attn_out, act->v, n * sizeof(float));
+     * [FIX 致命2] The V-copy was a placeholder — see attention_forward().
+     * v13l: When g_skip_wv is on, attn_out is already set to norm1_out,
+     * so we skip the attention computation entirely. */
+    if (!g_skip_wv) {
+        if (g_use_real_attention && tl->_kv_k && tl->_kv_v) {
+            attention_forward(act->attn_out, act->q, n, cfg->n_head, seq_pos,
+                              tl->_kv_k, tl->_kv_v);
+        } else {
+            /* Legacy V-copy (degenerate, no QK mixing). */
+            memcpy(act->attn_out, act->v, n * sizeof(float));
+        }
     }
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
     /* v13j: Proportional attention scaling — scale attn output to 15% of
@@ -340,6 +354,11 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
     memcpy(act->x_pre_norm1, x, n * sizeof(float));
     norm_forward(act->norm1_out, x, tl->norm1_w, tl->norm1_b, cfg->norm_type, n);
 
+    /* v13l: Skip W_v projection — use norm1_out directly as attention output */
+    if (g_skip_wv) {
+        memcpy(act->attn_out, act->norm1_out, n * sizeof(float));
+        memset(act->q, 0, 3 * n * sizeof(float));
+    } else {
     if (cfg->qkv_merged) {
         bin_forward_pure_float(act->q, act->norm1_out, &tl->attn_q);
         act->k = act->q + n;
@@ -358,6 +377,7 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
                           tl->_kv_k, tl->_kv_v);
     else
         memcpy(act->attn_out, act->v, n * sizeof(float));
+    } /* end !g_skip_wv */
 
     bin_forward_pure_float(act->proj_out, act->attn_out, &tl->attn_o);
     /* v13j: Proportional attention scaling (same as standard forward) */
@@ -573,6 +593,7 @@ float g_prune_freeze_thresh = 0.001f; /* PRUNE neurons below this are frozen */
  * Off by default — backward compat with V-copy. When on, trans_layer_forward
  * calls attention_forward() instead of memcpy(act->attn_out, act->v, n). */
 int g_use_real_attention = 0;
+int g_skip_wv = 0;  /* v13l: skip W_v projection, use norm1_out as attn_out */
 int g_use_pure_float = 0;
 int g_accumulate_gradients = 0;  /* 1 = accumulate grads, don't update weights */
 
@@ -630,7 +651,13 @@ void trans_layer_backward(float *grad_x, TransLayer *tl, TransAct *act,
     /* Attention backward — v13b: include scale_to_norm factor */
     for (int i = 0; i < n; i++) g_proj[i] = grad_x[i] * rs * act->attn_scale;
     BIN_BW(g_attn, g_proj, act->attn_out, &tl->attn_o, lr);
-    if (g_use_real_attention && tl->_kv_k && tl->_kv_v) {
+    if (g_skip_wv) {
+        /* v13l: W_v was skipped in forward, so attn_out = norm1_out.
+         * Gradient flows directly from g_attn to g_norm1 (identity).
+         * Q/K/V weights receive no gradient (frozen). */
+        memcpy(g_norm1, g_attn, n * sizeof(float));
+        memset(g_qkv, 0, 3 * n * sizeof(float));
+    } else if (g_use_real_attention && tl->_kv_k && tl->_kv_v) {
         /* Real attention: dQ/dK/dV at the current position. act->q is the
          * contiguous [Q|K|V] buffer (k=q+n, v=q+2n), valid for both merged
          * and separate QKV layouts. */
@@ -641,17 +668,20 @@ void trans_layer_backward(float *grad_x, TransLayer *tl, TransAct *act,
         memset(g_qkv, 0, 3 * n * sizeof(float));
         memcpy(g_qkv + 2 * n, g_attn, n * sizeof(float));
     }
-    if (cfg->qkv_merged) {
-        /* GPT-2: attn_q is the merged [in→3n] projection. */
-        BIN_BW(g_norm1, g_qkv, act->norm1_out, &tl->attn_q, lr);
-    } else {
-        /* LLaMA/Qwen: separate Q/K/V projections — backprop each. */
-        static float g_n1k[4096], g_n1v[4096];
-        BIN_BW(g_norm1,  g_qkv,       act->norm1_out, &tl->attn_q, lr);
-        BIN_BW(g_n1k,    g_qkv + n,   act->norm1_out, &tl->attn_k, lr);
-        BIN_BW(g_n1v,    g_qkv + 2*n, act->norm1_out, &tl->attn_v, lr);
-        for (int i = 0; i < n; i++) g_norm1[i] += g_n1k[i] + g_n1v[i];
+    if (!g_skip_wv) {
+        if (cfg->qkv_merged) {
+            /* GPT-2: attn_q is the merged [in→3n] projection. */
+            BIN_BW(g_norm1, g_qkv, act->norm1_out, &tl->attn_q, lr);
+        } else {
+            /* LLaMA/Qwen: separate Q/K/V projections — backprop each. */
+            static float g_n1k[4096], g_n1v[4096];
+            BIN_BW(g_norm1,  g_qkv,       act->norm1_out, &tl->attn_q, lr);
+            BIN_BW(g_n1k,    g_qkv + n,   act->norm1_out, &tl->attn_k, lr);
+            BIN_BW(g_n1v,    g_qkv + 2*n, act->norm1_out, &tl->attn_v, lr);
+            for (int i = 0; i < n; i++) g_norm1[i] += g_n1k[i] + g_n1v[i];
+        }
     }
+    /* v13l: when g_skip_wv, g_norm1 already = g_attn (identity from attn_out=norm1_out) */
     norm_backward(g_pre, g_norm1, act->x_pre_norm1, tl->norm1_w,
                   act->norm1_cache, cfg->norm_type, n,
                   tl->grad_norm1_w, tl->grad_norm1_b);
@@ -1097,13 +1127,14 @@ float model_forward(Model *m, const int *tokens, int n_tokens) {
     static float x[4096];
     int t = n_tokens - 1;  /* predict tokens[t+1] from context tokens[0..t] */
 
-    if (g_use_real_attention && m->k_cache) {
+    if (g_use_real_attention && m->k_cache && !g_skip_wv) {
         /* Real attention needs the KV cache for positions 0..t to hold THIS
          * sequence's keys/values. The cache persists across training steps
          * (different sentences), so (re)fill 0..t-1 as context before running
          * the target position t. Context positions are run through all layers
          * with a scratch activation buffer (not stored); only their K/V land
-         * in the cache and are treated as constants during backward. */
+         * in the cache and are treated as constants during backward.
+         * v13l: Skip when g_skip_wv — no KV cache needed. */
         static float xc[4096];
         TransAct *scratch = get_scratch_acts(m);
         for (int p = 0; p < t; p++) {
@@ -1217,7 +1248,7 @@ void model_forward_float_logits(Model *m, const int *tokens, int n_tokens,
     g_use_bnn_fast_path = 0;  /* never BNN for teacher */
 
     /* Fill KV cache for context positions (if real attention is enabled). */
-    if (g_use_real_attention && m->k_cache) {
+    if (g_use_real_attention && m->k_cache && !g_skip_wv) {
         static float xc[4096];
         TransAct *scratch = get_scratch_acts(m);
         for (int p = 0; p < t; p++) {
@@ -3163,6 +3194,11 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
     norm_forward(act->norm1_out, x, tl->norm1_w, tl->norm1_b, cfg->norm_type, n);
     compute_mean_std(act->x_pre_norm1, n, &act->norm1_cache[0], &act->norm1_cache[1]);
 
+    /* v13l: Skip W_v projection — use norm1_out directly as attention output */
+    if (g_skip_wv) {
+        memcpy(act->attn_out, act->norm1_out, n * sizeof(float));
+        memset(act->q, 0, 3 * n * sizeof(float));
+    } else {
     if (cfg->qkv_merged) {
         bin_fwd(act->q, act->norm1_out, &tl->attn_q);
         act->k = act->q + n;
@@ -3186,6 +3222,7 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
         /* Fallback: V-copy (legacy) */
         memcpy(act->attn_out, act->v, n * sizeof(float));
     }
+    } /* end !g_skip_wv */
 
     /* Output projection */
     bin_fwd(act->proj_out, act->attn_out, &tl->attn_o);
@@ -3757,7 +3794,9 @@ layer_done:
                            g_opt_step, approx_rank, frob, max_row);
                 }
 
-                /* v10: W_v weight decay 0.999 + noise */
+                /* v10: W_v weight decay 0.999 + noise
+                 * v13l: Skip when g_skip_wv — W_v not in forward path, no need to regularize */
+                if (!g_skip_wv) {
                 for (int j = 2*n; j < 3*n; j++) {
                     float *wf = &bl->w_float[(size_t)j * in];
                     for (int i = 0; i < in; i++) {
@@ -3765,10 +3804,18 @@ layer_done:
                         wf[i] += 0.001f * ((float)rand() / RAND_MAX * 2.0f - 1.0f);  /* noise */
                     }
                 }
+                } /* end !g_skip_wv */
 
-                /* v11: Orthogonal regularization on W_v
+                /* v11+v13l: Orthogonal regularization on W_v
                  * Loss += lambda * ||W_v^T @ W_v - I||^2_F
                  * Gradient: dW_v = 4 * lambda * W_v @ (W_v^T @ W_v - I)
+                 *
+                 * v13l enhancements:
+                 *   - Increased lambda 0.02→0.05 for stronger rank promotion
+                 *   - Added diagonal variance penalty: encourages uniform singular values
+                 *     (high effective rank). When all diag(G) entries are equal,
+                 *     all singular values are equal → maximum effective rank.
+                 *   - Skip when g_skip_wv (W_v not in forward path)
                  *
                  * Effect: pulls all singular values toward 1.
                  *   - Caps S[0] (currently 30-72) down toward 1
@@ -3782,8 +3829,8 @@ layer_done:
                  *          G -= I
                  *          dW_v = 4 * lambda * W_v @ G
                  * Cost: 2 * n^2 * n = 2 * 512^3 ≈ 268M FLOPs per layer (negligible vs training) */
-                {
-                    float lambda_ortho = 0.02f;  /* orthogonal reg strength */
+                if (!g_skip_wv) {
+                    float lambda_ortho = 0.05f;  /* v13l: increased 0.02→0.05 for stronger rank promotion */
                     /* Allocate G on stack: n x n = 512*512 = 262144 floats = 1MB */
                     /* Use static to avoid stack overflow */
                     static float *G = NULL;
@@ -3809,6 +3856,18 @@ layer_done:
                     }
 
                     /* Step 2: G -= I */
+                    /* v13l: compute effective rank (participation ratio) before I subtraction
+                     * eff_rank = (trace(G))^2 / trace(G^2) = (sum s_i^2)^2 / sum(s_i^4)
+                     * Full rank → n, rank-1 → 1. Monitor this to track rank improvement. */
+                    float tr_G = 0, tr_G2 = 0;
+                    for (int i = 0; i < n; i++) tr_G += G[i * n + i];
+                    for (int i = 0; i < n; i++) {
+                        for (int j = 0; j < n; j++) {
+                            tr_G2 += G[i * n + j] * G[i * n + j];  /* Frobenius of G = trace(G^2) for symmetric */
+                        }
+                    }
+                    float eff_rank = (tr_G * tr_G) / (tr_G2 + 1e-12f);
+
                     for (int i = 0; i < n; i++)
                         G[i * n + i] -= 1.0f;
 
@@ -3835,8 +3894,8 @@ layer_done:
                                 if (i != j) off_diag += G[i * n + j] * G[i * n + j];
                             }
                         }
-                        printf("    [ortho] step %d L%d W_v off_diag=%.2f diag_dev=%.4f\n",
-                               g_opt_step, l, off_diag, diag_dev);
+                        printf("    [ortho] step %d L%d W_v off_diag=%.2f diag_dev=%.4f eff_rank=%.1f/%d\n",
+                               g_opt_step, l, off_diag, diag_dev, eff_rank, n);
                     }
                 }
 
@@ -3844,7 +3903,7 @@ layer_done:
                  * 和 W_v 同样的正则化, 防止 W_o rank-1 退化
                  * W_o 是 b==1, 独立的 n×n 矩阵 (不是 QKV merged) */
                 if (b == 1) {
-                    float lambda_ortho = 0.02f;
+                    float lambda_ortho = 0.05f;  /* v13l: increased 0.02→0.05 */
                     static float *Go = NULL;
                     static int Go_n = 0;
                     if (Go_n != n) {
@@ -3904,7 +3963,7 @@ layer_done:
             if (b == 1) {
                 int n = m->cfg.n_embd;
                 int in = bl->in_dim;
-                float lambda_ortho_o = 0.02f;
+                float lambda_ortho_o = 0.05f;  /* v13l: increased 0.02→0.05 */
 
                 static float *Go = NULL;
                 static int Go_n = 0;

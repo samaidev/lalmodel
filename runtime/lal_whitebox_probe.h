@@ -252,21 +252,22 @@ static void compute_gate_input(Model *m, const float *initial_emb,
 
         /* Q, V projections. For qkv_merged, attn_q produces [Q|K|V] (3n);
          * V is at offset 2n. For non-merged, call attn_q and attn_v
-         * separately (K not needed for V-copy attention). */
-        if (m->cfg.qkv_merged) {
+         * separately (K not needed for V-copy attention).
+         * v13l: When g_skip_wv is set, skip Q/V projections entirely and
+         * use norm1 directly as attn_out (matches training forward). */
+        if (g_skip_wv) {
+            memcpy(attn_out, norm1, n * sizeof(float));
+        } else if (m->cfg.qkv_merged) {
             bin_forward_pure_float(qkv_buf, norm1, &tl->attn_q);
             /* v already points to qkv_buf + 2*n */
+            memcpy(attn_out, v, n * sizeof(float));
         } else {
             bin_forward_pure_float(q, norm1, &tl->attn_q);  /* unused but matches forward */
             bin_forward_pure_float(v, norm1, &tl->attn_v);
+            memcpy(attn_out, v, n * sizeof(float));
         }
 
-        /* V-copy attention (matches training default g_use_real_attention=0):
-         *   attn_out = v
-         * For single token this is exact. For multi-token concepts we're
-         * already collapsing to one position, so this is still the right
-         * degenerate attention. */
-        memcpy(attn_out, v, n * sizeof(float));
+        /* v13l: When g_skip_wv, attn_out = norm1 (no V-copy needed) */
 
         /* Output projection + residual */
         bin_forward_pure_float(proj_out, attn_out, &tl->attn_o);

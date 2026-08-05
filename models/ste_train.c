@@ -437,27 +437,35 @@ static float attn_logic_regularization(Model *m, float lr) {
  * 实现细节: 梯度对 h_a 和 h_b 各推开 (cosine - threshold) 的方向分量.
  *   d cosine / d h_a = (h_b - cosine * h_a) / (||h_a|| * ||h_b||)
  *   push apart: h_a -= lr * d_cosine_dh_a, h_b -= lr * d_cosine_dh_b
- *   但我们不直接改 h (它是中间激活), 而是把梯度传回给 model 的 grad_accum.
- *   简化处理: 只监控和报告, 梯度通过现有的 logic_guided + attn_logic 间接传递.
- *   如果 cosine > 0.9, 增加一个直接的 logit-diversity 惩罚.
+ *   v13l: 重写为带梯度的多样性损失。对每对反义词 (a,b)，在每层计算
+ *   cosine(x_a, x_b)，当超过阈值时直接对 attn_o 和 mlp_down 的 grad_accum
+ *   累加推开梯度。梯度方向：让 x_a 和 x_b 的残差方向互相远离。
+ *
+ *   梯度推导：L = max(0, cos(x_a, x_b) - threshold)
+ *   dL/dx_a = (x_b / (||x_a|| ||x_b||)) - cos * (x_a / ||x_a||²)   (当 cos > threshold)
+ *   dL/dx_b = (x_a / (||x_a|| ||x_b||)) - cos * (x_b / ||x_b||²)
+ *   这个梯度通过残差路径传回 W_o 和 W_down。
  */
-static float residual_diversity_loss(Model *m) {
+static float residual_diversity_loss(Model *m, float lr) {
     int n_embd = m->cfg.n_embd;
     int n_layer = m->cfg.n_layer;
     int n = n_embd;
-    float threshold = 0.5f;  /* cosine 超过这个才惩罚 */
-    float weight = 0.5f;     /* 损失权重 */
+    float threshold = 0.3f;  /* 惩罚阈值：cosine超过0.3就开始推开 */
+    float weight = 2.0f;     /* 损失权重 */
     float total_loss = 0.0f;
 
     static float *emb_a = NULL, *emb_b = NULL;
     static float *xa = NULL, *xb = NULL;
+    static float *grad_a = NULL, *grad_b = NULL;
     static int ec_n = 0;
     if (ec_n != n_embd) {
-        free(emb_a); free(emb_b); free(xa); free(xb);
+        free(emb_a); free(emb_b); free(xa); free(xb); free(grad_a); free(grad_b);
         emb_a = malloc(n * sizeof(float));
         emb_b = malloc(n * sizeof(float));
         xa = malloc(n * sizeof(float));
         xb = malloc(n * sizeof(float));
+        grad_a = malloc(n * sizeof(float));
+        grad_b = malloc(n * sizeof(float));
         ec_n = n;
     }
 
@@ -469,7 +477,17 @@ static float residual_diversity_loss(Model *m) {
         get_concept_embedding(m, cp->bytes_a, emb_a, n);
         get_concept_embedding(m, cp->bytes_b, emb_b, n);
 
-        /* 跑 forward, 在每层检查 cosine */
+        /* Forward: 跑完所有层，缓存每层后的 x_a, x_b */
+        /* 用静态数组缓存每层的 x_a, x_b */
+        static float *xa_layers = NULL, *xb_layers = NULL;
+        static int xl_n = 0, xl_layers = 0;
+        if (xl_n != n_embd || xl_layers != n_layer) {
+            free(xa_layers); free(xb_layers);
+            xa_layers = malloc((size_t)(n_layer + 1) * n * sizeof(float));
+            xb_layers = malloc((size_t)(n_layer + 1) * n * sizeof(float));
+            xl_n = n_embd; xl_layers = n_layer;
+        }
+
         memcpy(xa, emb_a, n * sizeof(float));
         memcpy(xb, emb_b, n * sizeof(float));
         if (m->wpe) {
@@ -478,33 +496,148 @@ static float residual_diversity_loss(Model *m) {
                 xb[i] += m->wpe[i];
             }
         }
+        memcpy(&xa_layers[0], xa, n * sizeof(float));
+        memcpy(&xb_layers[0], xb, n * sizeof(float));
 
         for (int l = 0; l < n_layer; l++) {
             trans_layer_forward(xa, &m->layers[l], &m->acts[l], &m->cfg, 0);
             trans_layer_forward(xb, &m->layers[l], &m->acts[l], &m->cfg, 0);
+            memcpy(&xa_layers[(size_t)(l + 1) * n], xa, n * sizeof(float));
+            memcpy(&xb_layers[(size_t)(l + 1) * n], xb, n * sizeof(float));
+        }
 
-            /* 计算 cosine(h_a, h_b) */
+        /* Backward: 从最后一层往回传梯度 */
+        memset(grad_a, 0, n * sizeof(float));
+        memset(grad_b, 0, n * sizeof(float));
+
+        for (int l = n_layer - 1; l >= 0; l--) {
+            float *xal = &xa_layers[(size_t)(l + 1) * n];
+            float *xbl = &xb_layers[(size_t)(l + 1) * n];
+
+            /* 计算 cosine(x_a, x_b) */
             float dot = 0, na = 0, nb = 0;
             for (int i = 0; i < n; i++) {
-                dot += xa[i] * xb[i];
-                na += xa[i] * xa[i];
-                nb += xb[i] * xb[i];
+                dot += xal[i] * xbl[i];
+                na += xal[i] * xal[i];
+                nb += xbl[i] * xbl[i];
             }
-            float cos = dot / (sqrtf(na) * sqrtf(nb) + 1e-12f);
+            float norm_a = sqrtf(na) + 1e-8f;
+            float norm_b = sqrtf(nb) + 1e-8f;
+            float cos = dot / (norm_a * norm_b);
             if (cos > max_cos) max_cos = cos;
+
             if (cos > threshold) {
                 total_loss += weight * (cos - threshold);
                 if (cos > 0.9f) n_collapsed++;
+
+                /* dL/dx_a = weight * (x_b / (||a|| ||b||) - cos * x_a / ||a||²) */
+                float inv_ab = 1.0f / (norm_a * norm_b);
+                float cos_over_na = cos / na;
+                float cos_over_nb = cos / nb;
+                for (int i = 0; i < n; i++) {
+                    grad_a[i] += weight * (xbl[i] * inv_ab - xal[i] * cos_over_na);
+                    grad_b[i] += weight * (xal[i] * inv_ab - xbl[i] * cos_over_nb);
+                }
+
+                /* 将梯度传到 attn_o 和 mlp_down 的 grad_accum */
+                /* x = x_pre + rs * attn_scale * proj_out + rs * mlp_scale * mlp_out */
+                /* 我们近似：对 attn_o 的 grad_accum 加 grad * norm1_out^T */
+                TransLayer *tl = &m->layers[l];
+                float rs = m->cfg.residual_scale;
+                /* attn_o: grad_W_o += (grad * rs * attn_scale) × norm1_out^T */
+                float attn_scale = m->acts[l].attn_scale;
+                float grad_attn_scale = rs * attn_scale;
+                int in_dim = tl->attn_o.in_dim;
+                int out_dim = tl->attn_o.out_dim;
+                for (int j = 0; j < out_dim && j < n; j++) {
+                    float ga = grad_a[j] * grad_attn_scale * lr;
+                    float gb = grad_b[j] * grad_attn_scale * lr;
+                    if (fabsf(ga) > 1e-10f || fabsf(gb) > 1e-10f) {
+                        float *wga = &tl->attn_o.grad_accum[(size_t)j * in_dim];
+                        const float *n1 = m->acts[l].norm1_out;
+                        for (int i = 0; i < in_dim && i < n; i++)
+                            wga[i] += ga * n1[i] + gb * n1[i];  /* 两个概念都推开 */
+                        if (tl->attn_o.bias_grad_accum) {
+                            tl->attn_o.bias_grad_accum[j] += ga + gb;
+                        }
+                    }
+                }
+
+                /* mlp_down: grad_W_down += (grad * rs * mlp_scale) × hidden^T */
+                float mlp_scale = m->acts[l].mlp_scale;
+                float grad_mlp_scale = rs * mlp_scale;
+                int md_in = tl->mlp_down.in_dim;
+                int md_out = tl->mlp_down.out_dim;
+                for (int j = 0; j < md_out && j < n; j++) {
+                    float ga = grad_a[j] * grad_mlp_scale * lr;
+                    float gb = grad_b[j] * grad_mlp_scale * lr;
+                    if (fabsf(ga) > 1e-10f || fabsf(gb) > 1e-10f) {
+                        float *wga = &tl->mlp_down.grad_accum[(size_t)j * md_in];
+                        const float *hid = m->acts[l].mlp_hidden;
+                        for (int i = 0; i < md_in; i++)
+                            wga[i] += ga * hid[i] + gb * hid[i];
+                        if (tl->mlp_down.bias_grad_accum) {
+                            tl->mlp_down.bias_grad_accum[j] += ga + gb;
+                        }
+                    }
+                }
+            }
+
+            /* 传播梯度到前一层 (简化：通过 W_o^T 和 W_down^T 传回) */
+            /* grad_x_pre = grad * (W_o^T * attn_scale + W_down^T * mlp_scale) */
+            /* 为了效率，只传播到 x_pre (跳过 LN 链) */
+            TransLayer *tl = &m->layers[l];  /* re-declare for this scope */
+            float *new_grad_a = grad_a;  /* 原地操作 */
+            float *new_grad_b = grad_b;
+            /* 实际上这里需要存储中间结果，用一个临时buffer */
+            static float *tmp_ga = NULL, *tmp_gb = NULL;
+            static int tg_n = 0;
+            if (tg_n != n) {
+                free(tmp_ga); free(tmp_gb);
+                tmp_ga = malloc(n * sizeof(float));
+                tmp_gb = malloc(n * sizeof(float));
+                tg_n = n;
+            }
+            memcpy(tmp_ga, grad_a, n * sizeof(float));
+            memcpy(tmp_gb, grad_b, n * sizeof(float));
+            memset(grad_a, 0, n * sizeof(float));
+            memset(grad_b, 0, n * sizeof(float));
+            /* grad_x_pre = W_o^T * (grad * attn_scale) + W_down^T * (grad * mlp_scale) */
+            /* 用 bin_forward_pure_float 近似反向传播（转置乘法） */
+            /* 简化：只传 attn_o 部分，因为 attn 是主要坍缩源 */
+            float as = m->acts[l].attn_scale * m->cfg.residual_scale;
+            float ms = m->acts[l].mlp_scale * m->cfg.residual_scale;
+            for (int j = 0; j < n; j++) {
+                float ga_j = tmp_ga[j] * as;
+                float gb_j = tmp_gb[j] * as;
+                /* W_o^T * grad: 对每个输入 i, sum_j W_o[j*n+i] * grad[j] */
+                const float *wo = tl->attn_o.w_float;
+                if (wo) {
+                    for (int i = 0; i < n; i++) {
+                        grad_a[i] += wo[(size_t)j * n + i] * ga_j;
+                        grad_b[i] += wo[(size_t)j * n + i] * gb_j;
+                    }
+                }
+            }
+            /* 加上 mlp_down 的贡献 */
+            for (int j = 0; j < n; j++) {
+                float ga_j = tmp_ga[j] * ms;
+                float gb_j = tmp_gb[j] * ms;
+                const float *wd = tl->mlp_down.w_float;
+                if (wd) {
+                    int md_in = tl->mlp_down.in_dim;
+                    for (int i = 0; i < n && i < md_in; i++) {
+                        grad_a[i] += wd[(size_t)j * md_in + i] * ga_j;
+                        grad_b[i] += wd[(size_t)j * md_in + i] * gb_j;
+                    }
+                }
             }
         }
     }
 
-    /* 报告: 不直接加梯度 (太复杂), 而是通过返回 loss 让训练 loop 知道当前状态.
-     * 真正的 anti-collapse 信号来自 logic_guided + attn_logic 的 CORE 差异化.
-     * 这个函数主要作为诊断指标, 当 cosine > 0.9 时增加 n_collapsed 计数. */
-    if (n_collapsed > 0) {
-        printf("  [DIVERSITY] max_cos=%.4f n_collapsed=%d/%d layers (need stronger logic_lr)\n",
-               max_cos, n_collapsed, N_PROBE_PAIRS * n_layer);
+    if (n_collapsed > 0 && g_opt_step % 10 == 0) {
+        printf("  [DIVERSITY] max_cos=%.4f n_collapsed=%d/%d layers\n",
+               max_cos, n_collapsed, (int)(N_PROBE_PAIRS * n_layer));
     }
     return total_loss / N_PROBE_PAIRS;
 }
@@ -1136,17 +1269,19 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
             int do_logic = (step % 5 == 0) || logic_only;
             float effective_logic_lr = do_logic ? logic_lr * 5.0f : 0.0f;
             float effective_attn_lr = do_logic ? logic_lr * 2.5f : 0.0f;
-            float logic_loss = 0, attn_loss = 0;
+            float logic_loss = 0, attn_loss = 0, div_loss = 0;
             if (do_logic) {
                 logic_loss = logic_guided_regularization(m, effective_logic_lr);
                 attn_loss = attn_logic_regularization(m, effective_attn_lr);
+                /* v13l: 多样性损失 — 直接惩罚概念对间隐藏状态余弦相似度 */
+                div_loss = residual_diversity_loss(m, effective_logic_lr);
             }
             /* v13g: logic-only 模式下 n_valid=0, 用 batch_size=1 做 apply */
             int apply_batch = logic_only ? 1 : n_valid;
             model_batch_apply(m, lr, apply_batch);
             /* g_opt_step is incremented inside model_batch_apply — don't double-increment */
             if (step % 10 == 0) {
-                printf("  [LOGIC] mlp=%.4f attn=%.4f\n", logic_loss, attn_loss);
+                printf("  [LOGIC] mlp=%.4f attn=%.4f div=%.4f\n", logic_loss, attn_loss, div_loss);
             }
         }
         clock_gettime(CLOCK_MONOTONIC, &t_apply_start);
@@ -1215,6 +1350,7 @@ static void generate_text(Model *m, const char *prompt, const int *prompt_ids,
     g_use_adam = 0;
     g_use_pure_float = 1;  /* 生成用 pure_float(完整浮点),避免 bin_forward 二值化丢失输入区分度 */
     g_use_real_attention = 1;
+    g_skip_wv = 1;  /* v13l: match training — skip W_v projection */
 
     int prompt_tokens[512];
     int prompt_len;
@@ -1479,6 +1615,7 @@ int main(int argc, char **argv) {
     g_use_pure_float = 1;  /* 前向用浮点(与推理一致),反向仍用 STE(g_use_ste=1) */
     g_use_ste = 1;         /* STE 反向:梯度通过 w_float 回传 */
     g_use_real_attention = 1;
+    g_skip_wv = 1;  /* v13l: Skip W_v projection, use LN1 output as attention output */
     g_use_logic_binarization = 1;
     g_use_cuda = 1;  /* v13i: enable CUDA for attn_q (no logic_mask layers) */
     /* Ablation: MLP-only test (set attn scale to 0 via env var) */

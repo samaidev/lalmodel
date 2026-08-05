@@ -209,6 +209,14 @@ void bin_layer_repack(BinLayer *bl);
  * flag before model_load(). */
 extern int g_use_real_attention;
 
+/* v13l: Skip W_v projection — use LayerNorm output directly as attention
+ * output, preserving full input diversity. When on:
+ *   - trans_layer_forward skips Q/K/V computation, sets attn_out = norm1_out
+ *   - trans_layer_backward only backprops through W_o, skips Q/K/V grads
+ *   - W_v weights are frozen (not updated) since they're not in the forward path
+ * This prevents W_v rank deficiency from collapsing the attention pathway. */
+extern int g_skip_wv;
+
 /* Global flag: set to 1 to use pure float (full-precision) forward and backward
  * instead of binary weight network (BWN). When on:
  *   - trans_layer_forward dispatches to bin_forward_pure_float (uses w_float)
