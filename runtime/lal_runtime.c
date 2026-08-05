@@ -359,24 +359,24 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
         memcpy(act->attn_out, act->norm1_out, n * sizeof(float));
         memset(act->q, 0, 3 * n * sizeof(float));
     } else {
-    if (cfg->qkv_merged) {
-        bin_forward_pure_float(act->q, act->norm1_out, &tl->attn_q);
-        act->k = act->q + n;
-        act->v = act->q + 2 * n;
-    } else {
-        bin_forward_pure_float(act->q, act->norm1_out, &tl->attn_q);
-        bin_forward_pure_float(act->k, act->norm1_out, &tl->attn_k);
-        bin_forward_pure_float(act->v, act->norm1_out, &tl->attn_v);
-    }
+        if (cfg->qkv_merged) {
+            bin_forward_pure_float(act->q, act->norm1_out, &tl->attn_q);
+            act->k = act->q + n;
+            act->v = act->q + 2 * n;
+        } else {
+            bin_forward_pure_float(act->q, act->norm1_out, &tl->attn_q);
+            bin_forward_pure_float(act->k, act->norm1_out, &tl->attn_k);
+            bin_forward_pure_float(act->v, act->norm1_out, &tl->attn_v);
+        }
 
-    if (cfg->attn_type == ATTN_ROPE)
-        apply_rope(act->q, act->k, seq_pos, cfg->n_head, n / cfg->n_head, n);
+        if (cfg->attn_type == ATTN_ROPE)
+            apply_rope(act->q, act->k, seq_pos, cfg->n_head, n / cfg->n_head, n);
 
-    if (g_use_real_attention && tl->_kv_k && tl->_kv_v)
-        attention_forward(act->attn_out, act->q, n, cfg->n_head, seq_pos,
-                          tl->_kv_k, tl->_kv_v);
-    else
-        memcpy(act->attn_out, act->v, n * sizeof(float));
+        if (g_use_real_attention && tl->_kv_k && tl->_kv_v)
+            attention_forward(act->attn_out, act->q, n, cfg->n_head, seq_pos,
+                              tl->_kv_k, tl->_kv_v);
+        else
+            memcpy(act->attn_out, act->v, n * sizeof(float));
     } /* end !g_skip_wv */
 
     bin_forward_pure_float(act->proj_out, act->attn_out, &tl->attn_o);
@@ -3199,29 +3199,29 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
         memcpy(act->attn_out, act->norm1_out, n * sizeof(float));
         memset(act->q, 0, 3 * n * sizeof(float));
     } else {
-    if (cfg->qkv_merged) {
-        bin_fwd(act->q, act->norm1_out, &tl->attn_q);
-        act->k = act->q + n;
-        act->v = act->q + 2 * n;
-    } else {
-        bin_fwd(act->q, act->norm1_out, &tl->attn_q);
-        bin_fwd(act->k, act->norm1_out, &tl->attn_k);
-        bin_fwd(act->v, act->norm1_out, &tl->attn_v);
-    }
+        if (cfg->qkv_merged) {
+            bin_fwd(act->q, act->norm1_out, &tl->attn_q);
+            act->k = act->q + n;
+            act->v = act->q + 2 * n;
+        } else {
+            bin_fwd(act->q, act->norm1_out, &tl->attn_q);
+            bin_fwd(act->k, act->norm1_out, &tl->attn_k);
+            bin_fwd(act->v, act->norm1_out, &tl->attn_v);
+        }
 
-    /* Apply RoPE if configured */
-    if (cfg->attn_type == ATTN_ROPE)
-        apply_rope(act->q, act->k, abs_pos, cfg->n_head, n / cfg->n_head, n);
+        /* Apply RoPE if configured */
+        if (cfg->attn_type == ATTN_ROPE)
+            apply_rope(act->q, act->k, abs_pos, cfg->n_head, n / cfg->n_head, n);
 
-    /* Sliding window attention */
-    if (tl->_kv_k && tl->_kv_v) {
-        attention_forward_sliding(act->attn_out, act->q, n, cfg->n_head,
-                                   cache_pos, tl->_kv_k, tl->_kv_v,
-                                   cfg->n_ctx, window, n_sinks);
-    } else {
-        /* Fallback: V-copy (legacy) */
-        memcpy(act->attn_out, act->v, n * sizeof(float));
-    }
+        /* Sliding window attention */
+        if (tl->_kv_k && tl->_kv_v) {
+            attention_forward_sliding(act->attn_out, act->q, n, cfg->n_head,
+                                       cache_pos, tl->_kv_k, tl->_kv_v,
+                                       cfg->n_ctx, window, n_sinks);
+        } else {
+            /* Fallback: V-copy (legacy) */
+            memcpy(act->attn_out, act->v, n * sizeof(float));
+        }
     } /* end !g_skip_wv */
 
     /* Output projection */

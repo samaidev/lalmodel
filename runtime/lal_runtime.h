@@ -341,8 +341,8 @@ typedef struct {
     float *swiglu_up;     /* up = W_up · norm2 */
     int   seq_pos;        /* position of the cached forward pass (for attention bwd) */
     /* v13b: scale factors for sublayer output normalization */
-    float attn_scale;     /* scale applied to proj_out (0.3/||proj_out||) */
-    float mlp_scale;      /* scale applied to mlp_out (0.3/||mlp_out||) */
+    float attn_scale;     /* scale applied to proj_out */
+    float mlp_scale;      /* scale applied to mlp_out */
 } TransAct;
 
 /* Initialize a transformer layer from tensors (model-agnostic) */
