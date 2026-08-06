@@ -1,0 +1,35 @@
+name: LAL Model Training
+
+on:
+  workflow_dispatch:
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3-pip
+          pip3 install sentencepiece
+
+      - name: Compile
+        run: make
+
+      - name: Generate BPE data
+        run: |
+          pip3 install sentencepiece
+          python3 scripts/tokenize_data.py --input data/cognitive_foundation.jsonl --output data/cognitive_bpe.bin --tokenizer tokenizer/chinese_bpe.model --max_len 64
+
+      - name: Train (500 steps)
+        run: |
+          ./ste_train --steps 500 --batch-size 4 --lr 0.001 --logic-lr 0.002 --phase 0 --vocab 32768 --data data/cognitive_bpe.bin --no-generate --save model.ste
+
+      - name: Upload model
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-model
+          path: model.ste
