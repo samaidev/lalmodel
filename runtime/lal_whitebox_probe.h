@@ -1457,6 +1457,15 @@ static ConceptEdge concept_edges[] = {
     {"\xe4\xba\xba", "\xe5\xa4\xa9", REL_ASSOC},  /* 人~天 */
     {"\xe9\x9b\xa8", "\xe6\xb0\xb4", REL_ASSOC},  /* 雨~水 */
     {"\xe6\x9c\x88", "\xe6\x98\x9f", REL_ASSOC},  /* 月~星 */
+    /* 对立补充 */
+    {"\xe7\x81\xab", "\xe6\xb0\xb4", REL_ANTONYM},  /* 火<>水 */
+    {"\xe5\xa4\xa9", "\xe5\x9c\xb0", REL_ANTONYM},  /* 天<>地 */
+    {"\xe5\xa4\xa9", "\xe6\xb0\xb4", REL_ASSOC},  /* 天~水 (天空含水汽) */
+    {"\xe5\xa4\xa9", "\xe5\x85\x89", REL_ACTIVE},  /* 天->光 (天空反射光) */
+    {"\xe5\x85\x89", "\xe8\x93\x9d", REL_SERIAL},  /* 光>>蓝 (光散射成蓝) */
+    {"\xe5\xa4\xa9", "\xe8\x93\x9d", REL_ATTRIBUTE},  /* 天.蓝 */
+    {"\xe6\xb0\xb4", "\xe5\x86\xb0", REL_SERIAL},    /* 水>>冰 */
+    {"\xe5\xb1\xb1", "\xe5\x9c\xb0", REL_CATEGORY},  /* 山 in 地 */
 };
 #define N_CONCEPT_EDGES (sizeof(concept_edges) / sizeof(concept_edges[0]))
 
@@ -1562,19 +1571,82 @@ static float core_activation_overlap(Model *m, const char *concept_a,
  *   core_diff = activation difference magnitude
  *
  *   High wte + High core_ov  -> PARALLEL (similar in both spaces)
- *   Med wte + Low core_ov    -> ATTRIBUTE (related but different logic)
+ *   Med wte + Med core_ov    -> ATTRIBUTE (related but different logic)
  *   Low wte + High core_ov   -> CATEGORY (different words, same circuitry)
- *   Low wte + Low core_ov    -> CAUSAL (distinct in both spaces)
- *   Default                  -> ASSOC
+ *   Low wte + High core_ov   -> CATEGORY (different words, same circuitry)
+ *   Default                  -> ASSOC (related but unspecified)
+ *
+ * Note: CAUSAL is NOT dynamically classified — causality requires directional
+ * evidence that wte/core_ov alone cannot provide. Only explicit edges
+ * define CAUSAL relationships.
  */
 static RelType classify_relationship(float wte_cos, float core_ov, float core_diff) {
+    /* 高语义+高逻辑 → 并行(共现) */
     if (wte_cos > 0.6f && core_ov > 0.6f)
         return REL_PARALLEL;
-    if (wte_cos > 0.4f && core_ov < 0.4f)
+    /* 中语义+中低逻辑(>=0.15) → 属性(相关但逻辑不同)
+     * core_ov < 0.15 时不判为属性, 降级为联想(避免误分类无关概念) */
+    if (wte_cos > 0.4f && core_ov >= 0.15f && core_ov < 0.5f)
         return REL_ATTRIBUTE;
+    /* 低语义+高逻辑 → 类别(不同词但同一回路) */
     if (wte_cos < 0.3f && core_ov > 0.5f)
         return REL_CATEGORY;
-    if (wte_cos < 0.2f && core_ov < 0.3f)
-        return REL_CAUSAL;
+    /* 不动态分类因果关系: 因果需要方向性证据, 仅凭 wte/core_ov 无法确定.
+     * 低 wte + 低 core_ov 的概念对是"不相关", 不是"因果" */
     return REL_ASSOC;
+}
+
+/* 检查关系边是否匹配问句类型 (严格匹配, 非加权) */
+static int rel_type_matches_qtype(RelType rt, QType qt) {
+    switch (qt) {
+        case Q_WHY:
+            return (rt == REL_CAUSAL || rt == REL_SERIAL || rt == REL_ACTIVE);
+        case Q_WHAT:
+            return (rt == REL_CATEGORY || rt == REL_ATTRIBUTE);
+        case Q_HOW:
+            /* "怎么"问过程: 串行(步骤) + 主被动(行动者) + 因果(原因驱动过程) */
+            return (rt == REL_SERIAL || rt == REL_ACTIVE || rt == REL_CAUSAL);
+        default:
+            return (rt == REL_ASSOC || rt == REL_PARALLEL);
+    }
+}
+
+/* 在 concept_edges 中查找 a→b 的关系类型, 返回 -1 表示未找到 */
+static int find_edge_type(const char *a, const char *b) {
+    for (int e = 0; e < (int)N_CONCEPT_EDGES; e++) {
+        if (strcmp(concept_edges[e].a, a) == 0 &&
+            strcmp(concept_edges[e].b, b) == 0)
+            return (int)concept_edges[e].type;
+    }
+    return -1;
+}
+
+/* 双向查找: 也检查 b→a (用于对立/并行等对称关系) */
+static int find_edge_type_bidir(const char *a, const char *b) {
+    int rt = find_edge_type(a, b);
+    if (rt >= 0) return rt;
+    /* 检查反向边 */
+    rt = find_edge_type(b, a);
+    if (rt >= 0) {
+        /* 对立和并行是对称关系, 直接返回 */
+        if (rt == REL_ANTONYM || rt == REL_PARALLEL)
+            return rt;
+        /* 其他关系有方向性, 反向不等于正向, 返回 -1 */
+    }
+    return -1;
+}
+
+/* 关系类型的自然语言解释 */
+static const char *rel_explanation_cn(RelType rt) {
+    switch (rt) {
+        case REL_CAUSAL:   return "\xe5\x9b\xa0\xe4\xb8\xba";  /* 因为 */
+        case REL_PARALLEL: return "\xe5\x90\x8c\xe6\x97\xb6";  /* 同时 */
+        case REL_ACTIVE:   return "\xe4\xb8\xbb\xe5\x8a\xa8";  /* 主动 */
+        case REL_SERIAL:   return "\xe5\xaf\xbc\xe8\x87\xb4";  /* 导致 */
+        case REL_CATEGORY: return "\xe5\xb1\x9e\xe4\xba\x8e";  /* 属于 */
+        case REL_ATTRIBUTE:return "\xe5\x85\xb7\xe6\x9c\x89";  /* 具有 */
+        case REL_ANTONYM:  return "\xe5\xaf\xb9\xe7\xab\x8b\xe4\xba\x8e"; /* 对立于 */
+        case REL_ASSOC:    return "\xe5\x85\xb3\xe8\x81\x94";  /* 关联 */
+    }
+    return "?";
 }
