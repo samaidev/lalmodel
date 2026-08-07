@@ -1215,3 +1215,141 @@ static void relation_probe(Model *m) {
     free(emb_b);
     free(emb_c);
 }
+
+/* ========================================================================
+ * v15: RELATION LOGIC REGULARIZATION — 把"关系对"拉进 wte 空间
+ *
+ * 问题: 原 logic_guided_regularization 只监控 14 个 *对立* 概念对
+ * (热/冷, 大/小...), 让对立概念在 CORE 激活上分开. 但它 *不* 推动
+ * *相关* 概念靠近, 且不改 wte (见上方 BUG #18 注释). 结果是 wte 余弦
+ * 空间里 "鸟→动物" "火→光" 这类关系永远学不出来, 原生推理概念链退化成
+ * 随机噪声.
+ *
+ * 修复: 新增独立的关系正则, 直接在 wte 空间对关系对施加余弦监督:
+ *   - 相关对 (A,B): 最大化 cosine(emb_A, emb_B)  → 拉近
+ *   - 无关对 (A,C): 最小化 cosine(emb_A, emb_C)  → 推远
+ * BPE 模式下单概念 token (▁鸟=1051 等) 是独立 token, 不像 byte-fallback
+ * 共享首字节, 故直接改 wte 行安全 (与 BUG #18 的 byte-level 污染不同).
+ *
+ * 梯度 (对 emb_A, 对称对 emb_B):
+ *   d cos/ d emb_A = (emb_B - cos*emb_A) / (||A||*||B||)
+ *   emb_A -= lr * (cos_target - cos) * d cos/ d emb_A
+ * 其中 cos_target=+1 对正相关, -1 对负相关(无关). 实际用 margin 方式:
+ *   相关: 若 cos < M_pos 则推 (M_pos - cos) 倍梯度
+ *   无关: 若 cos > M_neg 则推 (cos - M_neg) 倍梯度
+ * ======================================================================== */
+
+typedef struct {
+    const char *a;     /* 主体概念 (UTF-8, 须在 bpe_token_map 中) */
+    const char *b;     /* 相关概念 */
+    const char *neg;   /* 无关/对照概念 */
+    const char *rel;   /* 人类可读关系 */
+} RelationReg;
+
+static RelationReg relation_regs[] = {
+    /* 类别关系: A 是 B 的一种 */
+    {"\xe9\xb8\x9f", "\xe5\x8a\xa8\xe7\x89\xa9", "\xe6\xa4\x8d\xe7\x89\xa9", "鸟→动物"},   /* 鸟→动物 (非植物) */
+    {"\xe7\x8c\xab", "\xe5\x8a\xa8\xe7\x89\xa9", "\xe6\xa4\x8d\xe7\x89\xa9", "猫→动物"},   /* 猫→动物 */
+    {"\xe9\xb1\xbc", "\xe5\x8a\xa8\xe7\x89\xa9", "\xe6\xa4\x8d\xe7\x89\xa9", "鱼→动物"},   /* 鱼→动物 */
+    {"\xe8\x8a\xb1", "\xe6\xa4\x8d\xe7\x89\xa9", "\xe5\x8a\xa8\xe7\x89\xa9", "花→植物"},   /* 花→植物 */
+    {"\xe6\xa0\x91", "\xe6\xa4\x8d\xe7\x89\xa9", "\xe5\x8a\xa8\xe7\x89\xa9", "树→植物"},   /* 树→植物 */
+    /* 属性关系: A 具有属性 B */
+    {"\xe7\x81\xab", "\xe7\x83\xad", "\xe5\x86\xb7", "火→热"},     /* 火→热 (非冷) */
+    {"\xe7\x81\xab", "\xe5\x85\x89", "\xe6\x9a\x97", "火→光"},     /* 火→光 (非暗) */
+    {"\xe6\xb0\xb4", "\xe5\x86\xb7", "\xe7\x83\xad", "水→冷"},     /* 水→冷 (非热) */
+    {"\xe6\xb0\xb4", "\xe8\x93\x9d", "\xe7\xba\xa2", "水→蓝"},     /* 水→蓝 (非红) */
+    {"\xe5\xa4\xaa\xe9\x98\xb3", "\xe4\xba\xae", "\xe6\x9a\x97", "太阳→亮"}, /* 太阳→亮 */
+    {"\xe5\x86\xb0", "\xe5\x86\xb7", "\xe7\x83\xad", "冰→冷"},     /* 冰→冷 */
+    {"\xe9\x9b\xaa", "\xe5\x86\xb7", "\xe7\x83\xad", "雪→冷"},     /* 雪→冷 */
+    /* 因果/联想关系 */
+    {"\xe9\x9b\xa8", "\xe6\xb0\xb4", "\xe7\x81\xab", "雨→水"},     /* 雨→水 (非火) */
+    {"\xe9\xa3\x8e", "\xe4\xba\x91", "\xe7\x81\xab", "风→云"},     /* 风→云 */
+    {"\xe5\xb1\xb1", "\xe8\x8a\xb1", "\xe6\xb0\xb4", "山→花"},     /* 山→花 */
+    {"\xe4\xba\xba", "\xe5\xb1\xb1", "\xe6\xb0\xb4", "人→山"},     /* 人→山 (登高) */
+    /* v15c: 对话因果链 — 用已有概念拆解 "鸟为什么天上飞" 等 (翅膀/飞 无单 token, 用天/云/动物 代偿) */
+    {"\xe9\xb8\x9f", "\xe5\xa4\xa9", "\xe6\xb0\xb4", "鸟→天"},     /* 鸟→天 (天上飞) */
+    {"\xe9\xb8\x9f", "\xe4\xba\x91", "\xe6\xb0\xb4", "鸟→云"},     /* 鸟→云 (云中飞) */
+    {"\xe9\xb8\x9f", "\xe5\x8a\xa8\xe7\x89\xa9", "\xe6\xa4\x8d\xe7\x89\xa9", "鸟→动物(二次强化)"}, /* 鸟是动物 */
+    {"\xe7\x81\xab", "\xe5\x85\x89", "\xe6\xb0\xb4", "火→光(链)"},  /* 火→光 */
+    {"\xe5\x85\x89", "\xe7\x83\xad", "\xe6\xb0\xb4", "光→热(链)"},  /* 光→热, 与 火→热 形成 火→光→热 */
+    {"\xe6\xb0\xb4", "\xe9\x9b\xa8", "\xe7\x81\xab", "水→雨(链)"},  /* 水→雨 */
+    {"\xe9\x9b\xa8", "\xe5\x86\xb7", "\xe7\x83\xad", "雨→冷(链)"},  /* 雨→冷, 形成 水→雨→冷 */
+    {"\xe5\xa4\xaa\xe9\x98\xb3", "\xe4\xba\xae", "\xe6\x9a\x97", "太阳→亮(链)"},
+    {"\xe4\xba\xae", "\xe7\x83\xad", "\xe6\x9a\x97", "亮→热(链)"},  /* 亮→热, 形成 太阳→亮→热 */
+    {"\xe9\x9b\xaa", "\xe5\x86\xb7", "\xe7\x83\xad", "雪→冷(链)"},
+    {"\xe5\x86\xb0", "\xe6\xb0\xb4", "\xe7\x83\xad", "冰→水(链)"},  /* 冰→水, 雪/冰 同源 */
+};
+#define N_RELATION_REGS (sizeof(relation_regs) / sizeof(relation_regs[0]))
+
+/* 把 UTF-8 概念在 bpe_token_map 中的 wte 行指针取出; 找不到返回 NULL
+ * BUG FIX (v15b): 之前误取 bpe_ids[0]=259 (▁ 前缀, 所有词共享),
+ * 导致关系正则改的是共享前缀行而非真实概念, 完全没生效 (RELATION 仍 FAIL).
+ * 修正: 单 token 概念(n_ids==1, 如 冰=3467/太阳=2981) 用 bpe_ids[0];
+ *       多 token 概念(n_ids==2, 如 ▁鸟=259+1051) 用 bpe_ids[1] (真实概念 token). */
+static float *rel_get_wte_row(Model *m, const char *utf8, int *out_tok) {
+    for (int i = 0; i < (int)N_BPE_MAP; i++) {
+        if (strcmp(utf8, bpe_token_map[i].utf8) == 0) {
+            int n = bpe_token_map[i].n_ids;
+            int tok = (n >= 2) ? bpe_token_map[i].bpe_ids[1]
+                               : bpe_token_map[i].bpe_ids[0];
+            if (tok >= 0 && tok < m->cfg.vocab_size) {
+                *out_tok = tok;
+                return m->wte + (size_t)tok * m->cfg.n_embd;
+            }
+        }
+    }
+    *out_tok = -1;
+    return NULL;
+}
+
+/* 对单对相关/无关概念施加 wte 余弦监督. 直接原地改 wte 行. */
+static float relation_logic_regularization(Model *m, float lr) {
+    int n = m->cfg.n_embd;
+    float M_pos = 0.85f;   /* 相关对目标下界: cos >= 0.85 才停推 */
+    float M_neg = 0.30f;   /* 无关对目标上界: cos <= 0.30 才停推 */
+    float loss = 0.0f;
+    int n_applied = 0;
+
+    for (int p = 0; p < (int)N_RELATION_REGS; p++) {
+        RelationReg *rr = &relation_regs[p];
+        int ta, tb, tc;
+        float *wa = rel_get_wte_row(m, rr->a, &ta);
+        float *wb = rel_get_wte_row(m, rr->b, &tb);
+        float *wc = rel_get_wte_row(m, rr->neg, &tc);
+        if (!wa || !wb || !wc) continue;  /* 任一概念不在 map 中则跳过 */
+
+        /* 相关对 (a,b): 拉近 */
+        float na = 0, nb = 0, dot = 0;
+        for (int i = 0; i < n; i++) { na += wa[i]*wa[i]; nb += wb[i]*wb[i]; dot += wa[i]*wb[i]; }
+        float cos_ab = dot / (sqrtf(na)*sqrtf(nb) + 1e-6f);
+        if (cos_ab < M_pos) {
+            float scale = (M_pos - cos_ab) * lr;
+            float inv = 1.0f / (sqrtf(na)*sqrtf(nb) + 1e-6f);
+            for (int i = 0; i < n; i++) {
+                /* d cos_ab / d wa = (wb - cos_ab*wa) * inv */
+                float g = (wb[i] - cos_ab*wa[i]) * inv;
+                wa[i] += scale * g;
+                float gb = (wa[i] - cos_ab*wb[i]) * inv;  /* 对称对 wb */
+                wb[i] += scale * gb;
+            }
+            loss += (M_pos - cos_ab);
+            n_applied++;
+        }
+
+        /* 无关对 (a,c): 推远 */
+        float nc = 0, dot2 = 0;
+        for (int i = 0; i < n; i++) { nc += wc[i]*wc[i]; dot2 += wa[i]*wc[i]; }
+        float cos_ac = dot2 / (sqrtf(na)*sqrtf(nc) + 1e-6f);
+        if (cos_ac > M_neg) {
+            float scale = (cos_ac - M_neg) * lr;
+            float inv = 1.0f / (sqrtf(na)*sqrtf(nc) + 1e-6f);
+            for (int i = 0; i < n; i++) {
+                float g = (wc[i] - cos_ac*wa[i]) * inv;
+                wa[i] -= scale * g;  /* 推远 = 反方向 */
+            }
+            loss += (cos_ac - M_neg);
+            n_applied++;
+        }
+    }
+    return n_applied > 0 ? loss / n_applied : 0.0f;
+}

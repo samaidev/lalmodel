@@ -1,8 +1,34 @@
-output_trace
-ste_train
-*.o
-*.ste
-data/cognitive_bpe.bin
-data/cog_large_bpe.bin
+# Trained weight binaries (too large for git)
+prebuilt/gpt2_1b_trained.bin
+prebuilt/*_trained.bin
+prebuilt/*_1b*.bin
+
+# Chinese corpus data (downloaded at runtime)
+chinese_corpus.txt
+*.corpus
+
+# Python cache
 __pycache__/
 *.pyc
+
+# Build artifacts
+build/
+*.o
+*.exe
+all_curriculum.bin
+*.o
+web_model_v2
+web_model_v3
+/tmp/*.bin
+ste_train
+web_model_v3_asan
+web_model_v3_debug
+web_model_v3_demo
+web_model_v3_fast
+.gitignore_curriculum_backup
+data/curriculum_backup/
+output_trace
+
+# Dialogue training checkpoints / local models
+*.ste
+model_dialogue*.ste

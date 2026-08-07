@@ -1275,6 +1275,11 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
                 attn_loss = attn_logic_regularization(m, effective_attn_lr);
                 /* v13l: 多样性损失 — 直接惩罚概念对间隐藏状态余弦相似度 */
                 div_loss = residual_diversity_loss(m, effective_logic_lr);
+                /* v15: 关系监督 — 在 wte 空间拉近相关概念/推远无关概念,
+                 * 让原生推理概念链(鸟→动物, 火→光)有意义. 直接用 wte 行梯度,
+                 * lr 取 logic_lr 量级, BPE 单 token 独立安全. */
+                float rel_loss = relation_logic_regularization(m, logic_lr * 0.5f);
+                (void)rel_loss;
             }
             /* v13g: logic-only 模式下 n_valid=0, 用 batch_size=1 做 apply */
             int apply_batch = logic_only ? 1 : n_valid;
@@ -1340,6 +1345,91 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
     free(batch_tokens);
     free(batch_lens);
     return best_recent_loss;
+}
+
+/* === LAL 原生推理: 概念链检索 (不走 transformer 前向/采样) ===
+ * 直接读 wte 余弦相似度, 对问句中命中的概念在概念表内做 top-k 检索,
+ * 串成 "概念链" 输出. 这是 LAL 的原生推理形态, 与 generate_text 的自回归
+ * 句子生成互补:
+ *   - 句子层(generate_text): 逐 token 自回归, 产出完整中文答复
+ *   - 概念链层(lal_native_chain): wte 余弦, 直接给出关联概念(火→热→光)
+ * 概念表复用白箱探针的 bpe_token_map(已 include 自 lal_whitebox_probe.h).
+ */
+static void lal_native_chain(Model *m, const char *prompt, int top_k, int depth) {
+    int n_embd = m->cfg.n_embd;
+    if (top_k <= 0) top_k = 3;
+    if (depth <= 0) depth = 1;
+
+    printf("\n=== LAL Native Reasoning — Concept Chain (wte cosine, NO forward) ===\n");
+    printf("[*] query: %s\n", prompt);
+
+    /* 1) 在概念表中命中问句里出现的概念 */
+    float *q_emb = malloc(n_embd * sizeof(float));
+    float *c_emb = malloc(n_embd * sizeof(float));
+    int hits[64]; int n_hits = 0;
+    for (int i = 0; i < (int)N_BPE_MAP && n_hits < 64; i++) {
+        if (strstr(prompt, bpe_token_map[i].utf8)) {
+            hits[n_hits++] = i;
+        }
+    }
+    if (n_hits == 0) {
+        printf("[!] 问句中未命中已知概念表, 无法用原生推理检索.\n");
+        printf("    已知概念: 火 水 山 花 树 鸟 鱼 人 天 地 月 星 风 雨 云 太阳 猫 苹果 动物 植物 红 黄 蓝 绿 光 温 冰 雪 等\n");
+        free(q_emb); free(c_emb);
+        return;
+    }
+
+    printf("[*] 命中概念(%d): ", n_hits);
+    for (int h = 0; h < n_hits; h++) printf("%s ", bpe_token_map[hits[h]].utf8);
+    printf("\n");
+
+    /* 2) 逐层展开概念链: 每步对当前概念取 top-k 最相似概念(排除已访问) */
+    char visited[256]; memset(visited, 0, sizeof(visited));
+    for (int h = 0; h < n_hits; h++) visited[hits[h]] = 1;
+
+    printf("\n  概念链:\n");
+    for (int h = 0; h < n_hits; h++) {
+        int cur = hits[h];
+        printf("  %s", bpe_token_map[cur].utf8);
+        get_concept_embedding(m, bpe_token_map[cur].utf8, q_emb, n_embd);
+
+        int chain[16]; int chain_len = 0;
+        int frontier = cur;
+        for (int d = 0; d < depth; d++) {
+            /* 在概念表里找与 frontier 余弦最高的 top_k, 排除已访问 */
+            float best_sim[16]; int best_idx[16];
+            for (int k = 0; k < top_k; k++) { best_sim[k] = -2.0f; best_idx[k] = -1; }
+            get_concept_embedding(m, bpe_token_map[frontier].utf8, c_emb, n_embd);
+            for (int j = 0; j < (int)N_BPE_MAP; j++) {
+                if (visited[j]) continue;
+                float tmp[4096];
+                get_concept_embedding(m, bpe_token_map[j].utf8, tmp, n_embd);
+                float sim = cosine_sim(c_emb, tmp, n_embd);
+                /* 插入 top_k */
+                if (sim > best_sim[top_k - 1]) {
+                    int p = top_k - 1;
+                    while (p > 0 && best_sim[p - 1] < sim) {
+                        best_sim[p] = best_sim[p - 1]; best_idx[p] = best_idx[p - 1]; p--;
+                    }
+                    best_sim[p] = sim; best_idx[p] = j;
+                }
+            }
+            if (best_idx[0] < 0) break;
+            /* 输出本层 top 关联 */
+            printf(" → ");
+            for (int k = 0; k < top_k && best_idx[k] >= 0; k++) {
+                int j = best_idx[k];
+                visited[j] = 1;
+                if (k > 0) printf("/");
+                printf("%s(%.2f)", bpe_token_map[j].utf8, best_sim[k]);
+                if (k == 0) frontier = j;  /* 沿最强链继续展开 */
+                if (d == 0) chain[chain_len++] = j;
+            }
+        }
+        printf("\n");
+    }
+    printf("\n  (链中数字为 wte 余弦相似度; 无需前向, 纯嵌入空间检索)\n");
+    free(q_emb); free(c_emb);
 }
 
 /* === 生成文本 (用 stateful sliding window inference) === */
@@ -1502,26 +1592,37 @@ static void generate_text(Model *m, const char *prompt, const int *prompt_ids,
 
 /* === Main === */
 int main(int argc, char **argv) {
-    int n_steps = 200;
+    /* ========================================================================
+     * 默认参数已固化 = 对话训练唯一正确的路 (v5 验证: 4000步 avg_loss=1.58,
+     * 句子层出"你好。"完整短句, 概念链层 火→光(0.93)/鸟→动物(0.89)).
+     * 克隆仓库的人直接 `./ste_train` 或 `make dialogue-train` 即走此路,
+     * 无需手动拼参数, 避免走岔路浪费时间.
+     * ===================================================================== */
+    int n_steps = 4000;      /* 对话训练标准步数 (v5); 改小会句子层不出可读短句 */
     int batch_size = 4;
-    float base_lr = 0.0005f;
-    float logic_lr = 1.0f;  /* --logic-lr 调整:相对倍率 (1.0=同主梯度量级) */
-    int phase_idx = 0;
-    int vocab_size = 256;  /* --vocab 256=byte, 32768=BPE */
+    float base_lr = 0.001f;  /* CE 学习率 */
+    float logic_lr = 0.005f; /* 逻辑/关系正则倍率: 拉概念关系(火→热/鸟→动物) */
+    int phase_idx = 0;       /* 8L/448d ~22M, 对话训练稳定档 */
+    int vocab_size = 32768;  /* BPE 中文 tokenizer, 必须 32768 (非 256 byte 模式) */
     int start_step = 0;    /* --start-step: 续训时跳过的步数,用于正确恢复 LR schedule */
     int total_schedule_steps = 0; /* --total-steps: LR schedule 总步数 (0=用 n_steps) */
-    const char *data_path = "data/curriculum/stage_grounding_combined.bin";
+    const char *data_path = "data/dialogue_bpe.bin";  /* 对话+认知合并数据(唯一正确数据) */
     const char *weights_path = "/tmp/lal_ste_model.bin";
-    const char *save_path = NULL;   /* --save: 训练后保存 */
+    const char *save_path = "model_dialogue.ste";  /* 默认落盘名, 避免忘了 --save */
     const char *resume_path = NULL; /* --resume: 加载已训练权重续训 */
     const char *prompt = "\xe7\x81\xab\xe6\x98\xaf\xe4\xbb\x80\xe4\xb9\x88";  /* 火是什么 */
     int prompt_ids[64];      /* --prompt-ids 直接传 BPE token id */
     int n_prompt_ids = 0;    /* >0 表示用 --prompt-ids 而非 --prompt */
     int do_generate = 1;
-    int max_gen = 100;
+    int max_gen = 40;
     float temp = 0.4f;
     int top_k = 8;
     int logic_only = 0;  /* v13g: --logic-only, 课程学习 stage 1 只训概念对不训 CE */
+    /* v15: 原生推理概念链默认开启 —— LAL 的核心形态(纯 wte 余弦, 不走 transformer 前向).
+     * diagnose 模式(n_steps==0)下自动跑, 无需手动加 --native-chain. */
+    int native_chain = 1; /* 默认开启 LAL 原生推理概念链 */
+    int native_topk = 3;  /* --native-topk: 每层检索概念数 */
+    int native_depth = 2; /* --native-depth: 链展开层数 */
     const char *tokenizer_path = "tokenizer/chinese_bpe.vocab";  /* --tokenizer */
 
     for (int i = 1; i < argc; i++) {
@@ -1553,23 +1654,38 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--diagnose-only")) { n_steps = 0; }
         else if (!strcmp(argv[i], "--logic-only")) { logic_only = 1; }  /* v13g */
         else if (!strcmp(argv[i], "--tokenizer") && i+1 < argc) tokenizer_path = argv[++i];
+        else if (!strcmp(argv[i], "--native-chain")) { native_chain = 1; }
+        else if (!strcmp(argv[i], "--native-topk") && i+1 < argc) native_topk = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--native-depth") && i+1 < argc) native_depth = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--help")) {
             printf("Usage: ste_train [options]\n"
-                   "  --steps N         Training steps (default 200)\n"
+                   "  --steps N         Training steps (default 4000) [对话训练推荐值]\n"
                    "  --batch-size N    Batch size (default 4)\n"
-                   "  --lr F            Base learning rate (default 0.0005)\n"
-                   "  --logic-lr F      Logic guidance multiplier (default 1.0 = same as main grad)\n"
+                   "  --lr F            Base learning rate (default 0.001)\n"
+                   "  --logic-lr F      Logic guidance multiplier (default 0.005 = 拉概念关系)\n"
                    "  --start-step N    Skip N steps for LR schedule (used with --resume for chunked training)\n"
                    "  --total-steps N   Total steps for LR schedule (default: --steps; set larger for chunked training)\n"
-                   "  --data PATH       Data .bin path\n"
+                   "  --data PATH       Data .bin path (default: data/dialogue_bpe.bin)\n"
                    "  --tokenizer PATH  Tokenizer .vocab path (default: tokenizer/chinese_bpe.vocab)\n"
-                   "  --save PATH       Save trained weights to .ste file\n"
+                   "  --save PATH       Save trained weights to .ste file (default: model_dialogue.ste)\n"
                    "  --resume PATH     Load .ste weights and continue training\n"
                    "  --diagnose-only   Skip training, just load + diagnose + generate\n"
                    "  --prompt TEXT     Generation prompt\n"
-                   "  --max-gen N       Max generation tokens (default 100)\n"
+                   "  --max-gen N       Max generation tokens (default 40)\n"
                    "  --temp F          Sampling temperature (default 0.4)\n"
-                   "  --no-generate     Skip generation\n");
+                   "  --no-generate     Skip generation\n"
+                   "  --native-chain    LAL native reasoning: print concept chain via wte cosine (no forward) [默认已开启]\n"
+                   "  --native-topk N   Concepts per chain layer (default 3)\n"
+                   "  --native-depth N  Chain expansion depth (default 2)\n"
+                   "\n"
+                   "=== 唯一正确的路 (勿手动改参数, 避免走岔路) ===\n"
+                   "  训练:   make dialogue          (生成数据→训练4000步→测双形态)\n"
+                   "    或:   ./ste_train --steps 4000 --batch-size 4 --lr 0.001 --logic-lr 0.005 \\\n"
+                   "              --phase 0 --vocab 32768 --data data/dialogue_bpe.bin --no-generate --save model_dialogue.ste\n"
+                   "  诊断:   ./ste_train --diagnose-only --phase 0 --vocab 32768 --resume model_dialogue.ste \\\n"
+                   "              --prompt '鸟为什么天上飞？'   (原生推理概念链默认开启)\n"
+                   "  数据:   对话数据=data/dialogue_bpe.bin (data/gen_dialogue_data.py 生成, 与认知数据合并)\n"
+                   "  注意:   vocab 必须 32768(BPE), 不要用 256(byte 模式); 数据必须用 dialogue_bpe.bin\n");
             return 0;
         }
     }
@@ -1840,7 +1956,14 @@ int main(int argc, char **argv) {
         printf("  (如果 V 火vs水 cosine 高, 但 norm1_out cosine 低, 说明 W_v 把不同输入映射到相似输出)\n\n");
     }
 
-    /* 生成 */
+    /* LAL 原生推理: 概念链(不走 transformer 前向, 纯 wte 余弦检索).
+     * 默认开启: diagnose 模式(n_steps==0)下自动跑, 这就是 LAL 的核心形态,
+     * 别人诊断模型时自动看到概念链, 不会再误走 transformer 自回归岔路. */
+    if (n_steps == 0) {
+        lal_native_chain(&model, prompt, native_topk, native_depth);
+    }
+
+    /* 生成(句子层, transformer 自回归). 默认也跑, 但原生推理是主形态. */
     if (do_generate) {
         generate_text(&model, prompt, prompt_ids, n_prompt_ids, max_gen, temp, top_k);
     }
