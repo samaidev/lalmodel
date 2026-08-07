@@ -6,16 +6,22 @@
 #     bash train_dialogue.sh            # 训练 (默认 4000 步)
 #     bash train_dialogue.sh test       # 用默认模型测双形态(句子层+概念链层)
 #     bash train_dialogue.sh train 2000 # 自定义步数训练
+#     bash train_dialogue.sh resume model_dialogue_v5.ste 2000 4000 6000 0.0005 0.003
+#                                         # 从 v5 续训 2000 步 (start=4000 total=6000)
 # 不要手动拼 ./ste_train 参数 —— 除非你明确知道在做什么.
+#
+# 固化参数 (v5 → v6 验证, 别改):
+#   batch-size=4  lr=0.001 (新训) / 0.0005 (续训)  logic-lr=0.005 / 0.003
+#   phase=0 (Seed 8L/448d)  vocab=32768  data=data/dialogue_bpe.bin  native_chain=ON
 set -euo pipefail
 cd "$(dirname "$0")"
 
-STEPS="${2:-4000}"
+MODE="${1:-train}"
 MODEL="model_dialogue.ste"
 
 echo "=================================================="
 echo " LAL 长句对话训练 — 唯一正确的路"
-echo " 步数=$STEPS  模型=$MODEL  数据=data/dialogue_bpe.bin"
+echo " 模式=$MODE  模型=$MODEL  数据=data/dialogue_bpe.bin"
 echo "=================================================="
 
 # ---- 阶段1: 确保数据存在 (对话+认知合并) ----
@@ -50,16 +56,41 @@ if [ ! -x ste_train ] || [ models/ste_train.c -nt ste_train ]; then
 fi
 
 # ---- 阶段3: 训练 (参数固化, 勿改) ----
-if [ "${1:-train}" = "train" ] || [ $# -eq 0 ]; then
-    echo "[*] 训练 $STEPS 步 (lr=0.001 logic-lr=0.005 phase=0 vocab=32768)..."
-    ./ste_train --steps "$STEPS" --batch-size 4 --lr 0.001 --logic-lr 0.005 \
-        --phase 0 --vocab 32768 --data data/dialogue_bpe.bin \
-        --no-generate --save "$MODEL"
-    echo "[*] 训练完成 -> $MODEL"
-fi
+case "$MODE" in
+    train)
+        STEPS="${2:-4000}"
+        echo "[*] 训练 $STEPS 步 (lr=0.001 logic-lr=0.005 phase=0 vocab=32768)..."
+        ./ste_train --steps "$STEPS" --batch-size 4 --lr 0.001 --logic-lr 0.005 \
+            --phase 0 --vocab 32768 --data data/dialogue_bpe.bin \
+            --no-generate --save "$MODEL"
+        echo "[*] 训练完成 -> $MODEL"
+        ;;
+    resume)
+        # 用法: bash train_dialogue.sh resume <resume.ste> [steps] [start-step] [total-steps] [lr] [logic-lr]
+        RESUME="${2:?usage: bash train_dialogue.sh resume <model.ste> [steps] [start] [total] [lr] [logic-lr]}"
+        STEPS="${3:-2000}"
+        START="${4:-4000}"
+        TOTAL="${5:-6000}"
+        LR="${6:-0.0005}"
+        LLR="${7:-0.003}"
+        echo "[*] 续训 $RESUME → $MODEL  steps=$STEPS  start=$START  total=$TOTAL  lr=$LR  logic-lr=$LLR"
+        ./ste_train --resume "$RESUME" --steps "$STEPS" --start-step "$START" \
+            --total-steps "$TOTAL" --batch-size 4 --lr "$LR" --logic-lr "$LLR" \
+            --phase 0 --vocab 32768 --data data/dialogue_bpe.bin \
+            --no-generate --save "$MODEL"
+        echo "[*] 续训完成 -> $MODEL"
+        ;;
+    test)
+        : # 在阶段4统一执行
+        ;;
+    *)
+        echo "未知模式: $MODE  (合法: train | resume | test)" >&2
+        exit 2
+        ;;
+esac
 
 # ---- 阶段4: 测试双形态 (句子层 + 概念链层原生推理) ----
-if [ "${1:-train}" = "test" ] || [ "${1:-train}" = "train" ]; then
+if [ "$MODE" = "test" ] || [ "$MODE" = "train" ]; then
     echo ""
     echo "########## 句子层 (transformer 自回归) ##########"
     for q in "你好" "鸟为什么天上飞？" "什么是火？"; do
