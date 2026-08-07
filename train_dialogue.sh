@@ -89,7 +89,7 @@ case "$MODE" in
         ;;
 esac
 
-# ---- 阶段4: 测试双形态 (句子层 + 概念链层原生推理) ----
+# ---- 阶段4: 测试三形态 (句子层 + 概念链层 + 关系推理层) ----
 if [ "$MODE" = "test" ] || [ "$MODE" = "train" ]; then
     echo ""
     echo "########## 句子层 (transformer 自回归) ##########"
@@ -103,8 +103,17 @@ if [ "$MODE" = "test" ] || [ "$MODE" = "train" ]; then
     for q in "鸟为什么天上飞？" "什么是火？" "天为什么是蓝色的？"; do
         echo "--- Q: $q ---"
         ./ste_train --diagnose-only --phase 0 --vocab 32768 --resume "$MODEL" \
-            --prompt "$q" --native-topk 3 --native-depth 2 --no-generate 2>&1 \
+            --prompt "$q" --native-topk 3 --native-depth 2 --no-reason --no-generate 2>&1 \
             | sed -n '/=== LAL Native/,/嵌入空间检索/p' | head -16
+    done
+    echo ""
+    echo "########## 关系推理层 (概念边界 + 相互关系 + 推演) ##########"
+    echo "## 智慧 = 掌握概念边界和相互关系进行推理的能力"
+    for q in "鸟为什么天上飞？" "什么是火？" "太阳怎么发光？"; do
+        echo "--- Q: $q ---"
+        ./ste_train --diagnose-only --phase 0 --vocab 32768 --resume "$MODEL" \
+            --prompt "$q" --reason --reason-depth 3 --no-generate 2>&1 \
+            | sed -n '/=== LAL Relationship/,/验证方式/p' | head -50
     done
 fi
 echo ""

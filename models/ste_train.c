@@ -1432,6 +1432,259 @@ static void lal_native_chain(Model *m, const char *prompt, int top_k, int depth)
     free(q_emb); free(c_emb);
 }
 
+/* === LAL 关系推理引擎 (Relationship Reasoning Engine) ===
+ *
+ * 智慧 = 掌握概念边界 + 相互关系 + 推演能力
+ *
+ * 与 lal_native_chain (纯 wte 余弦) 的区别:
+ *   1. 关系类型化: 因果/并行/主被动/串行/类别/属性/对立/联想
+ *   2. 问句类型感知: 为什么→因果, 什么是→类别, 怎么→串行
+ *   3. CORE/BINARY/PRUNE 激活验证: 用神经元激活模式验证关系强度
+ *   4. 动态关系发现: 对未知概念对, 用 wte+CORE 双信号分类关系类型
+ *   5. 多跳推理链: 根据问句类型选择关系边类型, 组成推理链
+ */
+static void lal_relationship_reason(Model *m, const char *prompt, int max_depth) {
+    int n_embd = m->cfg.n_embd;
+    if (max_depth <= 0) max_depth = 3;
+
+    printf("\n=== LAL Relationship Reasoning Engine ===\n");
+    printf("\xe6\x99\xba\xe6\x85\xa7 = \xe6\xa6\x82\xe5\xbf\xb5\xe8\xbe\xb9\xe7\x95\x8c + \xe7\x9b\xb8\xe4\xba\x92\xe5\x85\xb3\xe7\xb3\xbb + \xe6\x8e\xa8\xe6\xbc\x94\n");
+    /* 智慧 = 概念边界 + 相互关系 + 推演 */
+    printf("[*] Query: %s\n", prompt);
+
+    /* 1. 检测问句类型 */
+    QType qt = detect_qtype(prompt);
+    printf("[*] Question type: %s\n", qtype_name[qt]);
+
+    /* 2. 从问句中提取已知概念 */
+    int hits[64]; int n_hits = 0;
+    for (int i = 0; i < (int)N_BPE_MAP && n_hits < 64; i++) {
+        if (strstr(prompt, bpe_token_map[i].utf8)) {
+            hits[n_hits++] = i;
+        }
+    }
+    if (n_hits == 0) {
+        printf("[!] \xe6\x9c\xaa\xe5\x9c\xa8\xe9\x97\xae\xe5\x8f\xa5\xe4\xb8\xad\xe5\x91\xbd\xe4\xb8\xad\xe5\xb7\xb2\xe7\x9f\xa5\xe6\xa6\x82\xe5\xbf\xb5\xe8\xa1\xa8.\n");
+        /* 未在问句中命中已知概念表 */
+        printf("    Known concepts: \xe7\x81\xab \xe6\xb0\xb4 \xe5\xb1\xb1 \xe8\x8a\xb1 \xe6\xa0\x91 \xe9\xb8\x9f \xe9\xb1\xbc \xe4\xba\xba \xe5\xa4\xa9 \xe5\x9c\xb0 \xe6\x9c\x88 \xe6\x98\x9f \xe9\xa3\x8e \xe9\x9b\xa8 \xe4\xba\x91 \xe5\xa4\xaa\xe9\x98\xb3 \xe7\x8c\xab \xe5\x8a\xa8\xe7\x89\xa9 \xe6\xa4\x8d\xe7\x89\xa9\n");
+        return;
+    }
+
+    printf("[*] Concepts found (%d): ", n_hits);
+    for (int h = 0; h < n_hits; h++)
+        printf("%s ", bpe_token_map[hits[h]].utf8);
+    printf("\n");
+
+    /* 3. 概念边界分析: 命中概念之间的 wte 余弦 + CORE 激活差异 */
+    printf("\n--- \xe6\xa6\x82\xe5\xbf\xb5\xe8\xbe\xb9\xe7\x95\x8c\xe5\x88\x86\xe6\x9e\x90 (Concept Boundaries) ---\n");
+    float emb_a[4096], emb_b[4096];
+    for (int i = 0; i < n_hits; i++) {
+        for (int j = i + 1; j < n_hits; j++) {
+            get_concept_embedding(m, bpe_token_map[hits[i]].utf8, emb_a, n_embd);
+            get_concept_embedding(m, bpe_token_map[hits[j]].utf8, emb_b, n_embd);
+            float wte_cos = cosine_sim(emb_a, emb_b, n_embd);
+            float core_diff = 0;
+            float core_ov = core_activation_overlap(m, bpe_token_map[hits[i]].utf8,
+                                                     bpe_token_map[hits[j]].utf8, &core_diff);
+            printf("  %s vs %s: wte=%.3f CORE_ov=%.3f CORE_diff=%.4f -> %s\n",
+                   bpe_token_map[hits[i]].utf8, bpe_token_map[hits[j]].utf8,
+                   wte_cos, core_ov, core_diff,
+                   wte_cos < 0.3f ? "BOUNDARY CLEAR" :
+                   wte_cos < 0.6f ? "related" : "similar");
+        }
+    }
+
+    /* 4. 已知关系边: 从 concept_edges 表中查找命中的关系 */
+    printf("\n--- \xe5\xb7\xb2\xe7\x9f\xa5\xe5\x85\xb3\xe7\xb3\xbb (Explicit Edges) ---\n");
+    int edge_found = 0;
+    for (int e = 0; e < (int)N_CONCEPT_EDGES; e++) {
+        ConceptEdge *edge = &concept_edges[e];
+        int a_hit = 0, b_hit = 0;
+        for (int h = 0; h < n_hits; h++) {
+            if (strcmp(edge->a, bpe_token_map[hits[h]].utf8) == 0) a_hit = 1;
+            if (strcmp(edge->b, bpe_token_map[hits[h]].utf8) == 0) b_hit = 1;
+        }
+        if (!a_hit && !b_hit) continue;
+
+        float core_diff = 0;
+        float core_ov = core_activation_overlap(m, edge->a, edge->b, &core_diff);
+        get_concept_embedding(m, edge->a, emb_a, n_embd);
+        get_concept_embedding(m, edge->b, emb_b, n_embd);
+        float wte_cos = cosine_sim(emb_a, emb_b, n_embd);
+
+        printf("  %s %s %s  [wte=%.2f CORE_ov=%.2f diff=%.4f] %s\n",
+               edge->a, rel_symbol[edge->type], edge->b,
+               wte_cos, core_ov, core_diff,
+               (core_ov > 0.4f) ? "validated" : "weak");
+        edge_found = 1;
+    }
+    if (!edge_found) {
+        printf("  (no explicit edges matched)\n");
+    }
+
+    /* 5. 动态关系发现: 对每个命中概念, 用 wte+CORE 双信号发现关系 */
+    printf("\n--- \xe5\x8a\xa8\xe6\x80\x81\xe5\x85\xb3\xe7\xb3\xbb\xe5\x8f\x91\xe7\x8e\xb0 (Dynamic Discovery) ---\n");
+    for (int h = 0; h < n_hits; h++) {
+        const char *cur = bpe_token_map[hits[h]].utf8;
+        get_concept_embedding(m, cur, emb_a, n_embd);
+
+        float best_sim[8]; int best_idx[8];
+        for (int k = 0; k < 8; k++) { best_sim[k] = -2.0f; best_idx[k] = -1; }
+        for (int j = 0; j < (int)N_BPE_MAP; j++) {
+            if (j == hits[h]) continue;
+            get_concept_embedding(m, bpe_token_map[j].utf8, emb_b, n_embd);
+            float sim = cosine_sim(emb_a, emb_b, n_embd);
+            if (sim > best_sim[7]) {
+                int p = 7;
+                while (p > 0 && best_sim[p - 1] < sim) {
+                    best_sim[p] = best_sim[p - 1]; best_idx[p] = best_idx[p - 1]; p--;
+                }
+                best_sim[p] = sim; best_idx[p] = j;
+            }
+        }
+
+        printf("  %s:\n", cur);
+        for (int k = 0; k < 5 && best_idx[k] >= 0; k++) {
+            int j = best_idx[k];
+            float core_diff = 0;
+            float core_ov = core_activation_overlap(m, cur, bpe_token_map[j].utf8, &core_diff);
+            RelType rt = classify_relationship(best_sim[k], core_ov, core_diff);
+            printf("    %s %s %s  [wte=%.2f CORE_ov=%.2f diff=%.4f]\n",
+                   cur, rel_symbol[rt], bpe_token_map[j].utf8,
+                   best_sim[k], core_ov, core_diff);
+        }
+    }
+
+    /* 6. 推理链: 根据问句类型选择关系边类型, 组成多跳推理 */
+    printf("\n--- \xe6\x8e\xa8\xe7\x90\x86\xe9\x93\xbe (Reasoning Chain) ---\n");
+    switch (qt) {
+        case Q_WHY:
+            printf("[\xe7\xad\x96\xe7\x95\xa5] \xe5\x9b\xa0\xe6\x9e\x9c\xe6\x8e\xa8\xe7\x90\x86: \xe6\xb2\xbf\xe5\x9b\xa0\xe6\x9e\x9c\xe8\xbe\xb9(=>) \xe5\x92\x8c\xe4\xb8\xb2\xe8\xa1\x8c\xe8\xbe\xb9(>>) \xe8\xbf\xbd\xe6\xba\xaf\xe5\x8e\x9f\xe5\x9b\xa0\n");
+            /* 策略: 因果推理: 沿因果边和串行边追溯原因 */
+            break;
+        case Q_WHAT:
+            printf("[\xe7\xad\x96\xe7\x95\xa5] \xe5\xae\x9a\xe4\xb9\x89\xe6\x8e\xa8\xe7\x90\x86: \xe6\xb2\xbf\xe7\xb1\xbb\xe5\x88\xab\xe8\xbe\xb9(in) \xe5\x92\x8c\xe5\xb1\x9e\xe6\x80\xa7\xe8\xbe\xb9(.) \xe5\xb1\x95\xe5\xbc\x80\xe5\xae\x9a\xe4\xb9\x89\n");
+            /* 策略: 定义推理: 沿类别边和属性边展开定义 */
+            break;
+        case Q_HOW:
+            printf("[\xe7\xad\x96\xe7\x95\xa5] \xe8\xbf\x87\xe7\xa8\x8b\xe6\x8e\xa8\xe7\x90\x86: \xe6\xb2\xbf\xe4\xb8\xb2\xe8\xa1\x8c\xe8\xbe\xb9(>>) \xe5\xb1\x95\xe5\xbc\x80\xe6\xad\xa5\xe9\xaa\xa4\xe5\xba\x8f\xe5\x88\x97\n");
+            /* 策略: 过程推理: 沿串行边展开步骤序列 */
+            break;
+        default:
+            printf("[\xe7\xad\x96\xe7\x95\xa5] \xe8\x81\x94\xe6\x83\xb3\xe6\x8e\xa8\xe7\x90\x86: \xe6\xb2\xbf\xe8\x81\x94\xe6\x83\xb3\xe8\xbe\xb9(~) \xe5\x92\x8c\xe5\xb9\xb6\xe8\xa1\x8c\xe8\xbe\xb9(||) \xe5\xb1\x95\xe5\xbc\x80\xe5\x85\xb3\xe8\x81\x94\n");
+            /* 策略: 联想推理: 沿联想边和并行边展开关联 */
+            break;
+    }
+
+    /* 遍历命中概念, 沿关系图推理 */
+    for (int h = 0; h < n_hits; h++) {
+        const char *cur = bpe_token_map[hits[h]].utf8;
+        printf("\n  %s", cur);
+
+        char visited_names[64][16];
+        int n_visited = 0;
+        strncpy(visited_names[n_visited], cur, 15);
+        visited_names[n_visited][15] = '\0';
+        n_visited++;
+
+        for (int d = 0; d < max_depth; d++) {
+            /* 在 concept_edges 中查找从当前概念出发的边, 优先选择匹配问句类型的边 */
+            float best_score = -1.0f;
+            int best_e = -1;
+            for (int e = 0; e < (int)N_CONCEPT_EDGES; e++) {
+                ConceptEdge *edge = &concept_edges[e];
+                if (strcmp(edge->a, cur) != 0) continue;
+
+                /* 检查目标是否已访问 */
+                int already = 0;
+                for (int v = 0; v < n_visited; v++) {
+                    if (strcmp(edge->b, visited_names[v]) == 0) { already = 1; break; }
+                }
+                if (already) continue;
+
+                /* 检查边类型是否匹配问句类型 */
+                int type_match = 0;
+                switch (qt) {
+                    case Q_WHY:
+                        type_match = (edge->type == REL_CAUSAL || edge->type == REL_SERIAL ||
+                                      edge->type == REL_ACTIVE);
+                        break;
+                    case Q_WHAT:
+                        type_match = (edge->type == REL_CATEGORY || edge->type == REL_ATTRIBUTE);
+                        break;
+                    case Q_HOW:
+                        type_match = (edge->type == REL_SERIAL || edge->type == REL_ACTIVE);
+                        break;
+                    default:
+                        type_match = (edge->type == REL_ASSOC || edge->type == REL_PARALLEL);
+                        break;
+                }
+
+                float core_diff = 0;
+                float core_ov = core_activation_overlap(m, edge->a, edge->b, &core_diff);
+                /* 评分: 匹配类型加权 + CORE overlap */
+                float score = core_ov + (type_match ? 0.3f : 0.0f);
+                if (score > best_score) {
+                    best_score = score;
+                    best_e = e;
+                }
+            }
+
+            if (best_e < 0) {
+                /* 无类型边, 尝试动态发现 */
+                get_concept_embedding(m, cur, emb_a, n_embd);
+                float best_sim = -1; int best_j = -1;
+                for (int j = 0; j < (int)N_BPE_MAP; j++) {
+                    int already = 0;
+                    for (int v = 0; v < n_visited; v++) {
+                        if (strcmp(bpe_token_map[j].utf8, visited_names[v]) == 0) { already = 1; break; }
+                    }
+                    if (already) continue;
+                    get_concept_embedding(m, bpe_token_map[j].utf8, emb_b, n_embd);
+                    float sim = cosine_sim(emb_a, emb_b, n_embd);
+                    if (sim > best_sim) { best_sim = sim; best_j = j; }
+                }
+                if (best_j >= 0 && best_sim > 0.05f) {
+                    float core_diff = 0;
+                    float core_ov = core_activation_overlap(m, cur, bpe_token_map[best_j].utf8, &core_diff);
+                    RelType rt = classify_relationship(best_sim, core_ov, core_diff);
+                    printf(" %s %s(ov=%.2f)", rel_symbol[rt], bpe_token_map[best_j].utf8, core_ov);
+                    strncpy(visited_names[n_visited], bpe_token_map[best_j].utf8, 15);
+                    visited_names[n_visited][15] = '\0';
+                    n_visited++;
+                    if (n_visited >= 64) break;
+                    cur = visited_names[n_visited - 1];
+                } else {
+                    break;
+                }
+            } else {
+                ConceptEdge *edge = &concept_edges[best_e];
+                float core_diff = 0;
+                float core_ov = core_activation_overlap(m, edge->a, edge->b, &core_diff);
+                printf(" %s %s(ov=%.2f)", rel_symbol[edge->type], edge->b, core_ov);
+                strncpy(visited_names[n_visited], edge->b, 15);
+                visited_names[n_visited][15] = '\0';
+                n_visited++;
+                if (n_visited >= 64) break;
+                cur = visited_names[n_visited - 1];
+            }
+        }
+        printf("\n");
+    }
+
+    /* 7. 推理总结 */
+    printf("\n--- \xe6\x8e\xa8\xe7\x90\x86\xe6\x80\xbb\xe7\xbb\x93 ---\n");
+    /* 推理总结 */
+    printf("\xe9\x97\xae\xe5\x8f\xa5\xe7\xb1\xbb\xe5\x9e\x8b: %s\n", qtype_name[qt]);
+    /* 问句类型 */
+    printf("\xe5\x91\xbd\xe4\xb8\xad\xe6\xa6\x82\xe5\xbf\xb5: %d \xe4\xb8\xaa\n", n_hits);
+    /* 命中概念: N 个 */
+    printf("\xe5\x85\xb3\xe7\xb3\xbb\xe7\xb1\xbb\xe5\x9e\x8b: \xe5\x9b\xa0\xe6\x9e\x9c(=>) \xe5\xb9\xb6\xe8\xa1\x8c(||) \xe4\xb8\xbb\xe8\xa2\xab\xe5\x8a\xa8(->) \xe4\xb8\xb2\xe8\xa1\x8c(>>) \xe7\xb1\xbb\xe5\x88\xab(in) \xe5\xb1\x9e\xe6\x80\xa7(.) \xe5\xaf\xb9\xe7\xab\x8b(<>) \xe8\x81\x94\xe6\x83\xb3(~)\n");
+    /* 关系类型: 因果(=>) 并行(||) 主被动(->) 串行(>>) 类别(in) 属性(.) 对立(<>) 联想(~) */
+    printf("\xe9\xaa\x8c\xe8\xaf\x81\xe6\x96\xb9\xe5\xbc\x8f: wte\xe4\xbd\x99\xe5\xbc\xa6(\xe8\xaf\xad\xe4\xb9\x89\xe7\x9b\xb8\xe4\xbc\xbc\xe5\xba\xa6) + CORE\xe6\xbf\x80\xe6\xb4\xbb(\xe9\x80\xbb\xe8\xbe\x91\xe7\xbb\x93\xe6\x9e\x84)\n");
+    /* 验证方式: wte余弦(语义相似度) + CORE激活(逻辑结构) */
+}
+
 /* === 生成文本 (用 stateful sliding window inference) === */
 static void generate_text(Model *m, const char *prompt, const int *prompt_ids,
                           int n_prompt_ids, int max_gen, float temp, int top_k) {
@@ -1623,6 +1876,8 @@ int main(int argc, char **argv) {
     int native_chain = 1; /* 默认开启 LAL 原生推理概念链 */
     int native_topk = 3;  /* --native-topk: 每层检索概念数 */
     int native_depth = 2; /* --native-depth: 链展开层数 */
+    int reason_engine = 1; /* 默认开启关系推理引擎 */
+    int reason_depth = 3;  /* --reason-depth: 推理链深度 */
     const char *tokenizer_path = "tokenizer/chinese_bpe.vocab";  /* --tokenizer */
 
     for (int i = 1; i < argc; i++) {
@@ -1657,6 +1912,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--native-chain")) { native_chain = 1; }
         else if (!strcmp(argv[i], "--native-topk") && i+1 < argc) native_topk = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--native-depth") && i+1 < argc) native_depth = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--reason")) { reason_engine = 1; }
+        else if (!strcmp(argv[i], "--no-reason")) { reason_engine = 0; }
+        else if (!strcmp(argv[i], "--reason-depth") && i+1 < argc) reason_depth = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--help")) {
             printf("Usage: ste_train [options]\n"
                    "  --steps N         Training steps (default 4000) [对话训练推荐值]\n"
@@ -1677,6 +1935,9 @@ int main(int argc, char **argv) {
                    "  --native-chain    LAL native reasoning: print concept chain via wte cosine (no forward) [默认已开启]\n"
                    "  --native-topk N   Concepts per chain layer (default 3)\n"
                    "  --native-depth N  Chain expansion depth (default 2)\n"
+                   "  --reason          LAL relationship reasoning engine: typed concept edges + CORE validation [默认已开启]\n"
+                   "  --no-reason       Disable relationship reasoning engine\n"
+                   "  --reason-depth N  Reasoning chain depth (default 3)\n"
                    "\n"
                    "=== 唯一正确的路 (勿手动改参数, 避免走岔路) ===\n"
                    "  训练:   make dialogue          (生成数据→训练4000步→测双形态)\n"
@@ -1961,6 +2222,14 @@ int main(int argc, char **argv) {
      * 别人诊断模型时自动看到概念链, 不会再误走 transformer 自回归岔路. */
     if (n_steps == 0) {
         lal_native_chain(&model, prompt, native_topk, native_depth);
+    }
+
+    /* LAL 关系推理引擎: 概念边界 + 相互关系 + 推演.
+     * 智慧 = 掌握概念边界和相互关系进行推理的能力.
+     * 用因果/并行/主被动/串行等关系类型, 结合 CORE 激活验证, 组成推理链.
+     * 默认开启: diagnose 模式下自动跑, 与概念链互补. */
+    if (n_steps == 0 && reason_engine) {
+        lal_relationship_reason(&model, prompt, reason_depth);
     }
 
     /* 生成(句子层, transformer 自回归). 默认也跑, 但原生推理是主形态. */

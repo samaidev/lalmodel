@@ -1353,3 +1353,228 @@ static float relation_logic_regularization(Model *m, float lr) {
     }
     return n_applied > 0 ? loss / n_applied : 0.0f;
 }
+
+/* ========================================================================
+ * LAL 关系推理引擎 (Relationship Reasoning Engine)
+ *
+ * 智慧 = 掌握概念边界 + 相互关系 + 推演能力
+ *
+ * This engine goes beyond lal_native_chain (pure wte cosine) by:
+ * 1. Classifying concept relationships into typed edges
+ * 2. Detecting question type to select the right reasoning strategy
+ * 3. Validating relationships via CORE/BINARY/PRUNE neuron activation
+ * 4. Composing multi-hop reasoning chains with typed annotations
+ *
+ * Relationship Types (matching user's framework):
+ *   REL_CAUSAL    因果: A causes B (火⇒热, 太阳⇒光)
+ *   REL_PARALLEL  并行: A co-occurs with B, no causality (热∥光)
+ *   REL_ACTIVE    主被动: A is agent of B (鸟→天)
+ *   REL_SERIAL    串行: A→B→C chain (水→雨→冷)
+ *   REL_CATEGORY  类别: A is-a B (鸟∈动物)
+ *   REL_ATTRIBUTE 属性: A has property B (火·热)
+ *   REL_ANTONYM   对立: A opposite B (热⇄冷)
+ *   REL_ASSOC     联想: A associated with B (鸟~云)
+ * ======================================================================== */
+
+typedef enum {
+    REL_CAUSAL = 0,
+    REL_PARALLEL,
+    REL_ACTIVE,
+    REL_SERIAL,
+    REL_CATEGORY,
+    REL_ATTRIBUTE,
+    REL_ANTONYM,
+    REL_ASSOC,
+} RelType;
+
+static const char *rel_name_cn[] = {
+    "\xe5\x9b\xa0\xe6\x9e\x9c",  /* 因果 */
+    "\xe5\xb9\xb6\xe8\xa1\x8c",  /* 并行 */
+    "\xe4\xb8\xbb\xe8\xa2\xab\xe5\x8a\xa8",  /* 主被动 */
+    "\xe4\xb8\xb2\xe8\xa1\x8c",  /* 串行 */
+    "\xe7\xb1\xbb\xe5\x88\xab",  /* 类别 */
+    "\xe5\xb1\x9e\xe6\x80\xa7",  /* 属性 */
+    "\xe5\xaf\xb9\xe7\xab\x8b",  /* 对立 */
+    "\xe8\x81\x94\xe6\x83\xb3",  /* 联想 */
+};
+static const char *rel_symbol[] = {
+    "=>", "||", "->", ">>", "in", ".", "<>", "~"
+};
+
+typedef struct {
+    const char *a;
+    const char *b;
+    RelType type;
+} ConceptEdge;
+
+/* Typed relationship graph: edges built from known concept relationships.
+ * UTF-8 bytes match bpe_token_map entries for direct lookup. */
+static ConceptEdge concept_edges[] = {
+    /* 类别: is-a */
+    {"\xe9\xb8\x9f", "\xe5\x8a\xa8\xe7\x89\xa9", REL_CATEGORY},  /* 鸟 in 动物 */
+    {"\xe7\x8c\xab", "\xe5\x8a\xa8\xe7\x89\xa9", REL_CATEGORY},  /* 猫 in 动物 */
+    {"\xe9\xb1\xbc", "\xe5\x8a\xa8\xe7\x89\xa9", REL_CATEGORY},  /* 鱼 in 动物 */
+    {"\xe8\x8a\xb1", "\xe6\xa4\x8d\xe7\x89\xa9", REL_CATEGORY},  /* 花 in 植物 */
+    {"\xe6\xa0\x91", "\xe6\xa4\x8d\xe7\x89\xa9", REL_CATEGORY},  /* 树 in 植物 */
+    /* 属性: has-property */
+    {"\xe7\x81\xab", "\xe7\x83\xad", REL_ATTRIBUTE},  /* 火.热 */
+    {"\xe7\x81\xab", "\xe5\x85\x89", REL_ATTRIBUTE},  /* 火.光 */
+    {"\xe6\xb0\xb4", "\xe5\x86\xb7", REL_ATTRIBUTE},  /* 水.冷 */
+    {"\xe6\xb0\xb4", "\xe8\x93\x9d", REL_ATTRIBUTE},  /* 水.蓝 */
+    {"\xe5\xa4\xaa\xe9\x98\xb3", "\xe4\xba\xae", REL_ATTRIBUTE}, /* 太阳.亮 */
+    {"\xe5\x86\xb0", "\xe5\x86\xb7", REL_ATTRIBUTE},  /* 冰.冷 */
+    {"\xe9\x9b\xaa", "\xe5\x86\xb7", REL_ATTRIBUTE},  /* 雪.冷 */
+    /* 因果: causes */
+    {"\xe5\xa4\xaa\xe9\x98\xb3", "\xe7\x83\xad", REL_CAUSAL},   /* 太阳=>热 */
+    {"\xe5\xa4\xaa\xe9\x98\xb3", "\xe5\x85\x89", REL_CAUSAL},   /* 太阳=>光 */
+    {"\xe7\x81\xab", "\xe5\x85\x89", REL_CAUSAL},   /* 火=>光 */
+    /* 主被动: agent-action */
+    {"\xe9\xb8\x9f", "\xe5\xa4\xa9", REL_ACTIVE},  /* 鸟->天 (鸟 actively inhabits 天) */
+    {"\xe9\xa3\x8e", "\xe4\xba\x91", REL_ACTIVE},  /* 风->云 (风 actively moves 云) */
+    {"\xe9\xa3\x8e", "\xe9\x9b\xa8", REL_ACTIVE},  /* 风->雨 */
+    /* 串行: chain */
+    {"\xe5\x85\x89", "\xe7\x83\xad", REL_SERIAL},    /* 光>>热 */
+    {"\xe6\xb0\xb4", "\xe9\x9b\xa8", REL_SERIAL},    /* 水>>雨 */
+    {"\xe9\x9b\xa8", "\xe5\x86\xb7", REL_SERIAL},    /* 雨>>冷 */
+    {"\xe5\x86\xb0", "\xe6\xb0\xb4", REL_SERIAL},    /* 冰>>水 */
+    {"\xe4\xba\xae", "\xe7\x83\xad", REL_SERIAL},    /* 亮>>热 */
+    {"\xe9\x9b\xaa", "\xe6\xb0\xb4", REL_SERIAL},    /* 雪>>水 */
+    /* 并行: co-occur */
+    {"\xe7\x83\xad", "\xe5\x85\x89", REL_PARALLEL},  /* 热||光 */
+    {"\xe5\x86\xb7", "\xe8\x93\x9d", REL_PARALLEL},  /* 冷||蓝 */
+    /* 对立: opposite (from probe_pairs) */
+    {"\xe7\x83\xad", "\xe5\x86\xb7", REL_ANTONYM},  /* 热<>冷 */
+    {"\xe5\xa4\xa7", "\xe5\xb0\x8f", REL_ANTONYM},  /* 大<>小 */
+    {"\xe4\xb8\x8a", "\xe4\xb8\x8b", REL_ANTONYM},  /* 上<>下 */
+    {"\xe4\xba\xae", "\xe6\x9a\x97", REL_ANTONYM},  /* 亮<>暗 */
+    {"\xe9\x87\x8d", "\xe8\xbd\xbb", REL_ANTONYM},  /* 重<>轻 */
+    {"\xe5\xbf\xab", "\xe6\x85\xa2", REL_ANTONYM},  /* 快<>慢 */
+    {"\xe6\xb9\xbf", "\xe5\xb9\xb2", REL_ANTONYM},  /* 湿<>干 */
+    /* 联想: associated */
+    {"\xe9\xb8\x9f", "\xe4\xba\x91", REL_ASSOC},  /* 鸟~云 */
+    {"\xe5\xb1\xb1", "\xe8\x8a\xb1", REL_ASSOC},  /* 山~花 */
+    {"\xe4\xba\xba", "\xe5\xb1\xb1", REL_ASSOC},  /* 人~山 */
+    {"\xe4\xba\xba", "\xe5\xa4\xa9", REL_ASSOC},  /* 人~天 */
+    {"\xe9\x9b\xa8", "\xe6\xb0\xb4", REL_ASSOC},  /* 雨~水 */
+    {"\xe6\x9c\x88", "\xe6\x98\x9f", REL_ASSOC},  /* 月~星 */
+};
+#define N_CONCEPT_EDGES (sizeof(concept_edges) / sizeof(concept_edges[0]))
+
+/* Question type detection */
+typedef enum {
+    Q_WHY = 0,     /* 为什么 -> causal/serial reasoning */
+    Q_WHAT,        /* 什么是 -> category+attribute */
+    Q_HOW,         /* 怎么 -> serial reasoning */
+    Q_GENERAL,     /* general -> association */
+} QType;
+
+static const char *qtype_name[] = {
+    "WHY(\xe5\x9b\xa0\xe6\x9e\x9c\xe6\x8e\xa8\xe7\x90\x86)",      /* WHY(因果推理) */
+    "WHAT(\xe5\xae\x9a\xe4\xb9\x89\xe6\x8e\xa8\xe7\x90\x86)",      /* WHAT(定义推理) */
+    "HOW(\xe8\xbf\x87\xe7\xa8\x8b\xe6\x8e\xa8\xe7\x90\x86)",        /* HOW(过程推理) */
+    "GENERAL(\xe8\x81\x94\xe6\x83\xb3\xe6\x8e\xa8\xe7\x90\x86)",   /* GENERAL(联想推理) */
+};
+
+static QType detect_qtype(const char *prompt) {
+    /* 为什么 = \xe4\xb8\xba\xe4\xbb\x80\xe4\xb9\x88 */
+    if (strstr(prompt, "\xe4\xb8\xba\xe4\xbb\x80\xe4\xb9\x88") ||
+        strstr(prompt, "\xe4\xb8\xba\xe4\xbd\x95") ||
+        strstr(prompt, "\xe5\x87\xad\xe4\xbb\x80\xe4\xb9\x88"))
+        return Q_WHY;
+    /* 什么是 = \xe4\xbb\x80\xe4\xb9\x88\xe6\x98\xaf, 是什么 = \xe6\x98\xaf\xe4\xbb\x80\xe4\xb9\x88 */
+    if (strstr(prompt, "\xe4\xbb\x80\xe4\xb9\x88\xe6\x98\xaf") ||
+        strstr(prompt, "\xe6\x98\xaf\xe4\xbb\x80\xe4\xb9\x88") ||
+        strstr(prompt, "\xe4\xbb\x80\xe4\xb9\x88\xe5\x8f\xab"))
+        return Q_WHAT;
+    /* 怎么 = \xe6\x80\x8e\xe4\xb9\x88, 如何 = \xe5\xa6\x82\xe4\xbd\x95 */
+    if (strstr(prompt, "\xe6\x80\x8e\xe4\xb9\x88") ||
+        strstr(prompt, "\xe5\xa6\x82\xe4\xbd\x95"))
+        return Q_HOW;
+    return Q_GENERAL;
+}
+
+/* CORE activation overlap between two concepts.
+ * Computes cosine similarity of CORE-only neuron activation patterns at layer 0.
+ *
+ * High overlap -> concepts share semantic circuitry (parallel/category)
+ * Low overlap  -> concepts are distinct (causal/antonym)
+ *
+ * Also outputs CORE diff (mean absolute difference of CORE activations).
+ */
+static float core_activation_overlap(Model *m, const char *concept_a,
+                                      const char *concept_b,
+                                      float *out_core_diff) {
+    int n_embd = m->cfg.n_embd;
+    int mlp_dim = m->cfg.mlp_dim;
+
+    float emb_a[4096], emb_b[4096];
+    float gate_a[4096], gate_b[4096];
+    float *act_a = (float *)malloc(mlp_dim * sizeof(float));
+    float *act_b = (float *)malloc(mlp_dim * sizeof(float));
+
+    get_concept_embedding(m, concept_a, emb_a, n_embd);
+    get_concept_embedding(m, concept_b, emb_b, n_embd);
+    compute_gate_input(m, emb_a, 0, gate_a, n_embd);
+    compute_gate_input(m, emb_b, 0, gate_b, n_embd);
+    simulate_activation(m, gate_a, 0, act_a, mlp_dim);
+    simulate_activation(m, gate_b, 0, act_b, mlp_dim);
+
+    uint8_t *mask = m->layers[0].mlp_gate.logic_mask;
+    if (!mask) {
+        free(act_a); free(act_b);
+        if (out_core_diff) *out_core_diff = 0;
+        return 0;
+    }
+
+    /* Extract CORE-only activations */
+    float *core_a = (float *)malloc(mlp_dim * sizeof(float));
+    float *core_b = (float *)malloc(mlp_dim * sizeof(float));
+    int n_core = 0;
+    for (int j = 0; j < mlp_dim; j++) {
+        if (mask[j] == 0) {  /* CORE neuron */
+            core_a[n_core] = act_a[j];
+            core_b[n_core] = act_b[j];
+            n_core++;
+        }
+    }
+
+    float overlap = 0, diff = 0;
+    if (n_core > 0) {
+        overlap = cosine_sim(core_a, core_b, n_core);
+        float sum_diff = 0;
+        for (int j = 0; j < n_core; j++)
+            sum_diff += fabsf(core_a[j] - core_b[j]);
+        diff = sum_diff / n_core;
+    }
+
+    free(act_a); free(act_b);
+    free(core_a); free(core_b);
+    if (out_core_diff) *out_core_diff = diff;
+    return overlap;
+}
+
+/* Dynamic relationship classification based on wte cosine + CORE activation.
+ * Used for concept pairs NOT in the explicit edge table.
+ *
+ * Classification logic:
+ *   wte_cos  = semantic similarity (embedding space)
+ *   core_ov  = logic similarity (neuron activation space)
+ *   core_diff = activation difference magnitude
+ *
+ *   High wte + High core_ov  -> PARALLEL (similar in both spaces)
+ *   Med wte + Low core_ov    -> ATTRIBUTE (related but different logic)
+ *   Low wte + High core_ov   -> CATEGORY (different words, same circuitry)
+ *   Low wte + Low core_ov    -> CAUSAL (distinct in both spaces)
+ *   Default                  -> ASSOC
+ */
+static RelType classify_relationship(float wte_cos, float core_ov, float core_diff) {
+    if (wte_cos > 0.6f && core_ov > 0.6f)
+        return REL_PARALLEL;
+    if (wte_cos > 0.4f && core_ov < 0.4f)
+        return REL_ATTRIBUTE;
+    if (wte_cos < 0.3f && core_ov > 0.5f)
+        return REL_CATEGORY;
+    if (wte_cos < 0.2f && core_ov < 0.3f)
+        return REL_CAUSAL;
+    return REL_ASSOC;
+}
