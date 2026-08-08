@@ -4505,6 +4505,25 @@ void model_set_sliding_window(Model *m, int window, int n_sinks) {
 /* 全局概念感知注意力配置（默认关闭，需显式开启） */
 ConceptAttnConfig g_concept_attn_cfg = {0};
 
+/* v16: 概念注意力运行时统计 (探针用, 前向单线程累加) */
+typedef struct {
+    long   forwards;       /* 前向调用次数 */
+    long   candidates;     /* 累计候选对数 (实际计算量) */
+    long   full_equiv;     /* 累计等效全注意力对数 (seq_pos+1) */
+    long   gate_pairs;     /* 参与门控判断的对数 */
+    long   gate_blocked;   /* 被门控屏蔽的对数 */
+    long   msg_candidates; /* 信使候选数 */
+    double msg_mass;       /* 信使获得的注意力质量累计 */
+    int    last_n_filled;  /* 最近一次前向的已填充片段数 */
+} ConceptAttnStats;
+ConceptAttnStats g_ca_stats = {0};
+void concept_attn_stats_reset(void) {
+    int keep = g_ca_stats.last_n_filled;
+    ConceptAttnStats z = {0};
+    g_ca_stats = z;
+    g_ca_stats.last_n_filled = keep;
+}
+
 /* 全局信使缓存（每层一个，按 layer_idx 索引） */
 MessengerCache *g_messenger_caches = NULL;
 static int g_messenger_caches_n_layer = 0;
@@ -4725,6 +4744,8 @@ void attention_forward_concept(float *attn_out, const float *qkv,
 
     int head_dim = n_embd / n_head;
     float scale = 1.0f / sqrtf((float)head_dim);
+    g_ca_stats.forwards++;
+    g_ca_stats.full_equiv += (long)(seq_pos + 1) * n_head;
 
     const float *Q = qkv;
     const float *K_new = qkv + n_embd;
@@ -4762,6 +4783,7 @@ void attention_forward_concept(float *attn_out, const float *qkv,
                                         cfg->num_messengers, mk, mv);
             mc->segment_filled[seg_idx] = 1;
             if (seg_idx + 1 > mc->n_filled) mc->n_filled = seg_idx + 1;
+            g_ca_stats.last_n_filled = mc->n_filled;
         }
     }
 
@@ -4838,6 +4860,10 @@ void attention_forward_concept(float *attn_out, const float *qkv,
             is_messenger[0] = -1;
             n_attend = 1;
         }
+        /* v16 探针: 候选集统计 */
+        g_ca_stats.candidates += n_attend;
+        for (int i = 0; i < n_attend; i++)
+            if (is_messenger[i] >= 0) g_ca_stats.msg_candidates++;
 
         /* 计算注意力分数 */
         const float *Q_h = Q + h * head_dim;
@@ -4861,8 +4887,10 @@ void attention_forward_concept(float *attn_out, const float *qkv,
             if (is_messenger[i] < 0 && cfg->gate_enable) {
                 int j = pos_list[i];
                 int distance = seq_pos - j;
+                g_ca_stats.gate_pairs++;
                 if (!concept_boundary_gate(Q_h, K_jh, head_dim, distance, cfg)) {
                     scores[i] = -1e30f;  /* 屏蔽 */
+                    g_ca_stats.gate_blocked++;
                     continue;
                 }
             }
@@ -4884,6 +4912,9 @@ void attention_forward_concept(float *attn_out, const float *qkv,
         }
         float inv_sum = 1.0f / (sum_exp + 1e-12f);
         for (int i = 0; i < n_attend; i++) attn_w[i] *= inv_sum;
+        /* v16 探针: 信使注意力质量 */
+        for (int i = 0; i < n_attend; i++)
+            if (is_messenger[i] >= 0) g_ca_stats.msg_mass += attn_w[i];
 
         /* 加权求和 V */
         float *out_h = attn_out + h * head_dim;
@@ -5181,5 +5212,22 @@ void model_set_concept_attn(Model *m, const ConceptAttnConfig *cfg) {
         model_messenger_caches_free();
         printf("[*] concept-aware attention disabled (fallback to standard attention)\n");
     }
+}
+
+/* v16: 概念注意力探针 — 输出聚合统计并重置计数器 */
+void concept_attn_probe_print(void) {
+    ConceptAttnStats *s = &g_ca_stats;
+    if (s->forwards == 0) return;
+    double reduction = s->full_equiv > 0 ?
+        100.0 * (1.0 - (double)s->candidates / (double)s->full_equiv) : 0.0;
+    double gate_rate = s->gate_pairs > 0 ?
+        100.0 * (double)s->gate_blocked / (double)s->gate_pairs : 0.0;
+    double msg_share = s->candidates > 0 ?
+        100.0 * (double)s->msg_candidates / (double)s->candidates : 0.0;
+    double msg_mass_per_head = s->forwards > 0 ?
+        s->msg_mass / (double)s->forwards : 0.0;
+    printf("  [CATTN] fwd=%ld 候选精简=%.1f%% 门控屏蔽=%.1f%% 信使候选=%.1f%% 信使质量=%.3f/头 片段=%d\n",
+           s->forwards, reduction, gate_rate, msg_share, msg_mass_per_head, s->last_n_filled);
+    concept_attn_stats_reset();
 }
 

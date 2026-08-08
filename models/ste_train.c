@@ -1503,6 +1503,7 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
         /* 白箱探针:每 10 步检查 CORE/BINARY/PRUNE 逻辑电路 */
         if (step % 10 == 0) {
             whitebox_probe_compact(m);
+            if (g_concept_attn_cfg.enable) concept_attn_probe_print();  /* v16 */
         }
 
         /* v16: 每 gen_interval 步做一次生成测试 — 避免白训 */
@@ -2406,6 +2407,10 @@ int main(int argc, char **argv) {
     if (getenv("LAL_CONCEPT_ATTN") && atoi(getenv("LAL_CONCEPT_ATTN"))) {
         ConceptAttnConfig cca = concept_attn_default_config();
         cca.enable = 1;
+        /* v16: 数据自适应调参 — 默认 seg_len=64 对短样本数据集永远填不满片段,
+         * 信使机制空转 (探针实证). LAL_CA_SEG_LEN/LAL_CA_MSG 可覆盖 */
+        if (getenv("LAL_CA_SEG_LEN")) cca.segment_len = atoi(getenv("LAL_CA_SEG_LEN"));
+        if (getenv("LAL_CA_MSG")) cca.num_messengers = atoi(getenv("LAL_CA_MSG"));
         model_set_concept_attn(&model, &cca);
     }
 

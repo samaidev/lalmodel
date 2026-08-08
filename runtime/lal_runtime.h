@@ -227,6 +227,7 @@ extern int g_use_pure_float;
 extern float g_binary_scale;   /* v16: BINARY 共模抑制 */
 extern float g_wte_lr_scale;   /* v16: wte/wpe 更新速率 */
 extern float g_logit_scale;    /* v16: logit 缩放 */
+void concept_attn_probe_print(void);  /* v16: 概念注意力探针 */
 
 /* Global flag: set to 1 to accumulate gradients instead of applying them
  * immediately in bin_backward_ste. Used by batch training to collect
