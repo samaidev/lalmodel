@@ -354,16 +354,17 @@ data/large_dialogue.jsonl: data/gen_large_dialogue.py
 data/large_dialogue_bpe.bin: data/large_dialogue.jsonl tokenizer/chinese_bpe.model
 	@if [ ! -f data/cognitive_foundation.jsonl ]; then \
 	    echo "[!] 缺少 data/cognitive_foundation.jsonl"; exit 1; fi
-	python3 -c "import json; \
+	python3 -c "import json,os; \
 srcs=['data/cognitive_foundation.jsonl','data/large_dialogue.jsonl','data/dialogue_long_form.jsonl']; \
 f=open('data/train_large_dialogue.jsonl','w',encoding='utf-8'); \
-[f.write(json.dumps(json.loads(l),ensure_ascii=False)+'\n') for s in srcs for l in open(s,encoding='utf-8') if l.strip() and 'text' in json.loads(l)]; \
+[[print('[!] skip missing '+s) if not os.path.exists(s) else None for s in srcs], \
+[f.write(json.dumps(json.loads(l),ensure_ascii=False)+'\n') for s in srcs if os.path.exists(s) for l in open(s,encoding='utf-8') if l.strip() and 'text' in json.loads(l)]]; \
 f.close(); print('[*] merged train_large_dialogue.jsonl')"
 	python3 scripts/tokenize_data.py \
 	    --input data/train_large_dialogue.jsonl \
 	    --output data/large_dialogue_bpe.bin \
 	    --tokenizer tokenizer/chinese_bpe.model \
-	    --max_len 128 --add-eos
+	    --max_len 128 --add_eos
 	@echo "[*] large_dialogue_bpe.bin ready"
 
 large-dialogue-data: data/large_dialogue_bpe.bin

@@ -1529,8 +1529,9 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
 
         /* 逻辑引导已在 model_batch_apply 前累加梯度 */
 
-        /* 每 50 步做一次推理 trace */
-        if (step > 0 && step % 50 == 0) {
+        /* 每 50 步做一次推理 trace (LAL_NO_TRACE=1 跳过 — 手机内存紧张时,
+         * 真注意力模式下滑动窗口 KV 懒加载 ~300MB, 会触发系统 OOM kill) */
+        if (step > 0 && step % 50 == 0 && !getenv("LAL_NO_TRACE")) {
             const char *trace_prompts[] = {
                 "\xe7\x83\xad", "\xe5\x86\xb7", "\xe7\x81\xab",
                 "\xe6\xb0\xb4", "\xe5\xa4\xa7", "\xe5\xb0\x8f"
