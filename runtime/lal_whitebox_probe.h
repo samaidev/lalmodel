@@ -1362,9 +1362,9 @@ static float relation_logic_regularization(Model *m, float lr) {
 static float wte_geometry_regularization(Model *m, float lr) {
     int n = m->cfg.n_embd;
     int V = m->cfg.vocab_size;
-    const float M_uni = 0.40f;
-    const float norm_cap = 1.5f;
-    const int n_pairs = 128;
+    const float M_uni = 0.30f;  /* v20: 0.40→0.30, 更积极推远无关 token */
+    const float norm_cap = 2.0f;  /* v20: 1.5→2.0, 允许更大嵌入范数 */
+    const int n_pairs = 256;  /* v20: 128→256, 更多采样对 */
 
     static int excl[256]; static int n_excl = -1;
     if (n_excl < 0) {

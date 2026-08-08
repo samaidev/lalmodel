@@ -567,8 +567,8 @@ static float residual_diversity_loss(Model *m, float lr) {
     int n_embd = m->cfg.n_embd;
     int n_layer = m->cfg.n_layer;
     int n = n_embd;
-    float threshold = 0.15f;  /* v15: 降低阈值(0.3→0.15), 更早开始推开 */
-    float weight = 5.0f;     /* v15: 提高权重(2.0→5.0), 强制隐藏状态分离 */
+    float threshold = 0.05f;  /* v20: 降低阈值(0.15→0.05), 几乎全程推开 */
+    float weight = 15.0f;     /* v20: 提高权重(5.0→15.0), 强制隐藏状态分离 */
     float total_loss = 0.0f;
 
     static float *emb_a = NULL, *emb_b = NULL;
@@ -759,6 +759,170 @@ static float residual_diversity_loss(Model *m, float lr) {
     if (n_collapsed > 0 && g_opt_step % 10 == 0) {
         printf("  [DIVERSITY] max_cos=%.4f n_collapsed=%d/%d layers\n",
                max_cos, n_collapsed, (int)(N_PROBE_PAIRS * n_layer));
+    }
+    return total_loss / N_PROBE_PAIRS;
+}
+
+/* === v20: V 投影多样性损失 (V-Projection Diversity Loss) ===
+ *
+ * 根因诊断: V=attn_v (火vs水) cosine=0.909 — V 投影把不同输入映射到
+ * 几乎相同的输出, 导致注意力输出与输入无关 (信息瓶颈在 V, 不在 QK).
+ *
+ * residual_diversity_loss 作用于残差流 (attn_out + mlp_out 之和),
+ * 但 V 塌缩发生在注意力内部, 残差损失无法直接触及 W_v.
+ *
+ * 本函数直接对 V 投影输出施加多样性约束:
+ *   对每对概念 (a, b), 在每层计算 V_a = W_v * norm1_out_a, V_b = W_v * norm1_out_b
+ *   如果 cosine(V_a, V_b) > threshold, 加损失并推梯度到 W_v
+ *
+ * 梯度: dL/dV_a = weight * (V_b / (||a|| ||b||) - cos * V_a / ||a||^2)
+ *        dL/dW_v += dL/dV_a * norm1_out_a^T  (对 a 和 b 对称)
+ */
+static float v_projection_diversity_loss(Model *m, float lr) {
+    int n = m->cfg.n_embd;
+    int n_layer = m->cfg.n_layer;
+    float threshold = 0.30f;   /* V 投影允许的余弦上限 */
+    float weight = 8.0f;       /* 强权重, 直接推 W_v */
+    float total_loss = 0.0f;
+
+    static float *emb_a = NULL, *emb_b = NULL;
+    static float *norm1_a = NULL, *norm1_b = NULL;
+    static float *v_a = NULL, *v_b = NULL;
+    static float *grad_va = NULL, *grad_vb = NULL;
+    static int ec_n = 0;
+    if (ec_n != n) {
+        free(emb_a); free(emb_b); free(norm1_a); free(norm1_b);
+        free(v_a); free(v_b); free(grad_va); free(grad_vb);
+        emb_a = malloc(n * sizeof(float));
+        emb_b = malloc(n * sizeof(float));
+        norm1_a = malloc(n * sizeof(float));
+        norm1_b = malloc(n * sizeof(float));
+        v_a = malloc(n * sizeof(float));
+        v_b = malloc(n * sizeof(float));
+        grad_va = malloc(n * sizeof(float));
+        grad_vb = malloc(n * sizeof(float));
+        ec_n = n;
+    }
+
+    float max_vcos = 0;
+    int n_collapsed = 0;
+
+    for (int p = 0; p < (int)N_PROBE_PAIRS; p++) {
+        ConceptPair *cp = &probe_pairs[p];
+        get_concept_embedding(m, cp->bytes_a, emb_a, n);
+        get_concept_embedding(m, cp->bytes_b, emb_b, n);
+
+        /* 加 WPE (位置 0) */
+        if (m->wpe) {
+            for (int i = 0; i < n; i++) {
+                emb_a[i] += m->wpe[i];
+                emb_b[i] += m->wpe[i];
+            }
+        }
+
+        for (int l = 0; l < n_layer; l++) {
+            TransLayer *tl = &m->layers[l];
+
+            /* LayerNorm 1: emb -> norm1_out */
+            norm_forward(norm1_a, emb_a, tl->norm1_w, tl->norm1_b,
+                        m->cfg.norm_type, n);
+            norm_forward(norm1_b, emb_b, tl->norm1_w, tl->norm1_b,
+                        m->cfg.norm_type, n);
+
+            /* QKV 投影: 取 V 部分 (最后 n 个输出) */
+            BinLayer *qkv = &tl->attn_q;
+            if (m->cfg.qkv_merged) {
+                /* merged: out = [Q|K|V], V = rows [2n, 3n) */
+                /* 用 bin_forward 计算 3n, 取最后 n */
+                static float *qkv_out_a = NULL, *qkv_out_b = NULL;
+                static int qo_n = 0;
+                if (qo_n != 3 * n) {
+                    free(qkv_out_a); free(qkv_out_b);
+                    qkv_out_a = malloc(3 * n * sizeof(float));
+                    qkv_out_b = malloc(3 * n * sizeof(float));
+                    qo_n = 3 * n;
+                }
+                bin_forward(qkv_out_a, norm1_a, qkv);
+                bin_forward(qkv_out_b, norm1_b, qkv);
+                memcpy(v_a, qkv_out_a + 2 * n, n * sizeof(float));
+                memcpy(v_b, qkv_out_b + 2 * n, n * sizeof(float));
+            } else {
+                /* separate V projection */
+                bin_forward(v_a, norm1_a, &tl->attn_v);
+                bin_forward(v_b, norm1_b, &tl->attn_v);
+            }
+
+            /* 计算 cosine(V_a, V_b) */
+            float dot = 0, na = 0, nb = 0;
+            for (int i = 0; i < n; i++) {
+                dot += v_a[i] * v_b[i];
+                na += v_a[i] * v_a[i];
+                nb += v_b[i] * v_b[i];
+            }
+            float norm_a = sqrtf(na) + 1e-8f;
+            float norm_b = sqrtf(nb) + 1e-8f;
+            float cos = dot / (norm_a * norm_b);
+
+            if (cos > max_vcos) max_vcos = cos;
+
+            if (cos > threshold) {
+                total_loss += weight * (cos - threshold);
+                if (cos > 0.7f) n_collapsed++;
+
+                /* 梯度: 推开 V_a 和 V_b */
+                float inv_ab = 1.0f / (norm_a * norm_b);
+                float cos_over_na = cos / na;
+                float cos_over_nb = cos / nb;
+                for (int i = 0; i < n; i++) {
+                    grad_va[i] = weight * (v_b[i] * inv_ab - v_a[i] * cos_over_na);
+                    grad_vb[i] = weight * (v_a[i] * inv_ab - v_b[i] * cos_over_nb);
+                }
+
+                /* 将梯度累加到 attn_q 的 V 部分 grad_accum */
+                if (m->cfg.qkv_merged) {
+                    /* V 在 merged QKV 的 [2n, 3n) 行 */
+                    int in_dim = qkv->in_dim;
+                    int v_offset = 2 * n;  /* V 起始行 */
+                    #pragma omp parallel for schedule(static)
+                    for (int j = 0; j < n; j++) {
+                        float ga = grad_va[j] * lr;
+                        float gb = grad_vb[j] * lr;
+                        if (fabsf(ga) > 1e-10f || fabsf(gb) > 1e-10f) {
+                            float *wga = &qkv->grad_accum[(size_t)(v_offset + j) * in_dim];
+                            for (int i = 0; i < in_dim && i < n; i++)
+                                wga[i] += ga * norm1_a[i] + gb * norm1_b[i];
+                            if (qkv->bias_grad_accum)
+                                qkv->bias_grad_accum[v_offset + j] += ga + gb;
+                        }
+                    }
+                } else {
+                    /* 独立 V 投影 */
+                    BinLayer *bl_v = &tl->attn_v;
+                    int in_dim = bl_v->in_dim;
+                    #pragma omp parallel for schedule(static)
+                    for (int j = 0; j < n; j++) {
+                        float ga = grad_va[j] * lr;
+                        float gb = grad_vb[j] * lr;
+                        if (fabsf(ga) > 1e-10f || fabsf(gb) > 1e-10f) {
+                            float *wga = &bl_v->grad_accum[(size_t)j * in_dim];
+                            for (int i = 0; i < in_dim && i < n; i++)
+                                wga[i] += ga * norm1_a[i] + gb * norm1_b[i];
+                            if (bl_v->bias_grad_accum)
+                                bl_v->bias_grad_accum[j] += ga + gb;
+                        }
+                    }
+                }
+            }
+
+            /* 前向传播到下一层 (简化: 只跑 trans_layer_forward) */
+            trans_layer_forward(emb_a, tl, &m->acts[l], &m->cfg, 0);
+            trans_layer_forward(emb_b, tl, &m->acts[l], &m->cfg, 0);
+        }
+    }
+
+    if (g_opt_step % 10 == 0) {
+        printf("  [VDIVERSE] max_vcos=%.4f n_collapsed=%d/%d pairs\n",
+               max_vcos, n_collapsed, (int)(N_PROBE_PAIRS * n_layer));
     }
     return total_loss / N_PROBE_PAIRS;
 }
@@ -1451,6 +1615,8 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
                 div_loss = residual_diversity_loss(m, effective_logic_lr);
                 clock_gettime(CLOCK_MONOTONIC, &_t1);
                 double _ms3 = (_t1.tv_sec-_t0.tv_sec)*1000 + (_t1.tv_nsec-_t0.tv_nsec)/1e6;
+                /* v20: V 投影多样性损失 — 直接修复 V 塌缩 (cosine=0.909) */
+                float vdiv_loss = v_projection_diversity_loss(m, effective_logic_lr);
                 /* v15: 关系监督 — 在 wte 空间拉近相关概念/推远无关概念,
                  * 让原生推理概念链(鸟→动物, 火→光)有意义. 直接用 wte 行梯度,
                  * lr 取 logic_lr 量级, BPE 单 token 独立安全. */
@@ -1459,8 +1625,8 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
                 float geo_loss = wte_geometry_regularization(m, logic_lr * 0.5f);
                 clock_gettime(CLOCK_MONOTONIC, &_t0);
                 double _ms4 = (_t0.tv_sec-_t1.tv_sec)*1000 + (_t0.tv_nsec-_t1.tv_nsec)/1e6;
-                printf("  [LTIME] mlp_reg=%.0f attn_reg=%.0f div=%.0f rel_geo=%.0f ms\n", _ms1, _ms2, _ms3, _ms4);
-                (void)rel_loss; (void)geo_loss;
+                printf("  [LTIME] mlp_reg=%.0f attn_reg=%.0f div=%.0f vdiv=%.0f rel_geo=%.0f ms\n", _ms1, _ms2, _ms3, _ms4);
+                (void)rel_loss; (void)geo_loss; (void)vdiv_loss;
             }
             /* v13g: logic-only 模式下 n_valid=0, 用 batch_size=1 做 apply */
             int apply_batch = logic_only ? 1 : n_valid;
