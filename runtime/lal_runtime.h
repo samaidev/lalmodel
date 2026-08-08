@@ -321,6 +321,7 @@ typedef struct {
      * NULL in legacy V-copy mode. */
     float *_kv_k;
     float *_kv_v;
+    int layer_idx;  /* v16: 概念感知注意力索引 g_messenger_caches 用 */
 } TransLayer;
 
 /* Per-layer activation cache (for backward) */

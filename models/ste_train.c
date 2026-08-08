@@ -2402,6 +2402,13 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
+    /* v16: 概念感知注意力 — LAL_CONCEPT_ATTN=1 启用 (框架四层优化) */
+    if (getenv("LAL_CONCEPT_ATTN") && atoi(getenv("LAL_CONCEPT_ATTN"))) {
+        ConceptAttnConfig cca = concept_attn_default_config();
+        cca.enable = 1;
+        model_set_concept_attn(&model, &cca);
+    }
+
     /* STE 训练 */
     if (n_steps > 0) {
         int total_steps = total_schedule_steps > 0 ? total_schedule_steps : n_steps;

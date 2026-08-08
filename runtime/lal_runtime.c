@@ -163,6 +163,7 @@ void trans_layer_init(TransLayer *tl, Tensor *tensors, int n_tensors,
                       const char *gate_key, const char *up_key, const char *down_key,
                       const char *norm1_w_key, const char *norm1_b_key,
                       const char *norm2_w_key, const char *norm2_b_key) {
+    tl->layer_idx = layer_idx;  /* v16: 概念注意力信使缓存索引 */
     int n = cfg->n_embd, m = cfg->mlp_dim;
     tl->_kv_k = NULL;
     tl->_kv_v = NULL;
@@ -316,8 +317,15 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
      * so we skip the attention computation entirely. */
     if (!g_skip_wv) {
         if (g_use_real_attention && tl->_kv_k && tl->_kv_v) {
-            attention_forward(act->attn_out, act->q, n, cfg->n_head, seq_pos,
-                              tl->_kv_k, tl->_kv_v);
+            /* v16: 概念感知注意力 (框架四层优化, g_concept_attn_cfg.enable 控制) */
+            if (g_concept_attn_cfg.enable && g_messenger_caches) {
+                attention_forward_concept(act->attn_out, act->q, n, cfg->n_head, seq_pos,
+                                          tl->_kv_k, tl->_kv_v, cfg->n_ctx,
+                                          &g_concept_attn_cfg, &g_messenger_caches[tl->layer_idx]);
+            } else {
+                attention_forward(act->attn_out, act->q, n, cfg->n_head, seq_pos,
+                                  tl->_kv_k, tl->_kv_v);
+            }
         } else {
             /* Legacy V-copy (degenerate, no QK mixing). */
             memcpy(act->attn_out, act->v, n * sizeof(float));
@@ -419,10 +427,17 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
         if (cfg->attn_type == ATTN_ROPE)
             apply_rope(act->q, act->k, seq_pos, cfg->n_head, n / cfg->n_head, n);
 
-        if (g_use_real_attention && tl->_kv_k && tl->_kv_v)
-            attention_forward(act->attn_out, act->q, n, cfg->n_head, seq_pos,
-                              tl->_kv_k, tl->_kv_v);
-        else
+        if (g_use_real_attention && tl->_kv_k && tl->_kv_v) {
+            /* v16: 概念感知注意力 (pure_float 路径) */
+            if (g_concept_attn_cfg.enable && g_messenger_caches) {
+                attention_forward_concept(act->attn_out, act->q, n, cfg->n_head, seq_pos,
+                                          tl->_kv_k, tl->_kv_v, cfg->n_ctx,
+                                          &g_concept_attn_cfg, &g_messenger_caches[tl->layer_idx]);
+            } else {
+                attention_forward(act->attn_out, act->q, n, cfg->n_head, seq_pos,
+                                  tl->_kv_k, tl->_kv_v);
+            }
+        } else
             memcpy(act->attn_out, act->v, n * sizeof(float));
     } /* end !g_skip_wv */
 
@@ -716,8 +731,15 @@ void trans_layer_backward(float *grad_x, TransLayer *tl, TransAct *act,
         /* Real attention: dQ/dK/dV at the current position. act->q is the
          * contiguous [Q|K|V] buffer (k=q+n, v=q+2n), valid for both merged
          * and separate QKV layouts. */
-        attention_backward(g_qkv, g_attn, act->q, n, cfg->n_head,
-                           act->seq_pos, tl->_kv_k, tl->_kv_v);
+        /* v16: 概念感知注意力反向 */
+        if (g_concept_attn_cfg.enable && g_messenger_caches) {
+            attention_backward_concept(g_qkv, g_attn, act->q, n, cfg->n_head,
+                                       act->seq_pos, tl->_kv_k, tl->_kv_v, cfg->n_ctx,
+                                       &g_concept_attn_cfg, &g_messenger_caches[tl->layer_idx]);
+        } else {
+            attention_backward(g_qkv, g_attn, act->q, n, cfg->n_head,
+                               act->seq_pos, tl->_kv_k, tl->_kv_v);
+        }
     } else {
         /* Legacy V-copy: only V receives gradient (Q, K grad = 0). */
         memset(g_qkv, 0, 3 * n * sizeof(float));
@@ -1183,6 +1205,8 @@ float model_forward(Model *m, const int *tokens, int n_tokens) {
     int t = n_tokens - 1;  /* predict tokens[t+1] from context tokens[0..t] */
 
     if (g_use_real_attention && m->k_cache && !g_skip_wv) {
+        /* v16: 新样本 — 重置概念注意力信使缓存, 防止跨样本污染 */
+        if (g_concept_attn_cfg.enable && g_messenger_caches) model_messenger_caches_reset();
         /* Real attention needs the KV cache for positions 0..t to hold THIS
          * sequence's keys/values. The cache persists across training steps
          * (different sentences), so (re)fill 0..t-1 as context before running
