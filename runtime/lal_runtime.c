@@ -1175,6 +1175,17 @@ void model_load(Model *m, const char *weight_path, ModelConfig cfg,
      * Callers can also call model_kv_cache_alloc() later to enable it. */
     if (g_use_real_attention) model_kv_cache_alloc(m);
 
+    /* 唯一路线底座：概念感知注意力默认随模型加载即启用（CORE/BINARY/PRUNE + 浮点 + 概念注意力）。
+     * 修复根因：推理侧此前 g_messenger_caches==NULL, 永远走标准 attention (探针 fwd=0)。
+     * LAL_CONCEPT_ATTN=0 作为调试逃生口强制关闭；其余环境变量(LAL_CA_SEG_LEN/LAL_CA_MSG)
+     * 由调用方在 model_set_concept_attn 时覆盖。训练侧 ste_train.c 会二次调用并覆盖分段长度。 */
+    if (g_use_real_attention) {
+        ConceptAttnConfig cca = concept_attn_default_config();
+        if (getenv("LAL_CONCEPT_ATTN") && atoi(getenv("LAL_CONCEPT_ATTN")) == 0)
+            cca.enable = 0;  /* 显式 0 才关，否则默认开 */
+        model_set_concept_attn(m, &cca);
+    }
+
 #ifdef LAL_CUDA
     /* v13k: Upload all layer weights to GPU (resident) for fast forward/backward.
      * Called once after model_load. Weights stay on GPU until model_free.
@@ -4527,6 +4538,10 @@ typedef struct {
     long   msg_candidates; /* 信使候选数 */
     double msg_mass;       /* 信使获得的注意力质量累计 */
     int    last_n_filled;  /* 最近一次前向的已填充片段数 */
+    /* 审查建议的核心验证项: 信使是否携带"差异"而非"共识均值" */
+    double msg_inter_cos;  /* 信使间平均余弦 (越低越好, 目标 < 0.2 说明去同质化生效) */
+    double msg_norm;       /* 信使平均范数 (验证范数钳制 MSG_NORM_CAP=4.0 是否生效) */
+    long   msg_segments;   /* 已统计信使的片段数 */
 } ConceptAttnStats;
 ConceptAttnStats g_ca_stats = {0};
 void concept_attn_stats_reset(void) {
@@ -4902,6 +4917,38 @@ void attention_forward_concept(float *attn_out, const float *qkv,
             mc->segment_filled[seg_idx] = 1;
             if (seg_idx + 1 > mc->n_filled) mc->n_filled = seg_idx + 1;
             g_ca_stats.last_n_filled = mc->n_filled;
+
+            /* 探针: 信使间相似度 + 信使范数 (审查建议的核心验证项)
+             * 去同质化目标: 信使间余弦 < 0.2 说明信使携带的是"差异"而非"共识均值"
+             * 范数钳制目标: 信使范数应被 MSG_NORM_CAP=4.0 约束, 不被注意力按范数主导 */
+            {
+                int S = cfg->num_messengers;
+                float seg_cos_sum = 0.0f; int seg_cos_pairs = 0;
+                float seg_norm_sum = 0.0f;
+                for (int a = 0; a < S; a++) {
+                    const float *ma = mv + (size_t)a * n_embd;
+                    float na = 0.0f;
+                    for (int d = 0; d < n_embd; d++) na += ma[d] * ma[d];
+                    na = sqrtf(na);
+                    seg_norm_sum += na;
+                    for (int b = a + 1; b < S; b++) {
+                        const float *mb = mv + (size_t)b * n_embd;
+                        float dot = 0.0f, nb = 0.0f;
+                        for (int d = 0; d < n_embd; d++) {
+                            dot += ma[d] * mb[d];
+                            nb += mb[d] * mb[d];
+                        }
+                        nb = sqrtf(nb);
+                        float cos = (na > 1e-6f && nb > 1e-6f) ? dot / (na * nb) : 0.0f;
+                        seg_cos_sum += cos;
+                        seg_cos_pairs++;
+                    }
+                }
+                if (seg_cos_pairs > 0)
+                    g_ca_stats.msg_inter_cos += seg_cos_sum / seg_cos_pairs;
+                g_ca_stats.msg_norm += seg_norm_sum / (float)S;
+                g_ca_stats.msg_segments++;
+            }
         }
     }
 
@@ -5362,8 +5409,16 @@ void concept_attn_probe_print(void) {
         100.0 * (double)s->msg_candidates / (double)s->candidates : 0.0;
     double msg_mass_per_head = s->forwards > 0 ?
         s->msg_mass / (double)s->forwards : 0.0;
+    double msg_cos = s->msg_segments > 0 ?
+        s->msg_inter_cos / (double)s->msg_segments : 0.0;
+    double msg_norm = s->msg_segments > 0 ?
+        s->msg_norm / (double)s->msg_segments : 0.0;
+    /* 审查判定: 信使间余弦 < 0.2 才算去同质化达标 (机制潜力挖完的判据) */
+    const char *cos_tag = msg_cos < 0.2f ? "OK" : (msg_cos < 0.35f ? "改善中" : "同质化!");
     printf("  [CATTN] fwd=%ld 候选精简=%.1f%% 门控屏蔽=%.1f%% 信使候选=%.1f%% 信使质量=%.3f/头 片段=%d\n",
            s->forwards, reduction, gate_rate, msg_share, msg_mass_per_head, s->last_n_filled);
+    printf("  [CATTN-PROBE] 信使间余弦=%.3f(%s,目标<0.2) 信使均范数=%.2f(钳制4.0) 统计片段=%ld\n",
+           msg_cos, cos_tag, msg_norm, s->msg_segments);
     concept_attn_stats_reset();
 }
 

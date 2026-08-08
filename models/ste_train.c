@@ -2570,14 +2570,18 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
-    /* v16: 概念感知注意力 — LAL_CONCEPT_ATTN=1 启用 (框架四层优化) */
-    if (getenv("LAL_CONCEPT_ATTN") && atoi(getenv("LAL_CONCEPT_ATTN"))) {
+    /* 唯一路线：概念感知注意力默认启用（CORE/BINARY/PRUNE + 浮点 + 概念注意力）。
+     * model_load 已默认开启；此处再次调用以应用数据集自适应分段长度，
+     * 并允许 LAL_CONCEPT_ATTN=0 强制关闭（调试逃生口）。 */
+    {
         ConceptAttnConfig cca = concept_attn_default_config();
-        cca.enable = 1;
-        /* v16: 数据自适应调参 — 默认 seg_len=64 对短样本数据集永远填不满片段,
-         * 信使机制空转 (探针实证). LAL_CA_SEG_LEN/LAL_CA_MSG 可覆盖 */
+        /* 数据自适应调参：默认 seg_len=64 对短样本数据集永远填不满片段，
+         * 信使机制空转 (探针实证)。LAL_CA_SEG_LEN/LAL_CA_MSG 可覆盖 */
         if (getenv("LAL_CA_SEG_LEN")) cca.segment_len = atoi(getenv("LAL_CA_SEG_LEN"));
         if (getenv("LAL_CA_MSG")) cca.num_messengers = atoi(getenv("LAL_CA_MSG"));
+        /* 显式 LAL_CONCEPT_ATTN=0 才强制关，否则沿用默认开启 */
+        if (getenv("LAL_CONCEPT_ATTN") && atoi(getenv("LAL_CONCEPT_ATTN")) == 0)
+            cca.enable = 0;
         model_set_concept_attn(&model, &cca);
     }
 

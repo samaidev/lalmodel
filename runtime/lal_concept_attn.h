@@ -83,22 +83,30 @@ typedef struct {
     int   enable;                /* 1 = 启用概念感知注意力，0 = 回退到标准 attention_forward */
 } ConceptAttnConfig;
 
-/* 默认配置（保守、安全） */
+/* 默认配置（唯一路线底座：CORE/BINARY/PRUNE + 浮点 + 概念注意力）
+ *
+ * 这是项目唯一保留的注意力路线——不再是"可选开关"。
+ * 四层优化（片段信使 / 关系门控 / 异构多头 / KV 复用）默认全开，
+ * 并按审查意见固化：去中心化门控、去中心化信使、窗口对称(128)、自适应阈值。
+ * 环境变量 LAL_CONCEPT_ATTN=0 仅作为调试逃生口（强制关，回退标准 attention）。 */
 static inline ConceptAttnConfig concept_attn_default_config(void) {
     ConceptAttnConfig c;
     c.segment_len         = 64;    /* 64 token 一个片段 */
     c.num_messengers      = 4;     /* 每片段 4 个信使 */
     c.messenger_neighbors = 2;     /* 看 2 个邻近片段的信使 */
     c.gate_enable        = 1;
-    c.gate_window         = 128;   /* Bug Fix 3: 32→128, 消除概念路径与标准路径的窗口不对称 */
-    c.gate_threshold      = 0.1f;  /* 相似度 < 0.1 判定为边界隔离 (运行时会被 P25 分位数覆盖) */
-    c.gate_fallback_prob  = 0.01f; /* 1% 回退概率 */
-    c.gate_distance_prior = 1;    /* 启用距离先验 */
-    c.hetero_enable      = 1;
+    c.gate_window         = 128;   /* 窗口对称：概念路径与标准路径一致 (审查 Bug Fix 3: 32→128) */
+    /* 阈值语义：固定 0.1 在塌缩表征下失效（审查 Bug 2）。
+     * 运行时用门控分数分布的 P25 分位数自适应覆盖（概念注意力前向内维护 g_ca_quantile）。
+     * 此处的 0.1 仅作初始/兜底值，不再作为稳定工作点。 */
+    c.gate_threshold      = 0.1f;
+    c.gate_fallback_prob  = 0.01f; /* 1% 回退概率，避免硬切断长距离指代 */
+    c.gate_distance_prior = 1;    /* 启用距离先验（去中心化后作为相对偏差项） */
+    c.hetero_enable      = 1;     /* 异构多头：局部/信使/全局分层算力 */
     c.n_local_heads       = -1;    /* -1 = 自动：n_head 的一半 */
     c.n_messenger_heads   = -1;    /* -1 = 自动：n_head 的 1/4 */
-    c.cache_messenger     = 1;
-    c.enable              = 0;    /* 默认关闭，需显式开启 */
+    c.cache_messenger     = 1;     /* 信使进 KV-cache，保证间接长距离通路复用 */
+    c.enable              = 1;    /* 默认开启——概念注意力是基座路线，非可选 */
     return c;
 }
 
