@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "lal_concept_attn.h"
 
 /* ========================================================================
  * Level 0: Types & Enums
@@ -541,6 +542,27 @@ void model_set_sliding_window(Model *m, int window, int n_sinks);
 
 
 /* ========================================================================
+ * Concept-Aware Attention (基于「理解(概念-边界) + 推理(关系演化)」框架)
+ * ========================================================================
+ * 四层优化设计：
+ *   Layer 1: 基于概念边界的语义片段切分 + segment-messenger
+ *   Layer 2: 关系强度门控（概念边界预筛选）
+ *   Layer 3: 异构多头算力分配（不同头不同访问域）
+ *   Layer 4: 推理侧 KV-Cache 概念复用（含信使 cache）
+ *
+ * 类型定义和函数声明在 lal_concept_attn.h 中（见下方 include）。
+ * Model-dependent 函数声明在下方（Model 定义之后）。
+ * ======================================================================== */
+
+/* 全局信使缓存管理（每层一个，Model-dependent） */
+void model_messenger_caches_alloc(Model *m, const ConceptAttnConfig *cfg);
+void model_messenger_caches_free(void);
+void model_messenger_caches_reset(void);
+
+/* 运行时配置概念感知注意力 */
+void model_set_concept_attn(Model *m, const ConceptAttnConfig *cfg);
+
+/* ========================================================================
  * Level 3: Batch Training (multiple sequences per weight update)
  * ========================================================================
  * True mini-batch training with gradient accumulation:
@@ -572,5 +594,6 @@ void model_batch_backward(Model *m, const int *tokens, int n_tokens);
 /* Apply accumulated gradients with Adam/SGD, divided by batch_size.
  * Increments g_opt_step once (one optimizer step per batch). */
 void model_batch_apply(Model *m, float lr, int batch_size);
+
 
 #endif /* LAL_RUNTIME_H */

@@ -8,6 +8,7 @@
  * Models only need Level 3 — just config + weight key patterns.
  */
 #include "lal_runtime.h"
+#include "lal_concept_attn.h"
 #ifdef LAL_CUDA
 #include "lal_cuda.h"
 
@@ -4457,3 +4458,704 @@ void model_set_sliding_window(Model *m, int window, int n_sinks) {
     printf("[*] sliding window configured: W=%d, sinks=%d (effective context: %d)\n",
            window, n_sinks, window + n_sinks);
 }
+
+/* ========================================================================
+ * ========================================================================
+ * Concept-Aware Attention (基于「理解(概念-边界) + 推理(关系演化)」框架)
+ * ========================================================================
+ * ========================================================================
+ * 四层设计实现：
+ *   Layer 1: 基于概念边界的语义片段切分 + segment-messenger
+ *   Layer 2: 关系强度门控（概念边界预筛选）
+ *   Layer 3: 异构多头算力分配（不同头不同访问域）
+ *   Layer 4: 推理侧 KV-Cache 概念复用（含信使 cache）
+ *
+ * 设计原点：
+ *   - 注意力的计算开销来自"两两概念对的关系匹配"
+ *   - 优化原则：保留真实需要建立关系的概念对的完整 Q-K 匹配
+ *   - 对于边界隔离、本就弱关系的概念对，要么过滤，要么走信使间接通信
+ *
+ * 本优化只改造理解阶段(Attention)的信息交互通路，不改动 FFN 推理演化逻辑。
+ * ======================================================================== */
+
+/* 全局概念感知注意力配置（默认关闭，需显式开启） */
+ConceptAttnConfig g_concept_attn_cfg = {0};
+
+/* 全局信使缓存（每层一个，按 layer_idx 索引） */
+MessengerCache *g_messenger_caches = NULL;
+static int g_messenger_caches_n_layer = 0;
+
+/* ─── Layer 1: Messenger Cache Management ─────────────────────── */
+
+void messenger_cache_alloc(MessengerCache *mc, int segment_capacity,
+                           int num_messengers, int n_embd) {
+    if (!mc || segment_capacity <= 0 || num_messengers <= 0 || n_embd <= 0) {
+        if (mc) memset(mc, 0, sizeof(*mc));
+        return;
+    }
+    mc->segment_capacity = segment_capacity;
+    mc->num_messengers   = num_messengers;
+    mc->n_embd           = n_embd;
+    mc->n_filled         = 0;
+    size_t total = (size_t)segment_capacity * num_messengers * n_embd;
+    mc->messenger_k = (float *)calloc(total, sizeof(float));
+    mc->messenger_v = (float *)calloc(total, sizeof(float));
+    mc->segment_filled = (uint8_t *)calloc(segment_capacity, sizeof(uint8_t));
+    if (!mc->messenger_k || !mc->messenger_v || !mc->segment_filled) {
+        fprintf(stderr, "[!] messenger_cache_alloc: OOM (cap=%d, S=%d, d=%d)\n",
+                segment_capacity, num_messengers, n_embd);
+        messenger_cache_free(mc);
+    }
+}
+
+void messenger_cache_free(MessengerCache *mc) {
+    if (!mc) return;
+    free(mc->messenger_k);
+    free(mc->messenger_v);
+    free(mc->segment_filled);
+    memset(mc, 0, sizeof(*mc));
+}
+
+void messenger_cache_reset(MessengerCache *mc) {
+    if (!mc || mc->segment_capacity <= 0) return;
+    size_t total = (size_t)mc->segment_capacity * mc->num_messengers * mc->n_embd;
+    if (mc->messenger_k) memset(mc->messenger_k, 0, total * sizeof(float));
+    if (mc->messenger_v) memset(mc->messenger_v, 0, total * sizeof(float));
+    if (mc->segment_filled) memset(mc->segment_filled, 0, mc->segment_capacity);
+    mc->n_filled = 0;
+}
+
+/* ─── Layer 1: Segment Messenger Generation ──────────────────────
+ * 在每个 segment 内部，基于本片段全部 V，聚合生成少量信使向量。
+ * 信使是本片段全部概念与关系状态的压缩载体。
+ *
+ * 聚合策略：均匀分桶 + 均值池化
+ *   - 将片段内 V[0..seg_len-1] 均匀分成 num_messengers 个桶
+ *   - 每个桶内做均值池化，得到一个信使向量
+ *   - 信使的 K = 信使的 V（自关联，简化）
+ *
+ * 语义意义：远方片段的整体语义，由信使代为表达。
+ *          普通token通过信使间接获得远方概念集合的状态。
+ */
+void generate_segment_messengers(const float *v_seg, int seg_len, int n_embd,
+                                 int num_messengers,
+                                 float *out_k, float *out_v) {
+    if (!v_seg || !out_k || !out_v || seg_len <= 0 || n_embd <= 0 || num_messengers <= 0)
+        return;
+
+    /* 均匀分桶：每个桶覆盖 [bucket_start, bucket_end) */
+    for (int m = 0; m < num_messengers; m++) {
+        int bucket_start = (int)((long long)m * seg_len / num_messengers);
+        int bucket_end   = (int)((long long)(m + 1) * seg_len / num_messengers);
+        if (bucket_end <= bucket_start) bucket_end = bucket_start + 1;
+        if (bucket_end > seg_len) bucket_end = seg_len;
+        int bucket_size = bucket_end - bucket_start;
+        if (bucket_size <= 0) bucket_size = 1;
+
+        /* 均值池化 */
+        float *k_dst = out_k + (size_t)m * n_embd;
+        float *v_dst = out_v + (size_t)m * n_embd;
+        float inv = 1.0f / (float)bucket_size;
+        for (int d = 0; d < n_embd; d++) {
+            float sum = 0.0f;
+            for (int t = bucket_start; t < bucket_end; t++) {
+                sum += v_seg[(size_t)t * n_embd + d];
+            }
+            float val = sum * inv;
+            v_dst[d] = val;
+            k_dst[d] = val;  /* 信使 K = V（自关联简化） */
+        }
+    }
+}
+
+/* ─── Layer 2: Concept Boundary Gate (关系强度门控) ───────────────
+ * 给定 token-i（Q侧）、token-j（K侧），利用距离先验 + 粗粒度相似度
+ * 快速预判：如果预判两个概念边界隔离，潜在关系极弱，
+ * 直接把该位置置 -inf，不参与完整内积计算。
+ *
+ * 软门控（保留回退通路，避免硬切断长距离指代）：
+ *   sim_coarse = <Q_i, K_j> / (||Q_i|| * ||K_j|| + eps)
+ *   dist_prior = exp(-distance / tau)   // tau = segment_len
+ *   gate_score = sim_coarse + gate_distance_prior * dist_prior * 0.5
+ *   if gate_score < gate_threshold:
+ *       以 (1 - gate_fallback_prob) 概率屏蔽
+ *       以 gate_fallback_prob 概率保留（回退通路）
+ *
+ * 返回：1 = 保留（参与完整 QK 计算），0 = 屏蔽（置 -inf）
+ */
+int concept_boundary_gate(const float *q_i, const float *k_j,
+                          int head_dim, int distance,
+                          const ConceptAttnConfig *cfg) {
+    if (!cfg->gate_enable) return 1;  /* 门控禁用，全部保留 */
+
+    /* 计算粗粒度余弦相似度（用前 1/4 维度做快速预判，省算力） */
+    int coarse_dim = head_dim > 16 ? head_dim / 4 : head_dim;
+    float q_norm = 0.0f, k_norm = 0.0f, dot = 0.0f;
+    for (int d = 0; d < coarse_dim; d++) {
+        dot    += q_i[d] * k_j[d];
+        q_norm += q_i[d] * q_i[d];
+        k_norm += k_j[d] * k_j[d];
+    }
+    q_norm = sqrtf(q_norm + 1e-8f);
+    k_norm = sqrtf(k_norm + 1e-8f);
+    float sim_coarse = dot / (q_norm * k_norm + 1e-8f);
+
+    /* 距离先验：距离越远，门控越严（但不是硬截断） */
+    float dist_prior = 1.0f;
+    if (cfg->gate_distance_prior && distance > 0) {
+        float tau = (float)(cfg->segment_len > 0 ? cfg->segment_len : 64);
+        dist_prior = expf(-(float)distance / tau);
+    }
+
+    /* 综合门控分数 */
+    float gate_score = sim_coarse;
+    if (cfg->gate_distance_prior) {
+        gate_score += 0.5f * dist_prior;  /* 距离近的 token 有先验加分 */
+    }
+
+    /* 软门控判定 */
+    if (gate_score < cfg->gate_threshold) {
+        /* 概率回退通路：用 hash(distance, sim) 做确定性伪随机，
+         * 避免引入 rand() 影响可复现性 */
+        unsigned int hash = (unsigned int)(distance * 2654435761u);
+        hash ^= (unsigned int)((sim_coarse + 1000.0f) * 10000.0f);
+        hash = (hash * 40503u) ^ (hash >> 7);
+        float r = (float)(hash & 0xFFFF) / 65535.0f;
+        if (r < cfg->gate_fallback_prob) {
+            return 1;  /* 回退通路：保留，避免切断长距离指代 */
+        }
+        return 0;  /* 屏蔽：概念边界隔离，不参与完整 QK 计算 */
+    }
+    return 1;  /* 保留：可能存在有效关系 */
+}
+
+/* ─── Layer 3: Heterogeneous Head Access Configuration ───────────
+ * 不同类型关系本身就有不同的"概念交互范围"，不需要统一全序列扫描。
+ *   - 头A：局部语法关系（主谓宾、修饰）：强局部性，适合小窗口。
+ *   - 头B：指代、实体绑定：偶尔需要长距离跳跃。
+ *   - 头C：因果、时序关系：中等范围依赖。
+ */
+HeadAccessType get_head_access_type(int head_idx, int n_head,
+                                    const ConceptAttnConfig *cfg) {
+    if (!cfg->hetero_enable) return HEAD_GLOBAL;  /* 异构禁用，全部全局 */
+
+    int n_local = cfg->n_local_heads;
+    int n_messenger = cfg->n_messenger_heads;
+    /* 自动分配：local = n_head/2, messenger = n_head/4, global = 剩余 */
+    if (n_local < 0)     n_local = n_head / 2;
+    if (n_messenger < 0) n_messenger = (n_head - n_local) / 2;
+    if (n_local + n_messenger > n_head) n_local = n_head / 2;
+
+    if (head_idx < n_local)                   return HEAD_LOCAL;
+    if (head_idx < n_local + n_messenger)     return HEAD_MESSENGER;
+    return HEAD_GLOBAL;
+}
+
+int get_head_window(int head_idx, int n_head, int base_window,
+                    const ConceptAttnConfig *cfg) {
+    if (!cfg->hetero_enable) return base_window;
+    HeadAccessType t = get_head_access_type(head_idx, n_head, cfg);
+    switch (t) {
+        case HEAD_LOCAL:     return base_window / 2;  /* 局部语法头：更小窗口 */
+        case HEAD_MESSENGER: return base_window;       /* 指代/因果头：标准窗口 */
+        case HEAD_GLOBAL:    return base_window * 2;   /* 全局头：更大窗口 */
+        default:             return base_window;
+    }
+}
+
+int head_can_access_messenger(int head_idx, int n_head,
+                              const ConceptAttnConfig *cfg) {
+    if (!cfg->hetero_enable) return 1;  /* 异构禁用，所有头都可访问信使 */
+    HeadAccessType t = get_head_access_type(head_idx, n_head, cfg);
+    return (t == HEAD_MESSENGER || t == HEAD_GLOBAL);
+}
+
+/* ─── Layer 4: Concept-Aware Attention Forward (主入口) ───────────
+ * 概念感知注意力前向传播。整合四层优化：
+ *   1. 切成语义片段（segment_len）
+ *   2. 片段内部：完整 QKV，充分做片段内概念理解
+ *   3. 生成本片段信使：聚合本片段全部概念-关系状态
+ *   4. 本片段普通 token：只和【局部窗口 + 本片段信使 + 邻近片段信使】做匹配
+ *   5. 关系门控：过滤边界隔离的概念对（Layer 2）
+ *   6. 异构多头：不同头不同访问域（Layer 3）
+ *   7. KV-Cache：历史 K/V 直接复用，信使也进 cache（Layer 4）
+ *
+ * 数学复杂度（设片段长度 L，每个片段信使数目 S，S << L）：
+ *   - 片段内部：O(n L d)
+ *   - 信使交互：O((n/L * S)^2 d)，该项很小
+ *   - 普通token与信使：O(n * S * d)，远小于 O(n^2 d)
+ */
+void attention_forward_concept(float *attn_out, const float *qkv,
+                               int n_embd, int n_head, int seq_pos,
+                               float *k_cache, float *v_cache,
+                               int n_ctx,
+                               const ConceptAttnConfig *cfg,
+                               MessengerCache *mc) {
+    /* 主开关关闭 → 回退到标准 attention_forward */
+    if (!cfg || !cfg->enable) {
+        attention_forward(attn_out, qkv, n_embd, n_head, seq_pos,
+                          k_cache, v_cache);
+        return;
+    }
+    (void)n_ctx;  /* 概念注意力内部用 seq_pos 直接索引 cache，n_ctx 仅用于片段切分参考 */
+
+    int head_dim = n_embd / n_head;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    const float *Q = qkv;
+    const float *K_new = qkv + n_embd;
+    const float *V_new = qkv + 2 * n_embd;
+
+    /* Layer 4: 写入 KV-Cache（与标准 attention_forward 一致） */
+    int cache_pos = seq_pos % n_ctx;
+    memcpy(k_cache + (size_t)cache_pos * n_embd, K_new, n_embd * sizeof(float));
+    memcpy(v_cache + (size_t)cache_pos * n_embd, V_new, n_embd * sizeof(float));
+
+    /* Layer 1: 片段切分 + 信使生成
+     * 当前 token 属于片段 seg_idx = seq_pos / segment_len
+     * 当一个片段的最后一个 token 处理完时，生成本片段的信使 */
+    int seg_len = cfg->segment_len > 0 ? cfg->segment_len : n_ctx;
+    int seg_idx = seq_pos / seg_len;
+    int seg_start = seg_idx * seg_len;
+    int seg_end = seg_start + seg_len;
+    if (seg_end > seq_pos + 1) seg_end = seq_pos + 1;  /* 当前片段尚未填满 */
+    if (seg_end > n_ctx) seg_end = n_ctx;
+    int actual_seg_len = seg_end - seg_start;
+
+    /* Layer 1: 当片段填满时（actual_seg_len == seg_len）或这是该片段最后一个 token
+     * 时，生成/更新该片段的信使 */
+    int is_seg_complete = (actual_seg_len >= seg_len) ||
+                          (seq_pos == n_ctx - 1) ||
+                          ((seq_pos + 1) % seg_len == 0 && seq_pos > 0);
+
+    if (mc && cfg->num_messengers > 0 && is_seg_complete && actual_seg_len > 0) {
+        if (seg_idx < mc->segment_capacity && !mc->segment_filled[seg_idx]) {
+            /* 从 v_cache 取本片段的 V，生成信使 */
+            float *v_seg = v_cache + (size_t)seg_start * n_embd;
+            float *mk = mc->messenger_k + (size_t)seg_idx * cfg->num_messengers * n_embd;
+            float *mv = mc->messenger_v + (size_t)seg_idx * cfg->num_messengers * n_embd;
+            generate_segment_messengers(v_seg, actual_seg_len, n_embd,
+                                        cfg->num_messengers, mk, mv);
+            mc->segment_filled[seg_idx] = 1;
+            if (seg_idx + 1 > mc->n_filled) mc->n_filled = seg_idx + 1;
+        }
+    }
+
+    /* 构建当前 token 的注意力候选集：
+     *   - 局部窗口：[max(0, seq_pos - window), seq_pos]
+     *   - 本片段信使（如果当前片段已完成）
+     *   - 邻近片段信使（前 messenger_neighbors 个已完成的片段）
+     *   - 全局头：可以访问全部已生成信使
+     *
+     * 注意：候选集大小受限于 scratch buffer（10240） */
+    int n_attend = 0;
+    int pos_list[10240];
+    int is_messenger[10240];  /* 标记该位置是信使还是普通 token */
+
+    for (int h = 0; h < n_head; h++) {
+        HeadAccessType htype = get_head_access_type(h, n_head, cfg);
+        int window = get_head_window(h, n_head,
+                                     cfg->gate_window > 0 ? cfg->gate_window : 64,
+                                     cfg);
+        if (window < 1) window = 1;
+
+        /* 构建候选位置列表 */
+        n_attend = 0;
+        /* 1. 局部窗口（因果：只看 seq_pos 之前 + 自己） */
+        int win_start = seq_pos - window + 1;
+        if (win_start < 0) win_start = 0;
+        for (int j = win_start; j <= seq_pos && n_attend < 10240; j++) {
+            pos_list[n_attend] = j;
+            is_messenger[n_attend] = -1;  /* -1 = 普通 token, >=0 = 信使索引 */
+            n_attend++;
+        }
+
+        /* 2. 本片段信使 + 邻近片段信使（仅 MESSENGER/GLOBAL 头） */
+        int can_msg = head_can_access_messenger(h, n_head, cfg);
+        if (can_msg && mc && cfg->num_messengers > 0) {
+            int n_neighbor = cfg->messenger_neighbors > 0 ? cfg->messenger_neighbors : 2;
+            /* 邻近片段：seg_idx - n_neighbor .. seg_idx - 1（已完成的） */
+            int neighbor_start = seg_idx - n_neighbor;
+            if (neighbor_start < 0) neighbor_start = 0;
+            for (int s = neighbor_start; s <= seg_idx && n_attend < 10240; s++) {
+                if (s >= mc->segment_capacity) break;
+                if (!mc->segment_filled[s]) continue;
+                /* 该片段的每个信使都加入候选集 */
+                for (int m = 0; m < cfg->num_messengers && n_attend < 10240; m++) {
+                    /* 用特殊编码标记信使：pos = -1, messenger_idx = s * num_messengers + m */
+                    pos_list[n_attend] = -1;  /* 标记为信使 */
+                    is_messenger[n_attend] = s * cfg->num_messengers + m;
+                    n_attend++;
+                }
+            }
+        }
+
+        /* 全局头：访问全部已生成信使（不限邻近） */
+        if (htype == HEAD_GLOBAL && mc && cfg->num_messengers > 0) {
+            for (int s = 0; s < mc->n_filled && n_attend < 10240; s++) {
+                if (s >= mc->segment_capacity) break;
+                if (!mc->segment_filled[s]) continue;
+                /* 跳过已在邻近列表中的（避免重复） */
+                int n_neighbor = cfg->messenger_neighbors > 0 ? cfg->messenger_neighbors : 2;
+                int neighbor_start = seg_idx - n_neighbor;
+                if (neighbor_start < 0) neighbor_start = 0;
+                if (s >= neighbor_start && s <= seg_idx) continue;
+                for (int m = 0; m < cfg->num_messengers && n_attend < 10240; m++) {
+                    pos_list[n_attend] = -1;
+                    is_messenger[n_attend] = s * cfg->num_messengers + m;
+                    n_attend++;
+                }
+            }
+        }
+
+        if (n_attend == 0) {
+            /* 至少关注自己 */
+            pos_list[0] = seq_pos;
+            is_messenger[0] = -1;
+            n_attend = 1;
+        }
+
+        /* 计算注意力分数 */
+        const float *Q_h = Q + h * head_dim;
+        float scores[10240];
+        float max_score = -1e30f;
+
+        for (int i = 0; i < n_attend; i++) {
+            const float *K_jh;
+            if (is_messenger[i] >= 0) {
+                /* 信使 K */
+                int msg_idx = is_messenger[i];
+                K_jh = mc->messenger_k + (size_t)msg_idx * n_embd + h * head_dim;
+            } else {
+                /* 普通 token K（从 KV cache） */
+                int j = pos_list[i];
+                int phys_j = j % n_ctx;
+                K_jh = k_cache + (size_t)phys_j * n_embd + h * head_dim;
+            }
+
+            /* Layer 2: 关系强度门控（仅对普通 token，信使总是保留） */
+            if (is_messenger[i] < 0 && cfg->gate_enable) {
+                int j = pos_list[i];
+                int distance = seq_pos - j;
+                if (!concept_boundary_gate(Q_h, K_jh, head_dim, distance, cfg)) {
+                    scores[i] = -1e30f;  /* 屏蔽 */
+                    continue;
+                }
+            }
+
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) dot += Q_h[d] * K_jh[d];
+            dot *= scale;
+            scores[i] = dot;
+            if (dot > max_score) max_score = dot;
+        }
+
+        /* Softmax */
+        float sum_exp = 0.0f;
+        float attn_w[10240];
+        for (int i = 0; i < n_attend; i++) {
+            float e = expf(scores[i] - max_score);
+            attn_w[i] = e;
+            sum_exp += e;
+        }
+        float inv_sum = 1.0f / (sum_exp + 1e-12f);
+        for (int i = 0; i < n_attend; i++) attn_w[i] *= inv_sum;
+
+        /* 加权求和 V */
+        float *out_h = attn_out + h * head_dim;
+        for (int d = 0; d < head_dim; d++) out_h[d] = 0.0f;
+        for (int i = 0; i < n_attend; i++) {
+            if (scores[i] <= -1e29f) continue;  /* 被门控屏蔽的跳过 */
+            const float *V_jh;
+            if (is_messenger[i] >= 0) {
+                int msg_idx = is_messenger[i];
+                V_jh = mc->messenger_v + (size_t)msg_idx * n_embd + h * head_dim;
+            } else {
+                int j = pos_list[i];
+                int phys_j = j % n_ctx;
+                V_jh = v_cache + (size_t)phys_j * n_embd + h * head_dim;
+            }
+            float w = attn_w[i];
+            for (int d = 0; d < head_dim; d++) out_h[d] += w * V_jh[d];
+        }
+    }
+}
+
+/* ─── Layer 4: Concept-Aware Attention Backward ──────────────────
+ * 概念感知注意力反向传播。计算当前 token 的 Q/K/V 梯度。
+ * 缓存的 K/V（位置 0..seq_pos-1）视为常量（与 attention_backward 一致）。
+ * 信使视为常量（不回传梯度到信使生成路径，简化实现）。
+ */
+void attention_backward_concept(float *grad_qkv, const float *grad_attn_out,
+                                const float *qkv, int n_embd, int n_head,
+                                int seq_pos,
+                                const float *k_cache, const float *v_cache,
+                                int n_ctx,
+                                const ConceptAttnConfig *cfg,
+                                MessengerCache *mc) {
+    /* 主开关关闭 → 回退到标准 attention_backward */
+    if (!cfg || !cfg->enable) {
+        attention_backward(grad_qkv, grad_attn_out, qkv, n_embd, n_head,
+                           seq_pos, k_cache, v_cache);
+        return;
+    }
+    (void)n_ctx;
+
+    int head_dim = n_embd / n_head;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    const float *Q = qkv;
+    float *gQ = grad_qkv;
+    float *gK = grad_qkv + n_embd;
+    float *gV = grad_qkv + 2 * n_embd;
+    memset(grad_qkv, 0, 3 * n_embd * sizeof(float));
+
+    int seg_len = cfg->segment_len > 0 ? cfg->segment_len : n_ctx;
+    int seg_idx = seq_pos / seg_len;
+
+    for (int h = 0; h < n_head; h++) {
+        HeadAccessType htype = get_head_access_type(h, n_head, cfg);
+        int window = get_head_window(h, n_head,
+                                     cfg->gate_window > 0 ? cfg->gate_window : 64,
+                                     cfg);
+        if (window < 1) window = 1;
+        const float *Q_h = Q + h * head_dim;
+        const float *g_out_h = grad_attn_out + h * head_dim;
+
+        /* 重建候选集（与前向一致） */
+        int n_attend = 0;
+        int pos_list[10240];
+        int is_messenger[10240];
+
+        int win_start = seq_pos - window + 1;
+        if (win_start < 0) win_start = 0;
+        for (int j = win_start; j <= seq_pos && n_attend < 10240; j++) {
+            pos_list[n_attend] = j;
+            is_messenger[n_attend] = -1;  /* -1 = 普通 token, >=0 = 信使索引 */
+            n_attend++;
+        }
+
+        int can_msg = head_can_access_messenger(h, n_head, cfg);
+        if (can_msg && mc && cfg->num_messengers > 0) {
+            int n_neighbor = cfg->messenger_neighbors > 0 ? cfg->messenger_neighbors : 2;
+            int neighbor_start = seg_idx - n_neighbor;
+            if (neighbor_start < 0) neighbor_start = 0;
+            for (int s = neighbor_start; s <= seg_idx && n_attend < 10240; s++) {
+                if (s >= mc->segment_capacity) break;
+                if (!mc->segment_filled[s]) continue;
+                for (int m = 0; m < cfg->num_messengers && n_attend < 10240; m++) {
+                    pos_list[n_attend] = -1;
+                    is_messenger[n_attend] = s * cfg->num_messengers + m;
+                    n_attend++;
+                }
+            }
+        }
+
+        if (htype == HEAD_GLOBAL && mc && cfg->num_messengers > 0) {
+            for (int s = 0; s < mc->n_filled && n_attend < 10240; s++) {
+                if (s >= mc->segment_capacity) break;
+                if (!mc->segment_filled[s]) continue;
+                int n_neighbor = cfg->messenger_neighbors > 0 ? cfg->messenger_neighbors : 2;
+                int neighbor_start = seg_idx - n_neighbor;
+                if (neighbor_start < 0) neighbor_start = 0;
+                if (s >= neighbor_start && s <= seg_idx) continue;
+                for (int m = 0; m < cfg->num_messengers && n_attend < 10240; m++) {
+                    pos_list[n_attend] = -1;
+                    is_messenger[n_attend] = s * cfg->num_messengers + m;
+                    n_attend++;
+                }
+            }
+        }
+
+        if (n_attend == 0) {
+            pos_list[0] = seq_pos;
+            is_messenger[0] = -1;
+            n_attend = 1;
+        }
+
+        /* 重算 scores + softmax（K 在 cache 中） */
+        float scores[10240], w[10240], g_w[10240];
+        float max_score = -1e30f;
+        for (int i = 0; i < n_attend; i++) {
+            const float *K_jh;
+            if (is_messenger[i] >= 0) {
+                int msg_idx = is_messenger[i];
+                K_jh = mc->messenger_k + (size_t)msg_idx * n_embd + h * head_dim;
+            } else {
+                int j = pos_list[i];
+                int phys_j = j % n_ctx;
+                K_jh = k_cache + (size_t)phys_j * n_embd + h * head_dim;
+            }
+            if (is_messenger[i] < 0 && cfg->gate_enable) {
+                int j = pos_list[i];
+                int distance = seq_pos - j;
+                if (!concept_boundary_gate(Q_h, K_jh, head_dim, distance, cfg)) {
+                    scores[i] = -1e30f;
+                    continue;
+                }
+            }
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) dot += Q_h[d] * K_jh[d];
+            dot *= scale;
+            scores[i] = dot;
+            if (dot > max_score) max_score = dot;
+        }
+
+        float sum_exp = 0.0f;
+        for (int i = 0; i < n_attend; i++) {
+            float e = expf(scores[i] - max_score);
+            w[i] = e; sum_exp += e;
+        }
+        float inv = 1.0f / (sum_exp + 1e-12f);
+        for (int i = 0; i < n_attend; i++) w[i] *= inv;
+
+        /* g_w[i] = <g_out, V_i> */
+        float dot_gw_w = 0.0f;
+        for (int i = 0; i < n_attend; i++) {
+            if (scores[i] <= -1e29f) { g_w[i] = 0.0f; continue; }
+            const float *V_jh;
+            if (is_messenger[i] >= 0) {
+                int msg_idx = is_messenger[i];
+                V_jh = mc->messenger_v + (size_t)msg_idx * n_embd + h * head_dim;
+            } else {
+                int j = pos_list[i];
+                int phys_j = j % n_ctx;
+                V_jh = v_cache + (size_t)phys_j * n_embd + h * head_dim;
+            }
+            float g = 0.0f;
+            for (int d = 0; d < head_dim; d++) g += g_out_h[d] * V_jh[d];
+            g_w[i] = g;
+            dot_gw_w += g * w[i];
+        }
+
+        /* g_scores[i] = w[i] * (g_w[i] - <g_w, w>) */
+        float g_scores[10240];
+        for (int i = 0; i < n_attend; i++) {
+            g_scores[i] = (scores[i] <= -1e29f) ? 0.0f : w[i] * (g_w[i] - dot_gw_w);
+        }
+
+        /* g_Q[d] += sum_i g_scores[i] * K_i[d] * scale */
+        float *gQ_h = gQ + h * head_dim;
+        for (int i = 0; i < n_attend; i++) {
+            if (g_scores[i] == 0.0f) continue;
+            const float *K_jh;
+            if (is_messenger[i] >= 0) {
+                int msg_idx = is_messenger[i];
+                K_jh = mc->messenger_k + (size_t)msg_idx * n_embd + h * head_dim;
+            } else {
+                int j = pos_list[i];
+                int phys_j = j % n_ctx;
+                K_jh = k_cache + (size_t)phys_j * n_embd + h * head_dim;
+            }
+            float gs = g_scores[i] * scale;
+            for (int d = 0; d < head_dim; d++) gQ_h[d] += gs * K_jh[d];
+        }
+
+        /* 当前 token 的 K/V 梯度（只在 seq_pos 在候选集中时） */
+        int self_idx = -1;
+        for (int i = 0; i < n_attend; i++) {
+            if (is_messenger[i] < 0 && pos_list[i] == seq_pos) {
+                self_idx = i;
+                break;
+            }
+        }
+        if (self_idx >= 0) {
+            /* g_K_cur[d] += g_scores[self_idx] * Q[d] * scale */
+            float *gK_h = gK + h * head_dim;
+            float gs = g_scores[self_idx] * scale;
+            for (int d = 0; d < head_dim; d++) gK_h[d] += gs * Q_h[d];
+
+            /* g_V_cur[d] += w[self_idx] * g_out[d] */
+            float *gV_h = gV + h * head_dim;
+            float w_self = w[self_idx];
+            for (int d = 0; d < head_dim; d++) gV_h[d] += w_self * g_out_h[d];
+        }
+    }
+}
+
+/* ─── Integration Guide: trans_layer_forward_concept ─────────────
+ * trans_layer_forward 的实现包含比例缩放、残差归一化等复杂逻辑，
+ * 完整复制易引入 bug。推荐集成方式：
+ *
+ *   在现有 trans_layer_forward() 中，将 attention_forward 调用替换为：
+ *
+ *     if (g_concept_attn_cfg.enable && g_messenger_caches) {
+ *         attention_forward_concept(act->attn_out, qkv_ptr,
+ *                                    n, cfg->n_head, abs_pos,
+ *                                    tl->kv_k, tl->kv_v, cfg->n_ctx,
+ *                                    &g_concept_attn_cfg,
+ *                                    &g_messenger_caches[layer_idx]);
+ *     } else {
+ *         attention_forward(act->attn_out, qkv_ptr, n, cfg->n_head,
+ *                            abs_pos, tl->kv_k, tl->kv_v);
+ *     }
+ *
+ *   反向传播同理：将 attention_backward 替换为 attention_backward_concept。
+ *
+ *   通过 model_set_concept_attn() 在运行时配置，无需修改模型结构。
+ * ──────────────────────────────────────────────────────────────────── */
+
+/* ─── Global Messenger Cache Management (per-layer) ──────────────
+ * 在 model_load 时分配，model_free 时释放。
+ * 每层一个 MessengerCache，按 layer_idx 索引。
+ */
+void model_messenger_caches_alloc(Model *m, const ConceptAttnConfig *cfg) {
+    if (!m || !cfg || !cfg->enable) return;
+    int n_layer = m->cfg.n_layer;
+    if (n_layer <= 0) return;
+
+    /* 释放旧的 */
+    if (g_messenger_caches) {
+        for (int i = 0; i < g_messenger_caches_n_layer; i++)
+            messenger_cache_free(&g_messenger_caches[i]);
+        free(g_messenger_caches);
+    }
+
+    int seg_len = cfg->segment_len > 0 ? cfg->segment_len : m->cfg.n_ctx;
+    int seg_capacity = (m->cfg.n_ctx / seg_len) + 2;  /* +2 余量 */
+    g_messenger_caches = (MessengerCache *)calloc(n_layer, sizeof(MessengerCache));
+    if (!g_messenger_caches) {
+        fprintf(stderr, "[!] model_messenger_caches_alloc: OOM\n");
+        return;
+    }
+    g_messenger_caches_n_layer = n_layer;
+    for (int i = 0; i < n_layer; i++) {
+        messenger_cache_alloc(&g_messenger_caches[i], seg_capacity,
+                              cfg->num_messengers, m->cfg.n_embd);
+    }
+    printf("[*] messenger caches allocated: %d layers, cap=%d segments/layer, S=%d messengers/segment\n",
+           n_layer, seg_capacity, cfg->num_messengers);
+}
+
+void model_messenger_caches_free(void) {
+    if (!g_messenger_caches) return;
+    for (int i = 0; i < g_messenger_caches_n_layer; i++)
+        messenger_cache_free(&g_messenger_caches[i]);
+    free(g_messenger_caches);
+    g_messenger_caches = NULL;
+    g_messenger_caches_n_layer = 0;
+}
+
+void model_messenger_caches_reset(void) {
+    if (!g_messenger_caches) return;
+    for (int i = 0; i < g_messenger_caches_n_layer; i++)
+        messenger_cache_reset(&g_messenger_caches[i]);
+}
+
+/* ─── Configure Concept-Aware Attention at Runtime ─────────────── */
+void model_set_concept_attn(Model *m, const ConceptAttnConfig *cfg) {
+    if (!m || !cfg) return;
+    g_concept_attn_cfg = *cfg;
+    if (cfg->enable) {
+        model_messenger_caches_alloc(m, cfg);
+        printf("[*] concept-aware attention enabled: seg_len=%d, S=%d, neighbors=%d, "
+               "gate=%d(threshold=%.3f, fallback=%.4f), hetero=%d(local=%d, msg=%d)\n",
+               cfg->segment_len, cfg->num_messengers, cfg->messenger_neighbors,
+               cfg->gate_enable, cfg->gate_threshold, cfg->gate_fallback_prob,
+               cfg->hetero_enable, cfg->n_local_heads, cfg->n_messenger_heads);
+    } else {
+        model_messenger_caches_free();
+        printf("[*] concept-aware attention disabled (fallback to standard attention)\n");
+    }
+}
+

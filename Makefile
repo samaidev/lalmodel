@@ -35,7 +35,7 @@ else
 endif
 LALC ?= $(PYTHON) compiler/lal.py
 
-.PHONY: all train server qwen-server qwen7b-server float-subset demos verify verify-qwen7b-lal mini-filter clean test-memory test-sparse meta-train meta-train-mem
+.PHONY: all train server qwen-server qwen7b-server float-subset demos verify verify-qwen7b-lal mini-filter clean test-memory test-sparse test-concept meta-train meta-train-mem
 
 all: demos train
 
@@ -208,6 +208,16 @@ build/test_sparse_attn: tests/test_sparse_attn.c runtime/lal_runtime.c runtime/l
 	@mkdir -p build
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_sparse_attn.c runtime/lal_runtime.c -lm
 	@echo "[*] built test_sparse_attn (sparse attention + stateful inference)"
+
+# === Concept-Aware Attention Test (基于「理解(概念-边界) + 推理(关系演化)」框架) ===
+# 四层优化：片段切分+信使 / 关系门控 / 异构多头 / KV-Cache概念复用
+test-concept: build/test_concept_attn
+	./build/test_concept_attn
+
+build/test_concept_attn: tests/test_concept_attn.c runtime/lal_runtime.c runtime/lal_runtime.h runtime/lal_concept_attn.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_concept_attn.c runtime/lal_runtime.c -lm
+	@echo "[*] built test_concept_attn (concept-aware attention: 4-layer optimization)"
 
 # === Semantic-Gated Curriculum Training (LAL-aware Adam + Whitebox Probing) ===
 web-train: web_model_v3
