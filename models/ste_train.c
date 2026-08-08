@@ -32,6 +32,10 @@ static int prompt_tokenize(const char *text, int *tokens, int max_len);
 #include "../runtime/lal_whitebox_probe.h"
 #include "../runtime/lal_inference_tracer.h"
 
+/* v16: 前向声明 generate_text — 训练中途每 N 步自动生成测试 */
+static void generate_text(Model *m, const char *prompt, const int *prompt_ids,
+                          int n_prompt_ids, int max_gen, float temp, int top_k);
+
 /* === 全层 CORE/BINARY/PRUNE 逻辑引导 ===
  *
  * LAL 的核心:每层权重按范数分为三类,各自承担不同语义角色:
@@ -764,6 +768,47 @@ static void deep_whitebox_diagnosis(Model *m) {
     }
     printf("\n\n");
 
+    /* v17: Position embedding (wpe) norm monitoring — detect wpe norm explosion.
+     * wpe is added to wte: x = wte[tok] + wpe[pos]. If wpe norm >> wte norm,
+     * token identity is drowned out → generation is position-driven, not content-driven. */
+    if (m->wpe) {
+        float wte_avg_norm = 0;
+        for (int i = 0; i < n_concepts; i++) {
+            float norm = 0;
+            for (int j = 0; j < n_embd; j++) norm += embs[i][j] * embs[i][j];
+            wte_avg_norm += sqrtf(norm);
+        }
+        wte_avg_norm /= n_concepts;
+
+        int n_ctx = m->cfg.n_ctx;
+        int show = n_ctx < 8 ? n_ctx : 8;
+        float wpe_max_norm = 0, wpe_avg_norm = 0;
+        printf("  Position embedding (wpe) norms [first %d]:\n    ", show);
+        for (int pos = 0; pos < n_ctx; pos++) {
+            float norm = 0;
+            for (int j = 0; j < n_embd; j++) {
+                float v = m->wpe[(size_t)pos * n_embd + j];
+                norm += v * v;
+            }
+            norm = sqrtf(norm);
+            if (norm > wpe_max_norm) wpe_max_norm = norm;
+            wpe_avg_norm += norm;
+            if (pos < show) printf("[%d]=%.3f ", pos, norm);
+        }
+        wpe_avg_norm /= n_ctx;
+        printf("\n    wpe avg=%.3f  max=%.3f  wte avg=%.3f  ratio=%.1fx",
+               wpe_avg_norm, wpe_max_norm, wte_avg_norm,
+               wte_avg_norm > 1e-6f ? wpe_max_norm / wte_avg_norm : 0);
+        if (wte_avg_norm > 1e-6f && wpe_max_norm / wte_avg_norm > 5.0f) {
+            printf("  [FAIL] wpe dominates wte — token signal drowned");
+        } else if (wte_avg_norm > 1e-6f && wpe_max_norm / wte_avg_norm > 2.0f) {
+            printf("  [WEAK] wpe larger than wte");
+        } else {
+            printf("  [OK]");
+        }
+        printf("\n\n");
+    }
+
     /* 反义词 vs 无关概念 平均相似度 */
     float opp_sim = 0, unrelated_sim = 0;
     int n_opp = 0, n_unrel = 0;
@@ -1272,12 +1317,13 @@ static int sample_argmax(const float *logits, int vocab_size) {
 static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
                        int warmup, int batch_size, int max_pos, int eval_interval,
                        float logic_lr, int start_step, int total_schedule_steps,
-                       int logic_only) {  /* v13g: logic_only mode for curriculum stage 1 */
+                       int logic_only, int gen_interval) {  /* v16: gen_interval=中途生成测试间隔 */
     printf("\n=== LAL STE Training (B=%d, max_pos=%d, steps=%d, start_step=%d, total_sched=%d, logic_lr=%.4f, logic_only=%d) ===\n",
            batch_size, max_pos, n_steps, start_step, total_schedule_steps, logic_lr, logic_only);
     printf("[*] STE: forward=sign(w), backward=w_float gradient\n");
     printf("[*] Whitebox probe every %d steps\n", eval_interval);
     printf("[*] Semantic regularization every step\n");
+    printf("[*] Mid-train generation test every %d steps%s\n", gen_interval, gen_interval <= 0 ? " (disabled)" : "");
     if (logic_only) printf("[*] LOGIC-ONLY MODE: skipping CE loss, only concept-pair regularization (curriculum stage 1)\n\n");
 
     struct timespec t0, t1;
@@ -1308,18 +1354,23 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
             for (int b = 0; b < batch_size; b++) {
                 int idx = rand() % dl->n_samples;
                 int n_tok = dataloader_get(dl, idx, batch_tokens[b], 512);
-                if (n_tok < 20) continue;
+                if (n_tok < 6) continue;  /* lowered: allow short dialogue samples */
 
                 int mp = n_tok < max_pos ? n_tok : max_pos;
-                if (mp < 10) continue;
+                if (mp < 4) continue;    /* lowered: min 4 tokens for 1 prediction */
 
-                /* Multi-position prediction: 2 positions per sample (v13i: was 4, reduced for max_pos=256) */
-                int n_preds = 2;
-                int stride = (mp - 6) / n_preds;
+                /* v17: Multi-position prediction — up to 8 positions for better coverage.
+                 * Old: only 2 positions → 75% of tokens get no CE signal → slow learning.
+                 * New: scale n_preds with sequence length, start from position 1.
+                 * mp=4→1pred, mp=8→2, mp=16→4, mp=32+→8 (capped). */
+                int n_preds = mp / 4;
+                if (n_preds < 1) n_preds = 1;
+                if (n_preds > 8) n_preds = 8;
+                int stride = (mp - 2) / n_preds;
                 if (stride < 1) stride = 1;
 
                 for (int p = 0; p < n_preds; p++) {
-                    int pred_pos = 5 + p * stride;
+                    int pred_pos = 1 + p * stride;  /* v17: start from pos 1, not 5 */
                     if (pred_pos >= mp - 1) break;
                     int target = batch_tokens[b][pred_pos + 1];
                     int predicted = 0;
@@ -1403,6 +1454,28 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
         /* 白箱探针:每 10 步检查 CORE/BINARY/PRUNE 逻辑电路 */
         if (step % 10 == 0) {
             whitebox_probe_compact(m);
+        }
+
+        /* v16: 每 gen_interval 步做一次生成测试 — 避免白训 */
+        if (gen_interval > 0 && step > 0 && step % gen_interval == 0) {
+            int saved_adam = g_use_adam;
+            g_use_adam = 0;  /* 生成时关闭 Adam */
+            printf("\n┌─── 中途生成测试 (step %d/%d, global=%d) ───\n", step, n_steps, global_step);
+            const char *test_prompts[] = {
+                "\xe9\x97\xae\xef\xbc\x9a\xe4\xbd\xa0\xe5\xa5\xbd\n\xe7\xad\x94\xef\xbc\x9a",  /* 问：你好\n答： */
+                "\xe9\x97\xae\xef\xbc\x9a\xe4\xbb\x80\xe4\xb9\x88\xe6\x98\xaf\xe7\x81\xab\xef\xbc\x9f\n\xe7\xad\x94\xef\xbc\x9a",  /* 问：什么是火？\n答： */
+                "\xe9\x97\xae\xef\xbc\x9a\xe9\xb8\x9f\xe4\xb8\xba\xe4\xbb\x80\xe4\xb9\x88\xe5\xa4\xa9\xe4\xb8\x8a\xe9\xa3\x9e\xef\xbc\x9f\n\xe7\xad\x94\xef\xbc\x9a",  /* 问：鸟为什么天上飞？\n答： */
+            };
+            const char *test_labels[] = {"你好", "什么是火？", "鸟为什么天上飞？"};
+            for (int ti = 0; ti < 3; ti++) {
+                printf("│ [Q] %s\n", test_labels[ti]);
+                printf("│ ");
+                generate_text(m, test_prompts[ti], NULL, 0, 30, 0.3f, 8);
+                printf("\n");
+            }
+            printf("└─── 中途生成测试结束 ---\n\n");
+            g_use_adam = saved_adam;  /* 恢复训练状态 */
+            fflush(stdout);
         }
 
         /* 逻辑引导已在 model_batch_apply 前累加梯度 */
@@ -1883,7 +1956,14 @@ static void generate_text(Model *m, const char *prompt, const int *prompt_ids,
     g_use_adam = 0;
     g_use_pure_float = 1;  /* 生成用 pure_float(完整浮点),避免 bin_forward 二值化丢失输入区分度 */
     g_use_real_attention = 1;
-    g_skip_wv = 1;  /* v13l: match training — skip W_v projection */
+    /* v19: 默认使用真实因果多头注意力(上下文混合).
+     * g_skip_wv=1 会完全跳过注意力, 模型只做逐位置变换, 无法理解上下文.
+     * 如果需要回退到旧的 V-copy 模式(仅用于调试), 设 LAL_SKIP_WV=1. */
+    g_skip_wv = 0;  /* v19: 默认真实注意力 */
+    {
+        const char *sv = getenv("LAL_SKIP_WV");
+        if (sv) g_skip_wv = atoi(sv);
+    }
 
     int prompt_tokens[512];
     int prompt_len;
@@ -2050,7 +2130,19 @@ int main(int argc, char **argv) {
     int start_step = 0;    /* --start-step: 续训时跳过的步数,用于正确恢复 LR schedule */
     int total_schedule_steps = 0; /* --total-steps: LR schedule 总步数 (0=用 n_steps) */
     const char *data_path = "data/dialogue_bpe.bin";  /* 对话+认知合并数据(唯一正确数据) */
-    const char *weights_path = "/tmp/lal_ste_model.bin";
+    /* v20: 跨平台临时路径 — Windows 没有 /tmp, 用 %TEMP% 或当前目录 */
+    char weights_path_buf[512];
+#ifdef _WIN32
+    {
+        const char *tmp = getenv("TEMP");
+        if (!tmp) tmp = getenv("TMP");
+        if (!tmp) tmp = ".";
+        snprintf(weights_path_buf, sizeof(weights_path_buf), "%s\\lal_ste_model.bin", tmp);
+    }
+#else
+    snprintf(weights_path_buf, sizeof(weights_path_buf), "/tmp/lal_ste_model.bin");
+#endif
+    const char *weights_path = weights_path_buf;
     const char *save_path = "model_dialogue.ste";  /* 默认落盘名, 避免忘了 --save */
     const char *resume_path = NULL; /* --resume: 加载已训练权重续训 */
     const char *prompt = "\xe7\x81\xab\xe6\x98\xaf\xe4\xbb\x80\xe4\xb9\x88";  /* 火是什么 */
@@ -2061,6 +2153,7 @@ int main(int argc, char **argv) {
     float temp = 0.4f;
     int top_k = 8;
     int logic_only = 0;  /* v13g: --logic-only, 课程学习 stage 1 只训概念对不训 CE */
+    int gen_interval = 100;  /* v16: 每 N 步中途生成测试 (0=关闭) */
     /* v15: 原生推理概念链默认开启 —— LAL 的核心形态(纯 wte 余弦, 不走 transformer 前向).
      * diagnose 模式(n_steps==0)下自动跑, 无需手动加 --native-chain. */
     int native_chain = 1; /* 默认开启 LAL 原生推理概念链 */
@@ -2098,7 +2191,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--resume") && i+1 < argc) resume_path = argv[++i];
         else if (!strcmp(argv[i], "--diagnose-only")) { n_steps = 0; }
         else if (!strcmp(argv[i], "--logic-only")) { logic_only = 1; }  /* v13g */
+        else if (!strcmp(argv[i], "--gen-interval") && i+1 < argc) gen_interval = atoi(argv[++i]);  /* v16 */
+        else if (!strcmp(argv[i], "--no-gen-test")) gen_interval = 0;  /* v16: 关闭中途生成测试 */
         else if (!strcmp(argv[i], "--tokenizer") && i+1 < argc) tokenizer_path = argv[++i];
+        else if (!strcmp(argv[i], "--weights") && i+1 < argc) weights_path = argv[++i];  /* v20: 覆盖临时权重路径 */
         else if (!strcmp(argv[i], "--native-chain")) { native_chain = 1; }
         else if (!strcmp(argv[i], "--native-topk") && i+1 < argc) native_topk = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--native-depth") && i+1 < argc) native_depth = atoi(argv[++i]);
@@ -2114,6 +2210,7 @@ int main(int argc, char **argv) {
                    "  --start-step N    Skip N steps for LR schedule (used with --resume for chunked training)\n"
                    "  --total-steps N   Total steps for LR schedule (default: --steps; set larger for chunked training)\n"
                    "  --data PATH       Data .bin path (default: data/dialogue_bpe.bin)\n"
+                   "  --weights PATH    Temp weights .bin path (default: auto /tmp or %%TEMP%%)\n"
                    "  --tokenizer PATH  Tokenizer .vocab path (default: tokenizer/chinese_bpe.vocab)\n"
                    "  --save PATH       Save trained weights to .ste file (default: model_dialogue.ste)\n"
                    "  --resume PATH     Load .ste weights and continue training\n"
@@ -2122,6 +2219,8 @@ int main(int argc, char **argv) {
                    "  --max-gen N       Max generation tokens (default 40)\n"
                    "  --temp F          Sampling temperature (default 0.4)\n"
                    "  --no-generate     Skip generation\n"
+                   "  --gen-interval N  Mid-train generation test every N steps (default 100, 0=off)\n"
+                   "  --no-gen-test     Disable mid-train generation test\n"
                    "  --native-chain    LAL native reasoning: print concept chain via wte cosine (no forward) [默认已开启]\n"
                    "  --native-topk N   Concepts per chain layer (default 3)\n"
                    "  --native-depth N  Chain expansion depth (default 2)\n"
@@ -2176,7 +2275,19 @@ int main(int argc, char **argv) {
     /* 模型 Phase 选择: 0=8L/448d(22M), 1=10L/512d(35M), 2=12L/576d(50M), 3=14L/640d(68M) */
     if (phase_idx < 0 || phase_idx >= N_GROWTH_PHASES) phase_idx = 0;
     printf("[*] Using %s (~%ldM params, vocab=%d)\n", growth_phases[phase_idx].name, growth_phases[phase_idx].est_params, vocab_size);
+    printf("[*] Temp weights path: %s\n", weights_path);
     gen_phase_weights(weights_path, &growth_phases[phase_idx], vocab_size);
+    /* v20: 如果主路径写入失败(gen_phase_weights 内部会回退), 检查文件是否存在 */
+    {
+        FILE *check = fopen(weights_path, "rb");
+        if (!check) {
+            /* gen_phase_weights 回退到了 ./lal_ste_model.bin */
+            weights_path = "lal_ste_model.bin";
+            printf("[*] Fallback: using %s for model_load\n", weights_path);
+        } else {
+            fclose(check);
+        }
+    }
 
     ModelConfig cfg = growth_phase_config(&growth_phases[phase_idx], vocab_size);
     g_use_adam = 1;
@@ -2185,9 +2296,23 @@ int main(int argc, char **argv) {
     g_use_pure_float = 1;  /* 前向用浮点(与推理一致),反向仍用 STE(g_use_ste=1) */
     g_use_ste = 1;         /* STE 反向:梯度通过 w_float 回传 */
     g_use_real_attention = 1;
-    g_skip_wv = 1;  /* v13l: Skip W_v projection, use LN1 output as attention output */
+    /* v19: 默认使用真实因果多头注意力(上下文混合).
+     * g_skip_wv=1 是旧版绕过 W_v 坍缩的临时方案, 但代价是完全丧失跨 token 上下文,
+     * 导致 CE 卡在 ~6.5 平台, 生成永远是高频词. 现在默认走真实注意力.
+     * 如需回退调试, 设 LAL_SKIP_WV=1. */
+    g_skip_wv = 0;  /* v19: 默认真实注意力 */
+    {
+        const char *sv = getenv("LAL_SKIP_WV");
+        if (sv) {
+            g_skip_wv = atoi(sv);
+            printf("[*] LAL_SKIP_WV=%d (%s)\n", g_skip_wv,
+                   g_skip_wv ? "SKIP attention (V-copy mode)" : "REAL attention (context mixing)");
+        }
+    }
     g_use_logic_binarization = 1;
-    g_use_cuda = 1;  /* v13i: enable CUDA for attn_q (no logic_mask layers) */
+    /* v19: CUDA 路径只有 V-copy(无真实注意力), 默认走 CPU.
+     * CPU 路径有完整的因果多头注意力 + KV cache. */
+    g_use_cuda = 0;  /* v19: 默认 CPU(真实注意力), 如需 CUDA 设 LAL_SKIP_WV=1 */
     /* Ablation: MLP-only test (set attn scale to 0 via env var) */
     {
         const char *attn_scale = getenv("LAL_ATTN_SCALE");
@@ -2226,7 +2351,7 @@ int main(int argc, char **argv) {
     /* STE 训练 */
     if (n_steps > 0) {
         int total_steps = total_schedule_steps > 0 ? total_schedule_steps : n_steps;
-        ste_train(&model, &dl, n_steps, base_lr, 50, batch_size, 256, 10, logic_lr, start_step, total_steps, logic_only);
+        ste_train(&model, &dl, n_steps, base_lr, 50, batch_size, 256, 10, logic_lr, start_step, total_steps, logic_only, gen_interval);
     }
 
     /* 保存训练后权重 */

@@ -27,7 +27,12 @@ else
   SIMD_FLAGS ?=
 endif
 
-CFLAGS ?= -O3 $(SIMD_FLAGS) -Wall -ldl
+# Windows/MinGW lacks libdl; auto-detect
+ifeq ($(OS),Windows_NT)
+  CFLAGS ?= -O3 $(SIMD_FLAGS) -Wall
+else
+  CFLAGS ?= -O3 $(SIMD_FLAGS) -Wall -ldl
+endif
 LALC ?= $(PYTHON) compiler/lal.py
 
 .PHONY: all train server qwen-server qwen7b-server float-subset demos verify verify-qwen7b-lal mini-filter clean test-memory test-sparse meta-train meta-train-mem
@@ -329,4 +334,135 @@ dialogue-test: ste_train
 ste-train: dialogue-train
 ste-generate: dialogue-test
 
-.PHONY: ste_train dialogue dialogue-data dialogue-train dialogue-test ste-train ste-generate
+# ============================================================================
+# === 大规模对话训练 (Large-Scale Dialogue Training) ===
+#   make large-dialogue      完整流程: 生成大数据→分词→续训8000步→测试
+#   make large-dialogue-data  仅生成大数据+分词
+#   make large-dialogue-train 仅续训(默认8000步, 可用 STEPS=N 覆盖)
+#   make large-dialogue-test  仅测试自然问答效果
+# 数据来源: cognitive_foundation(6004) + large_dialogue(734) + dialogue_long_form(80)
+# 续训策略: 从 model_dialogue.ste 续训, LR 从 4000/12000 衰减
+# ============================================================================
+LARGE_MODEL ?= model_large_dialogue.ste
+LARGE_STEPS ?= 8000
+
+# 生成大规模对话数据
+data/large_dialogue.jsonl: data/gen_large_dialogue.py
+	python3 data/gen_large_dialogue.py --out data/large_dialogue.jsonl
+
+# 合并+分词: cognitive + large_dialogue + long_form -> BPE binary
+data/large_dialogue_bpe.bin: data/large_dialogue.jsonl tokenizer/chinese_bpe.model
+	@if [ ! -f data/cognitive_foundation.jsonl ]; then \
+	    echo "[!] 缺少 data/cognitive_foundation.jsonl"; exit 1; fi
+	python3 -c "import json; \
+srcs=['data/cognitive_foundation.jsonl','data/large_dialogue.jsonl','data/dialogue_long_form.jsonl']; \
+f=open('data/train_large_dialogue.jsonl','w',encoding='utf-8'); \
+[f.write(json.dumps(json.loads(l),ensure_ascii=False)+'\n') for s in srcs for l in open(s,encoding='utf-8') if l.strip() and 'text' in json.loads(l)]; \
+f.close(); print('[*] merged train_large_dialogue.jsonl')"
+	python3 scripts/tokenize_data.py \
+	    --input data/train_large_dialogue.jsonl \
+	    --output data/large_dialogue_bpe.bin \
+	    --tokenizer tokenizer/chinese_bpe.model \
+	    --max_len 128 --add-eos
+	@echo "[*] large_dialogue_bpe.bin ready"
+
+large-dialogue-data: data/large_dialogue_bpe.bin
+
+large-dialogue-train: ste_train large-dialogue-data
+	./ste_train --steps $(LARGE_STEPS) --start-step 4000 --total-steps 12000 \
+	    --batch-size 4 --lr 0.001 --logic-lr 0.005 \
+	    --phase 0 --vocab 32768 --data data/large_dialogue_bpe.bin \
+	    --resume model_dialogue.ste \
+	    --no-generate --save $(LARGE_MODEL)
+	@echo "[*] $(LARGE_MODEL) trained ($(LARGE_STEPS) steps, resumed from model_dialogue.ste)"
+
+large-dialogue-test: ste_train
+	@echo "########## 自然问答测试 (句子层) ##########"
+	@for q in "你好" "鸟为什么天上飞？" "什么是火？" "怎么洗手？" "太阳为什么很热？" "请介绍一下水。"; do \
+	    echo "--- Q: $$q ---"; \
+	    ./ste_train --diagnose-only --phase 0 --vocab 32768 --resume $(LARGE_MODEL) \
+	        --prompt "$$q" --max-gen 40 --temp 0.4 2>&1 | sed -n '/=== Generation/,/^$$/p' | head -8; \
+	done
+	@echo "########## 概念链推理测试 (LAL 原生推理) ##########"
+	@for q in "鸟为什么天上飞？" "什么是火？" "天为什么是蓝色的？" "怎么种花？"; do \
+	    echo "--- Q: $$q ---"; \
+	    ./ste_train --diagnose-only --phase 0 --vocab 32768 --resume $(LARGE_MODEL) \
+	        --prompt "$$q" --native-topk 3 --native-depth 2 --no-generate 2>&1 \
+	        | sed -n '/=== LAL Native/,/嵌入空间检索/p' | head -16; \
+	done
+
+large-dialogue: large-dialogue-data large-dialogue-train large-dialogue-test
+	@echo "[*] 大规模对话训练全流程完成 -> $(LARGE_MODEL)"
+
+# ============================================================================
+# === v16: 带中途监控的训练 (每100步自动生成测试, 避免白训) ===
+#   make monitor-train      从 model_large_dialogue.ste 续训, 每100步看效果
+#   make monitor-train-fresh 从 model_dialogue.ste 续训, 全新余弦计划
+# 可用 STEPS=N 覆盖步数, LR=F 覆盖学习率, LOGIC=F 覆盖 logic_lr
+# ============================================================================
+MONITOR_MODEL ?= model_v16_monitor.ste
+MONITOR_STEPS ?= 3000
+MONITOR_LR ?= 0.003
+MONITOR_LOGIC ?= 0.0005
+MONITOR_RESUME ?= model_large_dialogue.ste
+MONITOR_START ?= 0
+MONITOR_TOTAL ?= 3000
+
+monitor-train: ste_train large-dialogue-data
+	./ste_train --steps $(MONITOR_STEPS) \
+	    --start-step $(MONITOR_START) --total-steps $(MONITOR_TOTAL) \
+	    --batch-size 4 --lr $(MONITOR_LR) --logic-lr $(MONITOR_LOGIC) \
+	    --phase 0 --vocab 32768 --data data/large_dialogue_bpe.bin \
+	    --resume $(MONITOR_RESUME) \
+	    --gen-interval 100 \
+	    --no-generate --save $(MONITOR_MODEL) 2>&1 | tee monitor_train.log
+	@echo "[*] $(MONITOR_MODEL) trained ($(MONITOR_STEPS) steps, gen-interval=100)"
+
+monitor-test: ste_train
+	@echo "########## v16 自然问答测试 ##########"
+	@for q in "问：你好\n答：" "问：什么是火？\n答：" "问：鸟为什么天上飞？\n答：" "问：怎么洗手？\n答：" "问：太阳为什么很热？\n答："; do \
+	    echo "--- Q: $$q ---"; \
+	    ./ste_train --diagnose-only --phase 0 --vocab 32768 --resume $(MONITOR_MODEL) \
+	        --prompt "$$q" --max-gen 50 --temp 0.3 2>&1 | sed -n '/=== Generation/,/^$$/p' | head -8; \
+	done
+
+monitor: monitor-train monitor-test
+	@echo "[*] 带监控训练完成 -> $(MONITOR_MODEL)"
+
+# ============================================================================
+# === v19: 默认真实注意力训练 (无需环境变量) ===
+#   make attn-ablation       纯 CE 100步, 验证真实注意力能否突破 CE=6.5 平台
+#   make attn-ablation-train 仅训练
+#   make attn-ablation-test  仅测试
+# v19: g_skip_wv 默认=0(真实注意力), 无需 LAL_SKIP_WV=0
+# 如需回退旧模式: make attn-ablation LAL_SKIP_WV=1
+# ============================================================================
+ATTN_MODEL ?= model_attn_test.ste
+ATTN_STEPS ?= 100
+ATTN_LR ?= 0.003
+ATTN_RESUME ?= model_large_dialogue.ste
+
+attn-ablation-train: ste_train large-dialogue-data
+	./ste_train --steps $(ATTN_STEPS) \
+	    --batch-size 4 --lr $(ATTN_LR) --logic-lr 0.0 \
+	    --phase 0 --vocab 32768 --data data/large_dialogue_bpe.bin \
+	    --resume $(ATTN_RESUME) \
+	    --gen-interval 50 \
+	    --no-generate --save $(ATTN_MODEL) 2>&1 | tee attn_ablation.log
+	@echo "[*] $(ATTN_MODEL) trained ($(ATTN_STEPS) steps, real attention)"
+
+attn-ablation-test: ste_train
+	@echo "########## v19 注意力测试 (默认真实注意力) ##########"
+	@for q in "问：你好\n答：" "问：什么是火？\n答：" "问：鸟为什么天上飞？\n答："; do \
+	    echo "--- Q: $$q ---"; \
+	    ./ste_train --diagnose-only --phase 0 --vocab 32768 --resume $(ATTN_MODEL) \
+	        --prompt "$$q" --max-gen 50 --temp 0.3 2>&1 | sed -n '/=== Generation/,/^$$/p' | head -8; \
+	done
+
+attn-ablation: attn-ablation-train attn-ablation-test
+	@echo "[*] 注意力消融实验完成 -> $(ATTN_MODEL)"
+
+.PHONY: ste_train dialogue dialogue-data dialogue-train dialogue-test ste-train ste-generate \
+        large-dialogue large-dialogue-data large-dialogue-train large-dialogue-test \
+        monitor-train monitor-test monitor \
+        attn-ablation attn-ablation-train attn-ablation-test

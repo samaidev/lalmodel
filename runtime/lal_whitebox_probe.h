@@ -892,8 +892,9 @@ static ProbeMetrics whitebox_probe_compact(Model *m) {
  *
  * The function body has been removed to prevent accidental use.
  * ======================================================================== */
-
-#endif /* LAL_WHITEBOX_PROBE_H */
+/* NOTE: #endif moved to end of file — all functions below are part of the
+ * LAL_WHITEBOX_PROBE_H guard. Previous early #endif caused MinGW to skip
+ * all relation reasoning types (ConceptEdge, RelType, etc.). */
 
 /* ========================================================================
  * v13l: Batch compute_all_gate_inputs — process all concept pairs at once.
@@ -1650,3 +1651,5 @@ static const char *rel_explanation_cn(RelType rt) {
     }
     return "?";
 }
+
+#endif /* LAL_WHITEBOX_PROBE_H */

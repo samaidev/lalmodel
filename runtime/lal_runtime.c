@@ -18,6 +18,52 @@
 #endif   /* CUDA GPU training backend (runtime/lal_cuda.cu) */
 #endif
 
+/* === Windows/MinGW compatibility ===
+ * MinGW lacks sys/mman.h and rand_r(). We provide shims so the same
+ * lal_runtime.c compiles on both Linux and Windows/MinGW64. */
+#ifdef _WIN32
+  #define WIN32_LEAN_AND_MEAN
+  #include <windows.h>
+  #include <io.h>
+
+  /* mmap shim: use CreateFileMapping on Windows */
+  #ifndef MAP_FAILED
+  #define MAP_FAILED ((void *)-1)
+  #endif
+  #ifndef PROT_READ
+  #define PROT_READ  0x1
+  #define MAP_PRIVATE 0x2
+  #endif
+  static inline void *mmap(void *addr, size_t length, int prot, int flags, int fd, long long offset) {
+      (void)addr; (void)prot; (void)flags;
+      HANDLE h = CreateFileMappingA((HANDLE)_get_osfhandle(fd), NULL, PAGE_READONLY, 0, 0, NULL);
+      if (!h) return MAP_FAILED;
+      void *p = MapViewOfFile(h, FILE_MAP_READ, 0, 0, length);
+      CloseHandle(h);
+      return p ? p : MAP_FAILED;
+  }
+  static inline int munmap(void *addr, size_t length) {
+      (void)length;
+      UnmapViewOfFile(addr);
+      return 0;
+  }
+
+  /* rand_r shim: MinGW lacks it, use rand() with thread-local seed */
+  static inline int rand_r(unsigned int *seedp) {
+      *seedp = *seedp * 1103515245u + 12345u;
+      return (int)((*seedp / 65536u) % 32768u);
+  }
+
+  /* fstat/stat shim: MinGW has them in sys/stat.h but with different struct */
+  #include <sys/stat.h>
+  #define fstat _fstat
+  #define stat _stat
+#else
+  #include <sys/mman.h>
+  #include <sys/stat.h>
+  #include <unistd.h>
+#endif
+
 /* Forward declarations for full-vocab softmax (defined later in this file,
  * but model_forward/model_backward call them — declared here to avoid
  * implicit-declaration errors since the definitions sit after the callers). */
@@ -2764,10 +2810,22 @@ void tensor_free_data_by_key(Tensor *tensors, int n, const char *key) {
  * this when startup time matters more than steady-state RSS.
  *
  * The returned Tensor array must be freed with tensor_free_all_mmap(). */
+/* sys/mman.h and sys/stat.h are included at the top (with Windows shims) */
+#ifndef _WIN32
 #include <sys/mman.h>
 #include <sys/stat.h>
+#endif
 #include <fcntl.h>
+#ifndef _WIN32
 #include <unistd.h>
+#else
+/* Windows: open/close/read lseek shims via _io.h */
+#define open _open
+#define close _close
+#define read _read
+#define lseek _lseek
+#define O_RDONLY _O_RDONLY
+#endif
 
 typedef struct {
     Tensor *tensors;
@@ -4109,15 +4167,24 @@ layer_done:
         }
     }
 
-    /* === Update position embeddings (wpe) with Adam ===
+    /* === Update position embeddings (wpe) with Adam + norm clipping ===
      * Without this, position embeddings are random noise → model has no
-     * position awareness → attention collapses all positions → same output. */
+     * position awareness → attention collapses all positions → same output.
+     *
+     * BUG FIX (v17): wpe norm explosion — wpe[0] reached 11.37 (22.7x wte norm 0.50).
+     * When wpe dominates wte, token identity is drowned out → model loses semantic
+     * information → generation produces position-driven garbage, not content-driven.
+     * Fix: (1) reduced LR (0.3x) slows wpe growth; (2) hard norm clip at 1.0 caps it.
+     * wpe is added to wte: x = wte[tok] + wpe[pos], so wpe norm should be ≤ wte norm
+     * to avoid drowning token signal. Cap at 1.0 (2x wte norm) gives learning room. */
     if (m->grad_wpe_accum && m->m_wpe && m->v_wpe && g_use_adam && m->wpe) {
         int n_ctx = m->cfg.n_ctx;
         int t = g_opt_step + 1;
         float bc1 = 1.0f - powf(g_adam_beta1, (float)t);
         float bc2 = 1.0f - powf(g_adam_beta2, (float)t);
         float inv_batch = 1.0f / (float)batch_size;
+        float wpe_lr = lr * 0.3f;           /* v17: reduced LR to slow wpe growth */
+        float wpe_max_norm = 1.0f;          /* v17: hard cap — 2x typical wte norm */
 
         for (int pos = 0; pos < n_ctx; pos++) {
             float *w  = &m->wpe[(size_t)pos * n];
@@ -4131,7 +4198,15 @@ layer_done:
                 va[i] = g_adam_beta2 * va[i] + (1.0f - g_adam_beta2) * g * g;
                 float mh = ma[i] / bc1;
                 float vh = sqrtf(va[i] / bc2) + g_adam_eps;
-                w[i] -= lr * mh / vh;
+                w[i] -= wpe_lr * mh / vh;
+            }
+            /* v17: Norm clipping — prevent wpe from dominating wte */
+            float norm_sq = 0.0f;
+            for (int i = 0; i < n; i++) norm_sq += w[i] * w[i];
+            float norm = sqrtf(norm_sq);
+            if (norm > wpe_max_norm) {
+                float scale = wpe_max_norm / norm;
+                for (int i = 0; i < n; i++) w[i] *= scale;
             }
         }
     }

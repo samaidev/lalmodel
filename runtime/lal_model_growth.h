@@ -83,14 +83,22 @@ static void growth_write_tensor(FILE *f, const char *key,
 }
 
 /* Generate Xavier-initialized random weights for a given phase
- * vocab 参数:256=byte-level, 32768=BPE */
+ * vocab 参数:256=byte-level, 32768=BPE
+ * v20: 如果写入失败, 自动回退到当前目录下的 lal_ste_model.bin */
 static void gen_phase_weights(const char *path, GrowthPhase *phase, int vocab_size) {
     int n = phase->n_embd, m = phase->mlp_dim, V = vocab_size, C = 10240;  /* n_ctx=10240 for 10k context */
     FILE *f = fopen(path, "wb");
     if (!f) {
-        fprintf(stderr, "gen_phase_weights: cannot write %s\n", path);
-        return;
+        /* v20: 回退到当前目录 — Windows 可能没有 /tmp 访问权限 */
+        fprintf(stderr, "[!] gen_phase_weights: cannot write %s, trying ./lal_ste_model.bin\n", path);
+        path = "lal_ste_model.bin";
+        f = fopen(path, "wb");
+        if (!f) {
+            fprintf(stderr, "[!] gen_phase_weights: cannot write %s either, giving up\n", path);
+            return;
+        }
     }
+    printf("[*] Writing phase weights to %s\n", path);
 
     /* Count tensors: base(4) + per_layer(12 for GPT-2 merged QKV + GELU) */
     int per_layer = 12;
