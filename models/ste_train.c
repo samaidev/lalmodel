@@ -30,6 +30,34 @@ static int prompt_tokenize(const char *text, int *tokens, int max_len);
 #include "../runtime/lal_model_growth.h"
 #include "../runtime/lal_semantic_logic.h"
 #include "../runtime/lal_whitebox_probe.h"
+
+/* v16: wte 去共模 — 减去行均值 + 清除 Adam 一阶动量共模分量 */
+static void wte_recenter(Model *m) {
+    int V = m->cfg.vocab_size, n = m->cfg.n_embd;
+    if (n > 4096) return;
+    static float mean[4096];
+    for (int i = 0; i < n; i++) {
+        double sum = 0;
+        for (int j = 0; j < V; j++) sum += m->wte[(size_t)j * n + i];
+        mean[i] = (float)(sum / V);
+    }
+    #pragma omp parallel for schedule(static)
+    for (int j = 0; j < V; j++) {
+        float *row = &m->wte[(size_t)j * n];
+        for (int i = 0; i < n; i++) row[i] -= mean[i];
+    }
+    if (m->m_wte) {
+        for (int i = 0; i < n; i++) {
+            double sum = 0;
+            for (int j = 0; j < V; j++) sum += m->m_wte[(size_t)j * n + i];
+            mean[i] = (float)(sum / V);
+        }
+        for (int j = 0; j < V; j++) {
+            float *row = &m->m_wte[(size_t)j * n];
+            for (int i = 0; i < n; i++) row[i] -= mean[i];
+        }
+    }
+}
 #include "../runtime/lal_inference_tracer.h"
 
 /* v16: 前向声明 generate_text — 训练中途每 N 步自动生成测试 */
@@ -185,6 +213,7 @@ static float logic_guided_regularization(Model *m, float lr) {
                 float inv_nc = layer_nc > 0 ? 1.0f / sqrtf((float)layer_nc) : 0;
                 float inv_nb = layer_nb > 0 ? 1.0f / sqrtf((float)layer_nb) : 0;
                 float layer_lr_scale = (l == 0) ? 1.0f : 0.5f;
+                #pragma omp parallel for schedule(static)
                 for (int j = 0; j < mlp_dim; j++) {
                     if (mask[j] == 2) continue;
                     float diff = act_a[j] - act_b[j];
@@ -473,6 +502,7 @@ static float attn_logic_regularization(Model *m, float lr) {
              * 对 CORE: grad = -alpha*0.5*sign(diff)*(1-tanh²) * (V_a - V_b) + gamma*sign(proj)*V
              * 对 BINARY: grad = beta*2*diff * (V_a - V_b)
              * 累加到 ao->grad_accum (与 logic_guided_regularization 同结构) */
+            #pragma omp parallel for schedule(static)
             for (int j = 0; j < out_dim; j++) {
                 if (mask[j] == 2) continue;
                 float diff = proj_a[j] - proj_b[j];
@@ -636,7 +666,9 @@ static float residual_diversity_loss(Model *m, float lr) {
                 float grad_attn_scale = rs * attn_scale;
                 int in_dim = tl->attn_o.in_dim;
                 int out_dim = tl->attn_o.out_dim;
-                for (int j = 0; j < out_dim && j < n; j++) {
+                int ao_jmax = out_dim < n ? out_dim : n;  /* v16-perf: OpenMP 规范循环形 */
+                #pragma omp parallel for schedule(static)
+                for (int j = 0; j < ao_jmax; j++) {
                     float ga = grad_a[j] * grad_attn_scale * lr;
                     float gb = grad_b[j] * grad_attn_scale * lr;
                     if (fabsf(ga) > 1e-10f || fabsf(gb) > 1e-10f) {
@@ -655,7 +687,9 @@ static float residual_diversity_loss(Model *m, float lr) {
                 float grad_mlp_scale = rs * mlp_scale;
                 int md_in = tl->mlp_down.in_dim;
                 int md_out = tl->mlp_down.out_dim;
-                for (int j = 0; j < md_out && j < n; j++) {
+                int md_jmax = md_out < n ? md_out : n;
+                #pragma omp parallel for schedule(static)
+                for (int j = 0; j < md_jmax; j++) {
                     float ga = grad_a[j] * grad_mlp_scale * lr;
                     float gb = grad_b[j] * grad_mlp_scale * lr;
                     if (fabsf(ga) > 1e-10f || fabsf(gb) > 1e-10f) {
@@ -1354,18 +1388,18 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
             for (int b = 0; b < batch_size; b++) {
                 int idx = rand() % dl->n_samples;
                 int n_tok = dataloader_get(dl, idx, batch_tokens[b], 512);
-                if (n_tok < 6) continue;  /* lowered: allow short dialogue samples */
+                if (n_tok < 6) continue;  /* v17(远程): 阈值降到6, 允许短对话样本 (v16 原为10) */
 
                 int mp = n_tok < max_pos ? n_tok : max_pos;
                 if (mp < 4) continue;    /* lowered: min 4 tokens for 1 prediction */
 
                 /* v17: Multi-position prediction — up to 8 positions for better coverage.
-                 * Old: only 2 positions → 75% of tokens get no CE signal → slow learning.
-                 * New: scale n_preds with sequence length, start from position 1.
-                 * mp=4→1pred, mp=8→2, mp=16→4, mp=32+→8 (capped). */
+                 * mp=4→1pred, mp=8→2, mp=16→4, mp=32+→8 (capped).
+                 * v16-merge: LAL_NPREDS 环境变量可强制覆盖 (消融实验用). */
                 int n_preds = mp / 4;
                 if (n_preds < 1) n_preds = 1;
                 if (n_preds > 8) n_preds = 8;
+                if (getenv("LAL_NPREDS")) n_preds = atoi(getenv("LAL_NPREDS"));
                 int stride = (mp - 2) / n_preds;
                 if (stride < 1) stride = 1;
 
@@ -1400,24 +1434,39 @@ static float ste_train(Model *m, DataLoader *dl, int n_steps, float base_lr,
             /* v13k: 只在每 5 步做 logic_reg, 减少 80% 的 logic_reg 计算量
              * logic_reg 是 GPU 瓶颈 (13.5s/step), 每 5 步做一次可降到 ~2.7s
              * logic_lr 乘 5 补偿频率降低 */
-            int do_logic = (step % 5 == 0) || logic_only;
-            float effective_logic_lr = do_logic ? logic_lr * 5.0f : 0.0f;
-            float effective_attn_lr = do_logic ? logic_lr * 2.5f : 0.0f;
+            int do_logic = (step % 10 == 0) || logic_only;  /* v16-perf: 5→10, 减半开销 */
+            float effective_logic_lr = do_logic ? logic_lr * 10.0f : 0.0f;
+            float effective_attn_lr = do_logic ? logic_lr * 5.0f : 0.0f;
             float logic_loss = 0, attn_loss = 0, div_loss = 0;
             if (do_logic) {
+                struct timespec _t0, _t1;
+                clock_gettime(CLOCK_MONOTONIC, &_t0);
                 logic_loss = logic_guided_regularization(m, effective_logic_lr);
+                clock_gettime(CLOCK_MONOTONIC, &_t1);
+                double _ms1 = (_t1.tv_sec-_t0.tv_sec)*1000 + (_t1.tv_nsec-_t0.tv_nsec)/1e6;
                 attn_loss = attn_logic_regularization(m, effective_attn_lr);
+                clock_gettime(CLOCK_MONOTONIC, &_t0);
+                double _ms2 = (_t0.tv_sec-_t1.tv_sec)*1000 + (_t0.tv_nsec-_t1.tv_nsec)/1e6;
                 /* v13l: 多样性损失 — 直接惩罚概念对间隐藏状态余弦相似度 */
                 div_loss = residual_diversity_loss(m, effective_logic_lr);
+                clock_gettime(CLOCK_MONOTONIC, &_t1);
+                double _ms3 = (_t1.tv_sec-_t0.tv_sec)*1000 + (_t1.tv_nsec-_t0.tv_nsec)/1e6;
                 /* v15: 关系监督 — 在 wte 空间拉近相关概念/推远无关概念,
                  * 让原生推理概念链(鸟→动物, 火→光)有意义. 直接用 wte 行梯度,
                  * lr 取 logic_lr 量级, BPE 单 token 独立安全. */
                 float rel_loss = relation_logic_regularization(m, logic_lr * 0.5f);
-                (void)rel_loss;
+                /* v16: wte 几何正则 (uniformity 推远 + 范数封顶), 对治对齐泵塌缩 */
+                float geo_loss = wte_geometry_regularization(m, logic_lr * 0.5f);
+                clock_gettime(CLOCK_MONOTONIC, &_t0);
+                double _ms4 = (_t0.tv_sec-_t1.tv_sec)*1000 + (_t0.tv_nsec-_t1.tv_nsec)/1e6;
+                printf("  [LTIME] mlp_reg=%.0f attn_reg=%.0f div=%.0f rel_geo=%.0f ms\n", _ms1, _ms2, _ms3, _ms4);
+                (void)rel_loss; (void)geo_loss;
             }
             /* v13g: logic-only 模式下 n_valid=0, 用 batch_size=1 做 apply */
             int apply_batch = logic_only ? 1 : n_valid;
             model_batch_apply(m, lr, apply_batch);
+            /* v16: 每 50 步去 wte 共模 (Adam 泵漂移控制, softmax 不变) */
+            if (step % 50 == 0) wte_recenter(m);
             /* g_opt_step is incremented inside model_batch_apply — don't double-increment */
             if (step % 10 == 0) {
                 printf("  [LOGIC] mlp=%.4f attn=%.4f div=%.4f\n", logic_loss, attn_loss, div_loss);
@@ -1956,7 +2005,7 @@ static void generate_text(Model *m, const char *prompt, const int *prompt_ids,
     g_use_adam = 0;
     g_use_pure_float = 1;  /* 生成用 pure_float(完整浮点),避免 bin_forward 二值化丢失输入区分度 */
     g_use_real_attention = 1;
-    /* v19: 默认使用真实因果多头注意力(上下文混合).
+    /* v19(远程)+v16: 默认使用真实因果多头注意力(上下文混合).
      * g_skip_wv=1 会完全跳过注意力, 模型只做逐位置变换, 无法理解上下文.
      * 如果需要回退到旧的 V-copy 模式(仅用于调试), 设 LAL_SKIP_WV=1. */
     g_skip_wv = 0;  /* v19: 默认真实注意力 */
@@ -2115,6 +2164,10 @@ static void generate_text(Model *m, const char *prompt, const int *prompt_ids,
 
 /* === Main === */
 int main(int argc, char **argv) {
+    /* v16: 环境变量调参 (训练/诊断全模式生效) */
+    if (getenv("LAL_BIN_SCALE")) g_binary_scale = (float)atof(getenv("LAL_BIN_SCALE"));
+    if (getenv("LAL_WTE_LR")) g_wte_lr_scale = (float)atof(getenv("LAL_WTE_LR"));
+    if (getenv("LAL_LOGIT_SCALE")) g_logit_scale = (float)atof(getenv("LAL_LOGIT_SCALE"));
     /* ========================================================================
      * 默认参数已固化 = 对话训练唯一正确的路 (v5 验证: 4000步 avg_loss=1.58,
      * 句子层出"你好。"完整短句, 概念链层 火→光(0.93)/鸟→动物(0.89)).
@@ -2296,7 +2349,7 @@ int main(int argc, char **argv) {
     g_use_pure_float = 1;  /* 前向用浮点(与推理一致),反向仍用 STE(g_use_ste=1) */
     g_use_ste = 1;         /* STE 反向:梯度通过 w_float 回传 */
     g_use_real_attention = 1;
-    /* v19: 默认使用真实因果多头注意力(上下文混合).
+    /* v19(远程)+v16: 默认使用真实因果多头注意力(上下文混合).
      * g_skip_wv=1 是旧版绕过 W_v 坍缩的临时方案, 但代价是完全丧失跨 token 上下文,
      * 导致 CE 卡在 ~6.5 平台, 生成永远是高频词. 现在默认走真实注意力.
      * 如需回退调试, 设 LAL_SKIP_WV=1. */

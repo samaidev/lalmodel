@@ -535,20 +535,22 @@ void bin_forward_pure_float(float *y, const float *x, const BinLayer *bl) {
      * CE uses lal_cuda_full_forward. This CPU path is fallback only. */
 #endif
     if (bl->logic_mask) {
-        int core_idx = 0;
+        /* v16-perf: 前缀索引 + OpenMP 并行 */
+        int *cidx = (int *)alloca(out * sizeof(int));
+        { int c = 0; for (int j = 0; j < out; j++) { cidx[j] = c; if (bl->logic_mask[j] == 0) c++; } }
+        #pragma omp parallel for schedule(static)
         for (int j = 0; j < out; j++) {
             uint8_t m = bl->logic_mask[j];
-            if (m == 0) {  /* CORE: float dot with w_core[core_idx] */
-                const float *wc = &bl->w_core[core_idx * in];
+            if (m == 0) {  /* CORE: float dot with w_core[cidx[j]] */
+                const float *wc = &bl->w_core[cidx[j] * in];
                 float s = bl->bias[j];
                 for (int i = 0; i < in; i++) s += wc[i] * x[i];
                 y[j] = s;
-                core_idx++;
-            } else if (m == 1) {  /* BINARY: float dot with w_float */
+            } else if (m == 1) {  /* BINARY: float dot with w_float (v16: *g_binary_scale) */
                 const float *wf = &bl->w_float[j * in];
                 float s = bl->bias[j];
                 for (int i = 0; i < in; i++) s += wf[i] * x[i];
-                y[j] = s;
+                y[j] = bl->bias[j] + (s - bl->bias[j]) * g_binary_scale;
             } else {
                 y[j] = 0.0f;  /* PRUNE */
             }
@@ -641,6 +643,12 @@ float g_prune_freeze_thresh = 0.001f; /* PRUNE neurons below this are frozen */
 int g_use_real_attention = 0;
 int g_skip_wv = 0;  /* v13l: skip W_v projection, use norm1_out as attn_out */
 int g_use_pure_float = 0;
+/* v16: BINARY 共模抑制系数 (白盒: BINARY 能量~18x CORE 但区分度≈0, 0.25=能量均衡) */
+float g_binary_scale = 0.25f;
+/* v16: wte/wpe 更新速率系数 (对齐泵降速) */
+float g_wte_lr_scale = 0.1f;
+/* v16: logit 缩放 (残差范数小→softmax近均匀→CE梯度稀释, 放大锐化分布) */
+float g_logit_scale = 1.0f;
 int g_accumulate_gradients = 0;  /* 1 = accumulate grads, don't update weights */
 
 void trans_layer_backward(float *grad_x, TransLayer *tl, TransAct *act,
@@ -1361,7 +1369,7 @@ void model_backward_distill(Model *m, const int *tokens, int n_tokens, float lr,
                + m->final_ln[i+4]*w[i+4] + m->final_ln[i+5]*w[i+5]
                + m->final_ln[i+6]*w[i+6] + m->final_ln[i+7]*w[i+7];
         for (int i = (n/8)*8; i < n; i++) s += m->final_ln[i] * w[i];
-        s_logits[j] = s;
+        s_logits[j] = s * g_logit_scale;  /* v16 */
     }
 
     /* 2. Softmax(student/T) and softmax(teacher/T) (numerically stable). */
@@ -1830,7 +1838,10 @@ void bin_forward(float *y, const float *x, const BinLayer *bl) {
             lut_init = 1;
         }
 
-        int core_idx = 0;
+        /* v16-perf: 预计算 CORE 行索引前缀, 解除循环依赖后可 OpenMP 并行 */
+        int *cidx = (int *)alloca(out * sizeof(int));
+        { int c = 0; for (int j = 0; j < out; j++) { cidx[j] = c; if (bl->logic_mask[j] == 0) c++; } }
+        #pragma omp parallel for schedule(static)
         for (int j = 0; j < out; j++) {
             switch (bl->logic_mask[j]) {
             case 0: { /* CORE: float matmul * core_gain * K
@@ -1845,7 +1856,7 @@ void bin_forward(float *y, const float *x, const BinLayer *bl) {
                  *
                  * alpha[j] = mean(|w_float[j]|), recalculated in bin_layer_repack.
                  * For CORE neurons, alpha is set in init then recalculated in repack. */
-                const float *wc = &bl->w_core[core_idx * in];
+                const float *wc = &bl->w_core[cidx[j] * in];
                 float s = 0.0f;
                 for (int i = 0; i + 7 < in; i += 8) {
                     s += x[i+0]*wc[i+0] + x[i+1]*wc[i+1] + x[i+2]*wc[i+2] + x[i+3]*wc[i+3];
@@ -1855,7 +1866,6 @@ void bin_forward(float *y, const float *x, const BinLayer *bl) {
                 float core_gain = 1.0f / (bl->alpha[j] + 1e-8f);
                 if (core_gain > 5.0f) core_gain = 5.0f;  /* moderate cap: 5x boost */
                 y[j] = s * core_gain * K + bl->bias[j];
-                core_idx++;
                 break;
             }
             case 1: { /* BINARY: sign(w) * alpha * K + bias (ternary if zbits set) */
@@ -1898,7 +1908,7 @@ void bin_forward(float *y, const float *x, const BinLayer *bl) {
                         }
                     }
                 }
-                y[j] = s * bl->alpha[j] * K + bl->bias[j];
+                y[j] = s * bl->alpha[j] * K * g_binary_scale + bl->bias[j];
                 break;
             }
             default: /* PRUNE: zero */
@@ -2603,12 +2613,8 @@ void normalize_residual(float *x, int n, float target_norm) {
     float norm_sq = 0;
     for (int i = 0; i < n; i++) norm_sq += x[i] * x[i];
     float norm = sqrtf(norm_sq) + 1e-8f;
-    /* v13m: enforce minimum — prevent residual death spiral */
-    float target_min = target_norm * 0.5f;  /* 3.0 when target=6.0 */
-    if (norm < target_min) {
-        float scale = target_min / norm;
-        for (int i = 0; i < n; i++) x[i] *= scale;
-    } else if (norm > target_norm) {
+    /* v16: 移除放大分支 — 白盒: 放大操作把共模方向等比放大, 逐层推高相似度. 只保留向下封顶 */
+    if (norm > target_norm) {
         float scale = target_norm / norm;
         for (int i = 0; i < n; i++) x[i] *= scale;
     }
@@ -2652,6 +2658,7 @@ void scale_to_norm(float *v, int n, float target_norm) {
 
 static void compute_full_logits(const float *hidden, const float *wte,
                                 float *logits_out, int vocab, int n_embd) {
+    #pragma omp parallel for schedule(static)
     for (int j = 0; j < vocab; j++) {
         const float *w = &wte[(size_t)j * n_embd];
         float s = 0;
@@ -2661,7 +2668,7 @@ static void compute_full_logits(const float *hidden, const float *wte,
                + hidden[i+4]*w[i+4] + hidden[i+5]*w[i+5]
                + hidden[i+6]*w[i+6] + hidden[i+7]*w[i+7];
         for (int i = (n_embd/8)*8; i < n_embd; i++) s += hidden[i] * w[i];
-        logits_out[j] = s;
+        logits_out[j] = s * g_logit_scale;  /* v16 */
     }
 }
 
@@ -2733,6 +2740,9 @@ void cross_entropy_full_grad(float *grad_hidden, const float *hidden, const floa
         for (int i = (n_embd/8)*8; i < n_embd; i++)
             grad_hidden[i] += coef * w[i];
     }
+    /* v16: logits 缩放了 g_logit_scale, 梯度按链式法则同乘 */
+    if (g_logit_scale != 1.0f)
+        for (int i = 0; i < n_embd; i++) grad_hidden[i] *= g_logit_scale;
 }
 
 void compute_mean_std(const float *x, int n, float *mean, float *std_inv) {
@@ -4147,7 +4157,7 @@ layer_done:
                     va[i] = g_adam_beta2 * va[i] + (1.0f - g_adam_beta2) * g * g;
                     float mh = ma[i] / bc1;
                     float vh = sqrtf(va[i] / bc2) + g_adam_eps;
-                    w[i] -= lr * mh / vh;
+                    w[i] -= lr * g_wte_lr_scale * mh / vh;  /* v16: wte 对齐泵降速 */
                 }
             }
             /* BUG #52 v2: Only decay unused tokens with large norm (threshold-based) */
@@ -4198,7 +4208,7 @@ layer_done:
                 va[i] = g_adam_beta2 * va[i] + (1.0f - g_adam_beta2) * g * g;
                 float mh = ma[i] / bc1;
                 float vh = sqrtf(va[i] / bc2) + g_adam_eps;
-                w[i] -= wpe_lr * mh / vh;
+                w[i] -= wpe_lr * mh / vh;  /* v17(远程): wpe 降速 lr*0.3 — 与 v16 对齐泵修复同源 */
             }
             /* v17: Norm clipping — prevent wpe from dominating wte */
             float norm_sq = 0.0f;
@@ -4431,7 +4441,7 @@ const float *model_stateful_forward_sliding(Model *m, int token) {
                + m->final_ln[k+6]*w[k+6] + m->final_ln[k+7]*w[k+7];
         for (int k = (n/8)*8; k < n; k++)
             s += m->final_ln[k] * w[k];
-        g_sctx.logits[j] = s;
+        g_sctx.logits[j] = s * g_logit_scale;  /* v16 */
     }
 
     /* Advance circular buffer pointer */

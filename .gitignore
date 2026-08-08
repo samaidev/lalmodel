@@ -32,3 +32,6 @@ output_trace
 # Dialogue training checkpoints / local models
 *.ste
 model_dialogue*.ste
+
+# Training log files
+*.log

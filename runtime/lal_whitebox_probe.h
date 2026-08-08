@@ -1355,6 +1355,92 @@ static float relation_logic_regularization(Model *m, float lr) {
     return n_applied > 0 ? loss / n_applied : 0.0f;
 }
 
+/* v16: wte 几何正则 — 对治"对齐泵"塌缩:
+ *   1. 随机配对推远 (cos>0.40), 排除关系监督概念 token
+ *   2. wte 行范数软封顶 1.5
+ *   3. wpe 范数软封顶 1.0 (白盒: ||wpe[0]||曾达 wte 的 14 倍, 淹没 token 身份) */
+static float wte_geometry_regularization(Model *m, float lr) {
+    int n = m->cfg.n_embd;
+    int V = m->cfg.vocab_size;
+    const float M_uni = 0.40f;
+    const float norm_cap = 1.5f;
+    const int n_pairs = 128;
+
+    static int excl[256]; static int n_excl = -1;
+    if (n_excl < 0) {
+        n_excl = 0;
+        for (int p2 = 0; p2 < (int)N_RELATION_REGS && n_excl < 200; p2++) {
+            int t;
+            if (rel_get_wte_row(m, relation_regs[p2].a, &t)) excl[n_excl++] = t;
+            if (rel_get_wte_row(m, relation_regs[p2].b, &t)) excl[n_excl++] = t;
+            if (rel_get_wte_row(m, relation_regs[p2].neg, &t)) excl[n_excl++] = t;
+        }
+        for (int p2 = 0; p2 < (int)N_PROBE_PAIRS && n_excl < 250; p2++) {
+            int t;
+            if (rel_get_wte_row(m, probe_pairs[p2].bytes_a, &t)) excl[n_excl++] = t;
+            if (rel_get_wte_row(m, probe_pairs[p2].bytes_b, &t)) excl[n_excl++] = t;
+        }
+    }
+    #define GEO_EXCLUDED(tid) ({ int _e=0; for (int _k=0;_k<n_excl;_k++) if (excl[_k]==(tid)){_e=1;break;} _e; })
+
+    float loss = 0.0f;
+    int n_applied = 0;
+
+    for (int p2 = 0; p2 < n_pairs; p2++) {
+        int ta = 3 + (rand() % 2997);
+        int tb = 3 + (rand() % 2997);
+        if (ta == tb || GEO_EXCLUDED(ta) || GEO_EXCLUDED(tb)) continue;
+        float *wa = &m->wte[(size_t)ta * n];
+        float *wb = &m->wte[(size_t)tb * n];
+        float na = 0, nb = 0, dot = 0;
+        for (int i = 0; i < n; i++) { na += wa[i]*wa[i]; nb += wb[i]*wb[i]; dot += wa[i]*wb[i]; }
+        float denom = sqrtf(na)*sqrtf(nb) + 1e-6f;
+        float cos = dot / denom;
+        if (cos > M_uni) {
+            float scale = (cos - M_uni) * lr;
+            float inv = 1.0f / denom;
+            for (int i = 0; i < n; i++) {
+                float ga = (wb[i] - cos*wa[i]) * inv;
+                float gb = (wa[i] - cos*wb[i]) * inv;
+                wa[i] -= scale * ga;
+                wb[i] -= scale * gb;
+            }
+            loss += (cos - M_uni);
+            n_applied++;
+        }
+    }
+
+    for (int v = 3; v < V; v++) {
+        float *w = &m->wte[(size_t)v * n];
+        float norm_sq = 0;
+        for (int i = 0; i < n; i++) norm_sq += w[i]*w[i];
+        float norm = sqrtf(norm_sq);
+        if (norm > norm_cap) {
+            float target = norm - 0.25f * (norm - norm_cap);
+            float scale = target / norm;
+            for (int i = 0; i < n; i++) w[i] *= scale;
+        }
+    }
+
+    if (m->wpe) {
+        const float wpe_cap = 1.0f;
+        int n_pos = m->cfg.n_ctx < 256 ? m->cfg.n_ctx : 256;
+        for (int pos = 0; pos < n_pos; pos++) {
+            float *wp = &m->wpe[(size_t)pos * n];
+            float norm_sq = 0;
+            for (int i = 0; i < n; i++) norm_sq += wp[i]*wp[i];
+            float norm = sqrtf(norm_sq);
+            if (norm > wpe_cap) {
+                float target = norm - 0.25f * (norm - wpe_cap);
+                float scale = target / norm;
+                for (int i = 0; i < n; i++) wp[i] *= scale;
+            }
+        }
+    }
+    #undef GEO_EXCLUDED
+    return n_applied > 0 ? loss / n_applied : 0.0f;
+}
+
 /* ========================================================================
  * LAL 关系推理引擎 (Relationship Reasoning Engine)
  *
