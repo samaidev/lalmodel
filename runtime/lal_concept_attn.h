@@ -90,8 +90,8 @@ static inline ConceptAttnConfig concept_attn_default_config(void) {
     c.num_messengers      = 4;     /* 每片段 4 个信使 */
     c.messenger_neighbors = 2;     /* 看 2 个邻近片段的信使 */
     c.gate_enable        = 1;
-    c.gate_window         = 32;    /* 32 token 窗口内做门控 */
-    c.gate_threshold      = 0.1f;  /* 相似度 < 0.1 判定为边界隔离 */
+    c.gate_window         = 128;   /* Bug Fix 3: 32→128, 消除概念路径与标准路径的窗口不对称 */
+    c.gate_threshold      = 0.1f;  /* 相似度 < 0.1 判定为边界隔离 (运行时会被 P25 分位数覆盖) */
     c.gate_fallback_prob  = 0.01f; /* 1% 回退概率 */
     c.gate_distance_prior = 1;    /* 启用距离先验 */
     c.hetero_enable      = 1;

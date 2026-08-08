@@ -4536,6 +4536,40 @@ void concept_attn_stats_reset(void) {
     g_ca_stats.last_n_filled = keep;
 }
 
+/* === Bug Fix 2: 门控分数运行统计 (自适应分位数阈值) ===
+ * 维护一个滑动窗口记录最近的门控分数，计算 P25 分位数作为阈值
+ * g_gate_ring: 循环缓冲区, g_gate_head: 写入位置, g_gate_n_samples: 已有样本数 */
+#define GATE_RING_SIZE 512
+static float g_gate_ring[GATE_RING_SIZE];
+static int   g_gate_head = 0;
+static int   g_gate_n_samples = 0;
+float g_gate_p25 = 0.1f;  /* P25 分位数 (初始回退到默认阈值) */
+
+/* 记录门控分数到滑动窗口，并更新 P25 分位数 */
+static void gate_score_record(float score) {
+    g_gate_ring[g_gate_head] = score;
+    g_gate_head = (g_gate_head + 1) % GATE_RING_SIZE;
+    if (g_gate_n_samples < GATE_RING_SIZE) g_gate_n_samples++;
+
+    /* 每 64 个样本重新计算一次 P25 (避免频繁排序) */
+    if ((g_gate_n_samples & 63) == 0 && g_gate_n_samples >= 64) {
+        /* 复制到临时数组排序 */
+        float tmp[GATE_RING_SIZE];
+        int n = g_gate_n_samples;
+        memcpy(tmp, g_gate_ring, n * sizeof(float));
+        /* 简单插入排序 (n <= 512, 复杂度可接受) */
+        for (int i = 1; i < n; i++) {
+            float key = tmp[i];
+            int j = i - 1;
+            while (j >= 0 && tmp[j] > key) { tmp[j+1] = tmp[j]; j--; }
+            tmp[j+1] = key;
+        }
+        /* P25 = 第 25 百分位 */
+        int idx = (int)(0.25f * (n - 1));
+        g_gate_p25 = tmp[idx];
+    }
+}
+
 /* 全局信使缓存（每层一个，按 layer_idx 索引） */
 MessengerCache *g_messenger_caches = NULL;
 static int g_messenger_caches_n_layer = 0;
@@ -4598,7 +4632,49 @@ void generate_segment_messengers(const float *v_seg, int seg_len, int n_embd,
     if (!v_seg || !out_k || !out_v || seg_len <= 0 || n_embd <= 0 || num_messengers <= 0)
         return;
 
-    /* 均匀分桶：每个桶覆盖 [bucket_start, bucket_end) */
+    /* === Bug Fix 1: 信使去中心化 ===
+     * 原始实现: 信使 = 桶内 V 的均值 → 携带公共模式，4个信使几乎相同
+     * 修复: 先计算片段内全局 V 均值，信使 = 桶均值 - 全局均值
+     *       只保留偏差信息（本桶的"特色"而非"共识"）
+     * 同时对信使做范数钳制，防止越训越大 */
+    float *global_mean = (float *)calloc(n_embd, sizeof(float));
+    if (!global_mean) {
+        /* 降级: 回退到原始均值池化 */
+        for (int m = 0; m < num_messengers; m++) {
+            int bucket_start = (int)((long long)m * seg_len / num_messengers);
+            int bucket_end   = (int)((long long)(m + 1) * seg_len / num_messengers);
+            if (bucket_end <= bucket_start) bucket_end = bucket_start + 1;
+            if (bucket_end > seg_len) bucket_end = seg_len;
+            int bucket_size = bucket_end - bucket_start;
+            if (bucket_size <= 0) bucket_size = 1;
+            float *k_dst = out_k + (size_t)m * n_embd;
+            float *v_dst = out_v + (size_t)m * n_embd;
+            float inv = 1.0f / (float)bucket_size;
+            for (int d = 0; d < n_embd; d++) {
+                float sum = 0.0f;
+                for (int t = bucket_start; t < bucket_end; t++)
+                    sum += v_seg[(size_t)t * n_embd + d];
+                float val = sum * inv;
+                v_dst[d] = val;
+                k_dst[d] = val;
+            }
+        }
+        return;
+    }
+
+    /* 计算片段内全局 V 均值 */
+    float inv_seg = 1.0f / (float)seg_len;
+    for (int d = 0; d < n_embd; d++) {
+        float sum = 0.0f;
+        for (int t = 0; t < seg_len; t++)
+            sum += v_seg[(size_t)t * n_embd + d];
+        global_mean[d] = sum * inv_seg;
+    }
+
+    /* 范数钳制上限: 嵌入维度的 sqrt(n_embd) 量级 */
+    float max_norm = sqrtf((float)n_embd) * 0.5f;  /* 保守上限 */
+
+    /* 去中心化分桶 + 范数钳制 */
     for (int m = 0; m < num_messengers; m++) {
         int bucket_start = (int)((long long)m * seg_len / num_messengers);
         int bucket_end   = (int)((long long)(m + 1) * seg_len / num_messengers);
@@ -4607,20 +4683,33 @@ void generate_segment_messengers(const float *v_seg, int seg_len, int n_embd,
         int bucket_size = bucket_end - bucket_start;
         if (bucket_size <= 0) bucket_size = 1;
 
-        /* 均值池化 */
         float *k_dst = out_k + (size_t)m * n_embd;
         float *v_dst = out_v + (size_t)m * n_embd;
         float inv = 1.0f / (float)bucket_size;
         for (int d = 0; d < n_embd; d++) {
             float sum = 0.0f;
-            for (int t = bucket_start; t < bucket_end; t++) {
+            for (int t = bucket_start; t < bucket_end; t++)
                 sum += v_seg[(size_t)t * n_embd + d];
-            }
-            float val = sum * inv;
+            float val = sum * inv - global_mean[d];  /* 去中心化 */
             v_dst[d] = val;
             k_dst[d] = val;  /* 信使 K = V（自关联简化） */
         }
+
+        /* 范数钳制: 防止信使范数失控膨胀 */
+        float norm_sq = 0.0f;
+        for (int d = 0; d < n_embd; d++)
+            norm_sq += v_dst[d] * v_dst[d];
+        float norm = sqrtf(norm_sq + 1e-8f);
+        if (norm > max_norm) {
+            float scale_factor = max_norm / norm;
+            for (int d = 0; d < n_embd; d++) {
+                v_dst[d] *= scale_factor;
+                k_dst[d] *= scale_factor;
+            }
+        }
     }
+
+    free(global_mean);
 }
 
 /* ─── Layer 2: Concept Boundary Gate (关系强度门控) ───────────────
@@ -4668,8 +4757,25 @@ int concept_boundary_gate(const float *q_i, const float *k_j,
         gate_score += 0.5f * dist_prior;  /* 距离近的 token 有先验加分 */
     }
 
+    /* === Bug Fix 2: 自适应分位数阈值 ===
+     * 原始实现: 固定阈值 0.1，但训练中分数分布整体漂移（52% > 0.5）
+     *          导致门控要么全开要么全关，无法稳定兑现"概念边界隔离"
+     * 修复: 使用运行统计的分位数作为阈值
+     *       g_gate_score_p25 = 观察到的分数分布的 25th percentile
+     *       屏蔽最低 25% 的分数对，而非用一个死阈值
+     *
+     * 原理: 不管训练如何移动分数的绝对值，分位数始终代表
+     *       "当前分布中关系最弱的 25%"——这才是"边界隔离"的语义 */
+    float effective_threshold = cfg->gate_threshold;  /* 默认回退 */
+
+    /* 使用运行统计的分位数（如果可用） */
+    if (g_gate_n_samples > 50) {
+        /* 有足够样本时，用 P25 分位数作为阈值 */
+        effective_threshold = g_gate_p25;
+    }
+
     /* 软门控判定 */
-    if (gate_score < cfg->gate_threshold) {
+    if (gate_score < effective_threshold) {
         /* 概率回退通路：用 hash(distance, sim) 做确定性伪随机，
          * 避免引入 rand() 影响可复现性 */
         unsigned int hash = (unsigned int)(distance * 2654435761u);
@@ -4711,7 +4817,7 @@ int get_head_window(int head_idx, int n_head, int base_window,
     if (!cfg->hetero_enable) return base_window;
     HeadAccessType t = get_head_access_type(head_idx, n_head, cfg);
     switch (t) {
-        case HEAD_LOCAL:     return base_window / 2;  /* 局部语法头：更小窗口 */
+        case HEAD_LOCAL:     return base_window;       /* Bug Fix 3: 不再减半, 保持对称 */
         case HEAD_MESSENGER: return base_window;       /* 指代/因果头：标准窗口 */
         case HEAD_GLOBAL:    return base_window * 2;   /* 全局头：更大窗口 */
         default:             return base_window;
@@ -4900,6 +5006,24 @@ void attention_forward_concept(float *attn_out, const float *qkv,
                 int j = pos_list[i];
                 int distance = seq_pos - j;
                 g_ca_stats.gate_pairs++;
+                /* Bug Fix 2: 记录门控分数到滑动窗口以计算自适应分位数阈值 */
+                {
+                    int coarse_dim2 = head_dim > 16 ? head_dim / 4 : head_dim;
+                    float qn = 0, kn = 0, dt = 0;
+                    for (int d = 0; d < coarse_dim2; d++) {
+                        dt += Q_h[d] * K_jh[d];
+                        qn += Q_h[d] * Q_h[d];
+                        kn += K_jh[d] * K_jh[d];
+                    }
+                    float sim = dt / (sqrtf(qn + 1e-8f) * sqrtf(kn + 1e-8f) + 1e-8f);
+                    float dp = 1.0f;
+                    if (cfg->gate_distance_prior && distance > 0) {
+                        float tau = (float)(cfg->segment_len > 0 ? cfg->segment_len : 64);
+                        dp = expf(-(float)distance / tau);
+                    }
+                    float gs = sim + (cfg->gate_distance_prior ? 0.5f * dp : 0.0f);
+                    gate_score_record(gs);
+                }
                 if (!concept_boundary_gate(Q_h, K_jh, head_dim, distance, cfg)) {
                     scores[i] = -1e30f;  /* 屏蔽 */
                     g_ca_stats.gate_blocked++;
