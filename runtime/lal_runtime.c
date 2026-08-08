@@ -342,7 +342,7 @@ void trans_layer_forward(float *x, TransLayer *tl, TransAct *act,
         for (int i = 0; i < n; i++) { xn += x[i] * x[i]; pn += act->proj_out[i] * act->proj_out[i]; }
         xn = sqrtf(xn) + 1e-8f;
         pn = sqrtf(pn) + 1e-8f;
-        float target = 0.15f * xn;
+        float target = g_attn_res_scale * xn;
         act->attn_scale = target / pn;
         for (int i = 0; i < n; i++) act->proj_out[i] *= act->attn_scale;
     }
@@ -448,7 +448,7 @@ void trans_layer_forward_pure_float(float *x, TransLayer *tl, TransAct *act,
         for (int i = 0; i < n; i++) { xn += x[i] * x[i]; pn += act->proj_out[i] * act->proj_out[i]; }
         xn = sqrtf(xn) + 1e-8f;
         pn = sqrtf(pn) + 1e-8f;
-        float target = 0.15f * xn;
+        float target = g_attn_res_scale * xn;
         act->attn_scale = target / pn;
         for (int i = 0; i < n; i++) act->proj_out[i] *= act->attn_scale;
     }
@@ -3322,9 +3322,16 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
 
         /* Sliding window attention */
         if (tl->_kv_k && tl->_kv_v) {
-            attention_forward_sliding(act->attn_out, act->q, n, cfg->n_head,
-                                       cache_pos, tl->_kv_k, tl->_kv_v,
-                                       cfg->n_ctx, window, n_sinks);
+            /* v16: 概念感知注意力推理接入 — 与训练同通路, 支持同权重 A/B 对比 */
+            if (g_concept_attn_cfg.enable && g_messenger_caches) {
+                attention_forward_concept(act->attn_out, act->q, n, cfg->n_head,
+                                          abs_pos, tl->_kv_k, tl->_kv_v, cfg->n_ctx,
+                                          &g_concept_attn_cfg, &g_messenger_caches[tl->layer_idx]);
+            } else {
+                attention_forward_sliding(act->attn_out, act->q, n, cfg->n_head,
+                                           cache_pos, tl->_kv_k, tl->_kv_v,
+                                           cfg->n_ctx, window, n_sinks);
+            }
         } else {
             /* Fallback: V-copy (legacy) */
             memcpy(act->attn_out, act->v, n * sizeof(float));
@@ -3339,7 +3346,7 @@ void trans_layer_forward_sliding(float *x, TransLayer *tl, TransAct *act,
         for (int i = 0; i < n; i++) { xn += x[i] * x[i]; pn += act->proj_out[i] * act->proj_out[i]; }
         xn = sqrtf(xn) + 1e-8f;
         pn = sqrtf(pn) + 1e-8f;
-        float target = 0.15f * xn;
+        float target = g_attn_res_scale * xn;
         act->attn_scale = target / pn;
         for (int i = 0; i < n; i++) act->proj_out[i] *= act->attn_scale;
     }
@@ -4394,6 +4401,7 @@ void model_stateful_begin(Model *m) {
     g_sctx.kv_pos = 0;
     g_sctx.total_pos = 0;
     g_sctx.active = 1;
+    model_messenger_caches_reset();  /* v16 */
 
     int window = m->cfg.sliding_window > 0 ? m->cfg.sliding_window : m->cfg.n_ctx;
     int sinks = m->cfg.n_sinks;
@@ -4412,6 +4420,7 @@ void model_stateful_reset(Model *m) {
     }
     g_sctx.kv_pos = 0;
     g_sctx.total_pos = 0;
+    model_messenger_caches_reset();  /* v16: 新一轮生成 — 清空信使缓存 */
 }
 
 /* ─── Stateful Forward with Sliding Window ──────────────────────── */
@@ -4504,6 +4513,9 @@ void model_set_sliding_window(Model *m, int window, int n_sinks) {
 
 /* 全局概念感知注意力配置（默认关闭，需显式开启） */
 ConceptAttnConfig g_concept_attn_cfg = {0};
+/* v16: 注意力残差配额 (v13j 防塌缩设计, 默认 0.15). LAL_ATTN_RES_SCALE 可调 —
+ * 配额太低时注意力架构变化在输出端"隐形" */
+float g_attn_res_scale = 0.15f;
 
 /* v16: 概念注意力运行时统计 (探针用, 前向单线程累加) */
 typedef struct {

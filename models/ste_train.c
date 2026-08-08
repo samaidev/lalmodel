@@ -2170,6 +2170,7 @@ int main(int argc, char **argv) {
     if (getenv("LAL_BIN_SCALE")) g_binary_scale = (float)atof(getenv("LAL_BIN_SCALE"));
     if (getenv("LAL_WTE_LR")) g_wte_lr_scale = (float)atof(getenv("LAL_WTE_LR"));
     if (getenv("LAL_LOGIT_SCALE")) g_logit_scale = (float)atof(getenv("LAL_LOGIT_SCALE"));
+    if (getenv("LAL_ATTN_RES_SCALE")) g_attn_res_scale = (float)atof(getenv("LAL_ATTN_RES_SCALE"));
     /* ========================================================================
      * 默认参数已固化 = 对话训练唯一正确的路 (v5 验证: 4000步 avg_loss=1.58,
      * 句子层出"你好。"完整短句, 概念链层 火→光(0.93)/鸟→动物(0.89)).
@@ -2627,6 +2628,19 @@ int main(int argc, char **argv) {
     /* 生成(句子层, transformer 自回归). 默认也跑, 但原生推理是主形态. */
     if (do_generate) {
         generate_text(&model, prompt, prompt_ids, n_prompt_ids, max_gen, temp, top_k);
+        /* v16 debug: 生成后打印概念注意力统计 — fwd=0 说明推理路径没走概念注意力 */
+        if (g_concept_attn_cfg.enable) {
+            printf("[GEN-PROBE] concept attn stats during generation:\n");
+            concept_attn_probe_print();
+        }
+        /* v16 debug: dump 最后隐状态前 8 维 — ON/OFF 余弦对比验证计算是否真的分叉 */
+        printf("[HIDDEN] final_ln[0:8]:");
+        for (int i = 0; i < 8; i++) printf(" %.4f", model.final_ln[i]);
+        {
+            float nrm = 0;
+            for (int i = 0; i < model.cfg.n_embd; i++) nrm += model.final_ln[i] * model.final_ln[i];
+            printf("  ||h||=%.3f\n", sqrtf(nrm));
+        }
     }
 
     printf("\n[*] Done\n");
